@@ -10,9 +10,13 @@ const esriTopo = L.tileLayer(
 const osm = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
   { attribution: "© OSM © CARTO", subdomains: "abcd", maxZoom: 19 });
 
-const map = L.map("map", { zoomControl: true, layers: [esriTopo] }).setView([39, -98], 4);
-L.control.layers({ "Topographic": esriTopo, "Satellite": esriImg, "Dark": osm }, {},
-  { position: "topright" }).addTo(map);
+const map = L.map("map", { zoomControl: true, layers: [esriTopo] }).setView([39, -98], 5);
+// dedicated pane so 2-D streamflow draws above tiles but below pins
+map.createPane("q2d");
+map.getPane("q2d").style.zIndex = 450;
+const q2dGroup = L.layerGroup().addTo(map);      // toggleable in the layers control
+L.control.layers({ "Topographic": esriTopo, "Satellite": esriImg, "Dark": osm },
+  { "2-D streamflow": q2dGroup }, { position: "topright" }).addTo(map);
 
 // ---- state -------------------------------------------------------------
 const gaugeMarkers = {};          // id -> marker
@@ -22,19 +26,27 @@ let eventLayer = L.layerGroup().addTo(map);
 let gaugeLayer = L.layerGroup().addTo(map);
 let MAX_SIMS = 10;
 
-let queryCtx = null;              // {t_start, t_end, bbox}
+let queryCtx = null;              // {t_start, t_end, bbox, label}
+let lastSim = null;               // {tStart, tEnd, hours, expectedSteps}
+let awaitingTime = false;         // waiting for the user to give a date range/link
+let pendingQuery = null;          // original query text while awaiting time
 const simHydro = {};              // gid -> accumulated rows
 const gaugeResult = {};           // gid -> {meta, metrics, report}
-const overlays = {};              // gid -> L.imageOverlay
+const gaugeState = {};            // gid -> "running" | "done"
+const overlays = {};              // gid -> L.imageOverlay (inside q2dGroup)
 let panelGauge = null;            // gauge focused in the right panel
 let currentSim = null;
+let zoomedToOverlay = false;
 
 // streamflow animation
 const gaugeFrames = {};           // gid -> {n, bounds}
-let animTimes = [];               // shared time axis (labels)
-let animMax = 0;                  // max frame index
+let animTimes = [];
+let animMax = 0;
 let animIdx = 0;
 let animTimer = null;
+
+// AI info mode (default ON, persisted)
+let aiInfo = localStorage.getItem("aiInfo") !== "off";
 
 // ---- drawing (rectangle select) ----------------------------------------
 const drawn = new L.FeatureGroup().addTo(map);
@@ -55,14 +67,42 @@ map.on(L.Draw.Event.CREATED, (e) => {
 
 // ---- chat --------------------------------------------------------------
 const log = document.getElementById("chat-log");
-function addMsg(text, cls = "bot") {
+function addMsg(html, cls = "bot") {
   const d = document.createElement("div");
-  d.className = "msg " + cls; d.innerHTML = text; log.appendChild(d);
+  d.className = "msg " + cls; d.innerHTML = html; log.appendChild(d);
   log.scrollTop = log.scrollHeight; return d;
+}
+function statusMsg(gid, text) {           // raw log line — only when AI info is OFF
+  if (!aiInfo) addMsg(`<b>${gid}</b> · ${text}`, "status");
+}
+
+// ---- map-first gauge pins (no AI needed) --------------------------------
+let vpTimer = null;
+async function loadViewportGauges() {
+  const b = map.getBounds();
+  try {
+    const r = await fetch(`/api/gauges?w=${b.getWest()}&s=${b.getSouth()}&e=${b.getEast()}&n=${b.getNorth()}`);
+    if (!r.ok) return;
+    const d = await r.json();
+    MAX_SIMS = d.max_sims || MAX_SIMS;
+    addGaugePins(d.gauge_pins || []);
+  } catch (_) { /* offline / transient */ }
+}
+map.on("moveend", () => { clearTimeout(vpTimer); vpTimer = setTimeout(loadViewportGauges, 400); });
+
+function addGaugePins(pins) {
+  pins.forEach((g) => {
+    if (gaugeMarkers[g.id]) return;                   // already on the map
+    gaugeData[g.id] = g;
+    const m = L.circleMarker([g.lat, g.lon], gaugeStyle(g.id))
+      .bindTooltip(`${g.id} · ${g.name}<br>${Math.round(g.area_km2).toLocaleString()} km²`, { direction: "top" })
+      .on("click", () => toggleGauge(g.id));
+    m.addTo(gaugeLayer); gaugeMarkers[g.id] = m;
+  });
 }
 
 async function runQuery(text) {
-  addMsg(text, "user");
+  addMsg(escapeHtml(text), "user");
   const s = addMsg("🧭 Analyzing…", "status");
   try {
     const r = await fetch("/api/query", {
@@ -76,35 +116,26 @@ async function runQuery(text) {
     s.textContent = `📍 ${d.label} — ${d.n_gauges} USGS gauges nearby. ` +
       `Pick a few gauges closest to the event — click the pins or draw a small box ` +
       `(up to ${MAX_SIMS}; fewer runs faster).`;
+    if (!d.time_known) {
+      awaitingTime = true; pendingQuery = text;
+      addMsg("🗓️ I found the <b>place</b> but couldn't pin down <b>when</b> this happened. " +
+        "Reply with a date range like <code>2025-07-03 to 2025-07-06</code>, a single start date, " +
+        "or paste a news link about the event — or set the start date in ⚙️ Model options.", "bot");
+    }
   } catch (err) {
     s.textContent = "⚠️ " + err.message;
   }
 }
 
 function renderResult(d) {
-  eventLayer.clearLayers(); gaugeLayer.clearLayers();
-  Object.keys(gaugeMarkers).forEach((k) => delete gaugeMarkers[k]);
-  Object.keys(gaugeData).forEach((k) => delete gaugeData[k]);
-  selected.clear();
-  queryCtx = { t_start: d.t_start, t_end: d.t_end, bbox: d.bbox };
-  Object.values(overlays).forEach((o) => map.removeLayer(o));
-  Object.keys(overlays).forEach((k) => delete overlays[k]);
-  Object.keys(simHydro).forEach((k) => delete simHydro[k]);
-  Object.keys(gaugeResult).forEach((k) => delete gaugeResult[k]);
-  resetAnim();
-
+  eventLayer.clearLayers();
+  queryCtx = { t_start: d.t_start, t_end: d.t_end, bbox: d.bbox, label: d.label };
   (d.event_pins || []).forEach((e) => {
     L.circleMarker([e.lat, e.lon], { radius: 9, color: "#fff", weight: 2,
       fillColor: "#e74c3c", fillOpacity: 0.95 })
       .bindTooltip(`🌊 ${e.label}`, { direction: "top" }).addTo(eventLayer);
   });
-  (d.gauge_pins || []).forEach((g) => {
-    gaugeData[g.id] = g;
-    const m = L.circleMarker([g.lat, g.lon], gaugeStyle(g.id))
-      .bindTooltip(`${g.id} · ${g.name}<br>${Math.round(g.area_km2).toLocaleString()} km²`, { direction: "top" })
-      .on("click", () => toggleGauge(g.id));
-    m.addTo(gaugeLayer); gaugeMarkers[g.id] = m;
-  });
+  addGaugePins(d.gauge_pins || []);
   if (d.bbox) map.fitBounds([[d.bbox[1], d.bbox[0]], [d.bbox[3], d.bbox[2]]], { padding: [40, 40] });
   refreshSelection();
 }
@@ -117,7 +148,7 @@ function gaugeStyle(id) {
 function toggleGauge(id) {
   selected.has(id) ? selected.delete(id) : selected.add(id);
   refreshSelection();
-  focusGauge(id);                 // open right panel on the clicked gauge
+  if (simHydro[id]) focusGauge(id);        // has results -> show them
 }
 function refreshSelection() {
   Object.entries(gaugeMarkers).forEach(([id, m]) => m.setStyle(gaugeStyle(id)));
@@ -148,17 +179,31 @@ async function simulate() {
   const startOv = document.getElementById("k-start").value;
   const tStart = startOv ? `${startOv}T00:00:00` : queryCtx?.t_start;
   const tEnd = startOv ? null : queryCtx?.t_end;
+  if (!tStart) {                          // map-first flow with no time context
+    addMsg("🗓️ I need a time period first — tell me the event (e.g. <i>“flood in Kerrville, July 2025”</i>), " +
+      "reply with a date range like <code>2025-07-03 to 2025-07-06</code>, or set the start date in ⚙️ Model options.", "bot");
+    awaitingTime = true;
+    document.getElementById("left-panel").classList.remove("collapsed");
+    return;
+  }
   addMsg(`▶ Simulating ${ids.length} gauge(s)…`, "status");
   const r = await fetch("/api/simulate", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      gauge_ids: ids, t_start: tStart, t_end: tEnd, ...opt,
-    }),
+    body: JSON.stringify({ gauge_ids: ids, t_start: tStart, t_end: tEnd, ...opt }),
   });
   const d = await r.json();
   if (d.warning) addMsg("⚠️ " + d.warning, "status");
   resetAnim();
-  ids.forEach((id) => { simHydro[id] = []; });
+  zoomedToOverlay = false;
+  const hours = opt.hours;
+  lastSim = { tStart, tEnd, hours, expectedSteps: hours + 1 };
+  ids.forEach((id) => { simHydro[id] = []; gaugeState[id] = "running"; delete gaugeResult[id]; });
+  renderTabs();
+  if (ids.length && !panelGauge) focusGauge(ids[0]);
+  if (aiInfo) {
+    initProgress(ids);
+    fetchEventInfo();
+  }
   openStream(d.sim_id);
 }
 
@@ -175,26 +220,197 @@ function openStream(simId) {
 
 function handleSimEvent(simId, ev) {
   if (ev.kind === "status") {
-    addMsg(`<b>${ev.gauge_id}</b> · ${ev.msg}`, "status");
+    statusMsg(ev.gauge_id, ev.msg);
+    if (aiInfo) progressFromStatus(ev.gauge_id, ev.msg);
   } else if (ev.kind === "hydro") {
     (simHydro[ev.gauge_id] = simHydro[ev.gauge_id] || []).push(...ev.rows);
+    if (aiInfo) progressFromRows(ev.gauge_id);
     if (ev.gauge_id === panelGauge) renderHydro(ev.gauge_id);
   } else if (ev.kind === "q2d") {
     updateOverlay(simId, ev.gauge_id, ev.bounds, ev.frame);
   } else if (ev.kind === "gauge_done") {
-    addMsg(`✅ <b>${ev.gauge_id}</b> complete (${ev.n} steps)`, "status");
+    gaugeState[ev.gauge_id] = "done";
+    renderTabs();
+    if (aiInfo) setProgress(ev.gauge_id, 100, "complete ✓");
+    else addMsg(`✅ <b>${ev.gauge_id}</b> complete (${ev.n} steps)`, "status");
     if (ev.gauge_id === panelGauge) renderHydro(ev.gauge_id);
   } else if (ev.kind === "result") {
     gaugeResult[ev.gauge_id] = { meta: ev.meta, metrics: ev.metrics, report: ev.report };
+    renderTabs();
     if (ev.gauge_id === panelGauge) { renderStats(ev.gauge_id); renderReport(ev.gauge_id); }
+    maybeOfferCalibration(ev.gauge_id, ev.metrics);
   } else if (ev.kind === "timeline") {
     gaugeFrames[ev.gauge_id] = { n: ev.n, bounds: ev.bounds };
     if (ev.n - 1 > animMax) { animMax = ev.n - 1; animTimes = ev.times || animTimes; }
+    if (ev.vmax) document.getElementById("q-max").textContent = Math.round(ev.vmax).toLocaleString();
     showAnim();
   } else if (ev.kind === "all_done") {
-    addMsg("✅ All simulations complete — use the time bar to replay the flood.", "status");
-    setFrame(animMax);            // rest on the final timestep
+    addMsg("✅ All simulations complete — use the time bar to replay the flood, and the tabs " +
+      "in the results panel to switch between gauges.", "status");
+    setFrame(animMax);
   }
+}
+
+// ---- AI info: per-gauge progress bars + event background ----------------
+let progressBox = null;
+const progressEls = {};           // gid -> {fill, stage, pct, value}
+
+function initProgress(ids) {
+  progressBox = addMsg("", "progress");
+  ids.forEach((gid) => {
+    const row = document.createElement("div"); row.className = "pg-row";
+    row.innerHTML = `<span class="pg-name">${gid}</span>
+      <span class="pg-track"><span class="pg-fill"></span></span>
+      <span class="pg-pct">0%</span><span class="pg-stage">queued…</span>`;
+    progressBox.appendChild(row);
+    progressEls[gid] = { fill: row.querySelector(".pg-fill"), stage: row.querySelector(".pg-stage"),
+                         pct: row.querySelector(".pg-pct"), value: 0 };
+  });
+  log.scrollTop = log.scrollHeight;
+}
+
+function setProgress(gid, pct, stage) {
+  const p = progressEls[gid];
+  if (!p) return;
+  p.value = Math.max(p.value, Math.min(100, pct));   // monotonic
+  p.fill.style.width = p.value + "%";
+  p.pct.textContent = Math.round(p.value) + "%";
+  if (stage) p.stage.textContent = stage;
+}
+
+// map raw pipeline statuses to friendly stages + progress
+const STAGES = [
+  [/clip DEM/i,          8,  "preparing terrain (DEM, flow direction, accumulation)…"],
+  [/clip @gauge/i,       10, null],
+  [/derived from the DEM/i, 12, "flow network rebuilt from the DEM (pysheds)"],
+  [/SNOW17 enabled/i,    14, "snow module ON (cold basin detected)"],
+  [/no snow/i,           14, "snow module off (warm basin)"],
+  [/stored best parameters/i, 16, "loading this basin's best-known parameters"],
+  [/reused .* cached/i,  18, "reusing cached results for the overlap"],
+  [/USGS observed/i,     20, "fetched observed discharge from USGS"],
+  [/warm start from exact/i, 45, "warm-starting from a saved model state"],
+  [/short warm-up/i,     30, "short warm-up bridging to the saved state…"],
+  [/-day warm-up from/i, 25, "downloading forcing + warming up the soil state…"],
+  [/warm-up disabled/i,  25, "cold start (no warm-up)"],
+  [/running warm-up/i,   35, "running the warm-up simulation…"],
+  [/warm-up done/i,      55, "warm-up finished — initial state saved"],
+  [/running CREST/i,     60, "CREST is running — hydrograph streaming live…"],
+  [/served entirely from cache/i, 95, "results served from cache"],
+];
+
+function progressFromStatus(gid, msg) {
+  for (const [re, pct, label] of STAGES) {
+    if (re.test(msg)) { setProgress(gid, pct, label || undefined); return; }
+  }
+  if (/⚠️/.test(msg)) setProgress(gid, undefined === undefined ? (progressEls[gid]?.value || 0) : 0,
+                                  msg.replace(/⚠️\s*/, "⚠ ").slice(0, 90));
+}
+
+function progressFromRows(gid) {
+  const n = (simHydro[gid] || []).length;
+  const exp = lastSim?.expectedSteps || 49;
+  setProgress(gid, 60 + 38 * Math.min(1, n / exp),
+              `simulating — ${n}/${exp} timesteps`);
+}
+
+async function fetchEventInfo() {
+  if (!queryCtx?.label) return;
+  const card = addMsg(`<div class="news-h">📰 About this event — ${escapeHtml(queryCtx.label)}</div>` +
+                      `<i>looking up impacts, damage and news…</i>`, "news");
+  try {
+    const r = await fetch("/api/eventinfo", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label: queryCtx.label, t_start: queryCtx.t_start, t_end: queryCtx.t_end }),
+    });
+    const d = await r.json();
+    card.innerHTML = `<div class="news-h">📰 About this event — ${escapeHtml(queryCtx.label)}</div>` +
+                     mdLite(d.text || "(no information found)");
+  } catch (_) {
+    card.innerHTML += "<br><i>(event lookup unavailable)</i>";
+  }
+}
+
+// minimal markdown: links + bold + newlines (LLM output is short + trusted-ish)
+function mdLite(t) {
+  return escapeHtml(t)
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/\n/g, "<br>");
+}
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ---- auto-calibration offer (NSE < 0.3) ---------------------------------
+const calOffered = new Set();
+function maybeOfferCalibration(gid, metrics) {
+  const nse = metrics && metrics.nsce;
+  if (nse == null || nse >= 0.3 || calOffered.has(gid)) return;
+  calOffered.add(gid);
+  const card = addMsg(
+    `📉 <b>${gid}</b> finished with NSE = <b>${nse}</b> (below 0.3 — a weak fit). ` +
+    `Want help calibrating the parameters?` +
+    `<div class="btn-row"><button class="primary" data-act="ai">🤖 AI calibration</button>` +
+    `<button data-act="manual">🛠 I'll adjust manually</button></div>`, "bot");
+  card.querySelector('[data-act="ai"]').onclick = () => { card.querySelector(".btn-row").remove(); startCalibration(gid); };
+  card.querySelector('[data-act="manual"]').onclick = () => {
+    card.querySelector(".btn-row").remove();
+    const lp = document.getElementById("left-panel");
+    lp.classList.remove("collapsed");
+    document.getElementById("adv-body").classList.remove("hidden");
+    document.getElementById("adv-arrow").textContent = "▾";
+    addMsg("🛠 Opened <b>Model options → Advanced parameters</b>. Adjust values and hit Simulate again — " +
+      "if your run beats the stored NSE, the parameters are saved for this basin automatically.", "bot");
+  };
+}
+
+async function startCalibration(gid) {
+  if (!lastSim) return;
+  const opt = readOptions();
+  addMsg(`🤖 Starting AI calibration for <b>${gid}</b> — the assistant proposes parameter changes ` +
+    `(within hydrologic bounds), tests each with a real 1-D model run, and keeps the best. ` +
+    `The winning parameters are saved for this basin.`, "bot");
+  const box = addMsg("", "progress");
+  const row = document.createElement("div"); row.className = "pg-row";
+  row.innerHTML = `<span class="pg-name">${gid} 🎯</span>
+    <span class="pg-track"><span class="pg-fill cal"></span></span>
+    <span class="pg-pct">0%</span><span class="pg-stage">baseline run…</span>`;
+  box.appendChild(row);
+  const fill = row.querySelector(".pg-fill"), stage = row.querySelector(".pg-stage"),
+        pct = row.querySelector(".pg-pct");
+
+  const r = await fetch("/api/calibrate", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ gauge_id: gid, t_start: lastSim.tStart,
+                           t_end: lastSim.tEnd || new Date(new Date(lastSim.tStart).getTime() + lastSim.hours * 3600e3).toISOString().slice(0, 19),
+                           model: opt.model, snow: opt.snow }),
+  });
+  const d = await r.json();
+  const es = new EventSource(`/api/calstream/${d.cal_id}`);
+  es.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    if (ev.kind === "cal_status") {
+      stage.textContent = ev.msg.slice(0, 90);
+    } else if (ev.kind === "cal_round") {
+      const last = (ev.tried || [])[ev.tried.length - 1];
+      const p = last && last.progress ? last.progress * 100 : undefined;
+      if (p) { fill.style.width = p + "%"; pct.textContent = Math.round(p) + "%"; }
+      stage.textContent = `round ${ev.round}: best NSE so far ${ev.best_nse}`;
+    } else if (ev.kind === "cal_hydro") {
+      simHydro[gid] = ev.rows;                     // preview the improving fit
+      if (gid === panelGauge) renderHydro(gid);
+    } else if (ev.kind === "cal_done") {
+      es.close();
+      fill.style.width = "100%"; pct.textContent = "100%";
+      if (ev.error) { stage.textContent = "failed: " + ev.error; return; }
+      stage.textContent = `done — NSE ${ev.baseline_nse} → ${ev.best_nse}`;
+      addMsg(`🎯 Calibration finished for <b>${gid}</b>: NSE <b>${ev.baseline_nse}</b> → <b>${ev.best_nse}</b>` +
+        (ev.saved ? " — saved as this basin's best parameter set (it will be used automatically from now on)."
+                  : " — did not beat the stored parameters, keeping the previous set.") +
+        ` Hit <b>Simulate</b> again to re-run with the ${ev.saved ? "new" : "existing"} parameters (with the 2-D map).`, "bot");
+    }
+  };
+  es.onerror = () => es.close();
 }
 
 // ---- streamflow time animation -----------------------------------------
@@ -203,6 +419,9 @@ function resetAnim() {
   Object.keys(gaugeFrames).forEach((k) => delete gaugeFrames[k]);
   animTimes = []; animMax = 0; animIdx = 0;
   document.getElementById("anim").classList.add("hidden");
+  Object.values(overlays).forEach((o) => q2dGroup.removeLayer(o));
+  Object.keys(overlays).forEach((k) => delete overlays[k]);
+  document.getElementById("q-legend").classList.add("hidden");
 }
 
 function showAnim() {
@@ -219,7 +438,7 @@ function setFrame(idx) {
     const i = Math.min(animIdx, info.n - 1);
     const url = `/api/frame/${currentSim}/${gid}/${i}.png`;
     if (overlays[gid]) { overlays[gid].setUrl(url); if (info.bounds) overlays[gid].setBounds(info.bounds); }
-    else if (info.bounds) overlays[gid] = L.imageOverlay(url, info.bounds, { opacity: 0.9, interactive: false }).addTo(map);
+    else if (info.bounds) addOverlay(gid, url, info.bounds);
   });
 }
 
@@ -236,18 +455,43 @@ function stopPlay() {
   document.getElementById("anim-play").textContent = "▶";
 }
 
+function addOverlay(gid, url, bounds) {
+  overlays[gid] = L.imageOverlay(url, bounds,
+    { opacity: 0.9, interactive: false, pane: "q2d" }).addTo(q2dGroup);
+  document.getElementById("q-legend").classList.remove("hidden");
+  if (!zoomedToOverlay) {                 // make the 2-D layer impossible to miss
+    zoomedToOverlay = true;
+    try { map.fitBounds(bounds, { padding: [60, 60] }); } catch (_) {}
+  }
+}
+
 function updateOverlay(simId, gid, bounds, frame) {
   const url = `/api/overlay/${simId}/${gid}.png?f=${frame}`;
   if (overlays[gid]) { overlays[gid].setBounds(bounds); overlays[gid].setUrl(url); }
-  else overlays[gid] = L.imageOverlay(url, bounds, { opacity: 0.85, interactive: false }).addTo(map);
+  else addOverlay(gid, url, bounds);
 }
 
-// ---- right panel: focus a gauge + live hydrograph ----------------------
+// ---- right panel: gauge tabs + live hydrograph ---------------------------
+function renderTabs() {
+  const bar = document.getElementById("rp-tabs");
+  const ids = Object.keys(simHydro);
+  bar.innerHTML = "";
+  ids.forEach((id) => {
+    const t = document.createElement("button");
+    t.className = "rp-tab" + (id === panelGauge ? " active" : "") +
+                  (gaugeState[id] === "done" ? " done" : gaugeState[id] === "running" ? " running" : "");
+    t.innerHTML = `<span class="dot"></span>${id}`;
+    t.onclick = () => focusGauge(id);
+    bar.appendChild(t);
+  });
+}
+
 function focusGauge(id) {
   panelGauge = id;
   const g = gaugeData[id];
   document.getElementById("right-panel").classList.remove("hidden");
   document.getElementById("rp-title").textContent = `${id} · ${g ? g.name : ""}`;
+  renderTabs();
   renderStats(id);
   renderHydro(id);
   renderReport(id);
@@ -294,8 +538,10 @@ function renderHydro(id) {
   const maxp = Math.max(0.1, ...pr);
   Plotly.react(el, [
     { x, y: pr, name: "Precip", type: "bar", marker: { color: "#5b9bd5" }, yaxis: "y2", opacity: 0.7 },
-    { x, y: obs, name: "Obs Q", mode: "lines", line: { color: "#f4f4f4", width: 1.3 } },
-    { x, y: sim, name: "Sim Q", mode: "lines", line: { color: "#4cc9a0", width: 1.6 } },
+    { x, y: obs, name: "Obs Q", mode: "lines",
+      line: { color: "#f4f4f4", width: 1.3, shape: "spline", smoothing: 0.8 } },
+    { x, y: sim, name: "Sim Q", mode: "lines",
+      line: { color: "#4cc9a0", width: 1.8, shape: "spline", smoothing: 0.8 } },
   ], {
     height: 250, margin: { l: 46, r: 46, t: 12, b: 30 }, bargap: 0,
     showlegend: true, legend: { orientation: "h", y: 1.18, font: { size: 9 } },
@@ -306,17 +552,99 @@ function renderHydro(id) {
   }, { displayModeBar: false, responsive: true });
 }
 
-// ---- chat select shortcuts ("simulate all") ----------------------------
+// ---- chat routing ---------------------------------------------------------
+const DATE_RANGE = /(\d{4}-\d{2}-\d{2})(?:\s*(?:to|through|–|—|-)\s*(\d{4}-\d{2}-\d{2}))?/;
+
 function handleChat(text) {
-  const t = text.trim().toLowerCase();
-  if (/simulate all|all gauges|run all/.test(t)) {
+  const t = text.trim();
+  const tl = t.toLowerCase();
+  if (/simulate all|all gauges|run all/.test(tl)) {
     Object.keys(gaugeData).forEach((id) => selected.add(id));
     refreshSelection();
-    if (selected.size > MAX_SIMS) addMsg(`⚠️ ${selected.size} selected — the demo runs at most ${MAX_SIMS} at once.`, "status");
+    addMsg(`⚠️ ${selected.size} gauges selected — the demo runs at most ${MAX_SIMS} at once; ` +
+      `picking just the few nearest the event is faster and clearer.`, "status");
     return;
   }
-  runQuery(text);
+  // reply to the "when did this happen?" prompt: a date range or single date
+  const dm = t.match(DATE_RANGE);
+  if (awaitingTime && dm) {
+    awaitingTime = false;
+    const start = dm[1], end = dm[2];
+    queryCtx = queryCtx || {};
+    queryCtx.t_start = `${start}T00:00:00`;
+    queryCtx.t_end = end ? `${end}T00:00:00` : null;
+    document.getElementById("k-start").value = start;
+    addMsg(escapeHtml(t), "user");
+    addMsg(`🗓️ Got it — simulation window starts <b>${start}</b>${end ? ` and ends <b>${end}</b>` : ""}. ` +
+      `Select gauges and hit Simulate.`, "bot");
+    return;
+  }
+  // a pasted link (or anything else) while waiting for time -> re-parse with context
+  if (awaitingTime && /https?:\/\//.test(t)) {
+    awaitingTime = false;
+    runQuery(`${pendingQuery || ""} ${t}`.trim());
+    return;
+  }
+  runQuery(t);
 }
+
+// ---- auth: HF OAuth + profile modal ---------------------------------------
+async function initAuth() {
+  try {
+    const r = await fetch("/api/me");
+    const d = await r.json();
+    const el = document.getElementById("auth");
+    if (!d.user) { el.innerHTML = `<a class="tb-btn" href="/login">Sign in</a>`; return; }
+    const pic = d.user.picture ? `<img src="${d.user.picture}" alt="">` : "👤";
+    el.innerHTML = `<button class="tb-btn" id="auth-btn">${pic} ${escapeHtml(d.user.name || d.user.username)}</button>`;
+    document.getElementById("auth-btn").onclick = () => openProfile(d);
+  } catch (_) {}
+}
+
+function openProfile(d) {
+  const m = document.getElementById("profile-modal");
+  m.classList.remove("hidden");
+  document.getElementById("pm-name").textContent = d.user.name || d.user.username;
+  document.getElementById("pm-username").textContent = "@" + d.user.username + (d.user.dev ? " (dev mode)" : "");
+  const av = document.getElementById("pm-avatar");
+  if (d.user.picture) { av.src = d.user.picture; av.style.display = ""; } else av.style.display = "none";
+  const p = d.profile || {};
+  ["display_name", "affiliation", "email", "bio"].forEach((k) => {
+    document.getElementById("pf-" + k).value = p[k] || "";
+  });
+}
+
+document.getElementById("pm-close").onclick = () =>
+  document.getElementById("profile-modal").classList.add("hidden");
+document.getElementById("profile-modal").addEventListener("click", (e) => {
+  if (e.target.id === "profile-modal") e.target.classList.add("hidden");
+});
+document.getElementById("pf-save").onclick = async () => {
+  const body = {};
+  ["display_name", "affiliation", "email", "bio"].forEach((k) => {
+    body[k] = document.getElementById("pf-" + k).value;
+  });
+  const r = await fetch("/api/profile", { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  document.getElementById("pf-saved").textContent = r.ok ? "✓ saved" : "⚠ failed";
+  setTimeout(() => { document.getElementById("pf-saved").textContent = ""; }, 2500);
+};
+
+// ---- AI info toggle --------------------------------------------------------
+const aiBtn = document.getElementById("ai-info-btn");
+function renderAiBtn() {
+  aiBtn.textContent = `🤖 AI info: ${aiInfo ? "ON" : "OFF"}`;
+  aiBtn.classList.toggle("on", aiInfo);
+}
+aiBtn.onclick = () => {
+  aiInfo = !aiInfo;
+  localStorage.setItem("aiInfo", aiInfo ? "on" : "off");
+  renderAiBtn();
+  addMsg(aiInfo
+    ? "🤖 AI info ON — you'll see progress bars, plain-word stages and event background instead of raw logs."
+    : "🤖 AI info OFF — showing the raw model log.", "status");
+};
+renderAiBtn();
 
 // ---- wire UI -----------------------------------------------------------
 document.getElementById("chat-send").onclick = () => {
@@ -383,3 +711,7 @@ document.getElementById("adv-toggle").onclick = () => {
 
 document.getElementById("anim-play").onclick = togglePlay;
 document.getElementById("anim-slider").oninput = (e) => { stopPlay(); setFrame(parseInt(e.target.value)); };
+
+// ---- boot ----------------------------------------------------------------
+initAuth();
+loadViewportGauges();               // gauge pins visible with zero AI interaction

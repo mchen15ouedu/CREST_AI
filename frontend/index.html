@@ -15,6 +15,8 @@
     <span class="brand">🌊 CREST_demo</span>
     <span class="sub">agentic flash-flood analysis</span>
     <span id="selinfo" class="selinfo"></span>
+    <button id="ai-info-btn" class="tb-btn on" title="Show model progress + event background instead of raw logs">🤖 AI info: ON</button>
+    <span id="auth"><a class="tb-btn" href="/login">Sign in</a></span>
   </div>
 
   <!-- LEFT: model operation knobs -->
@@ -52,9 +54,10 @@
     </div>
   </div>
 
-  <!-- RIGHT: results / hydrograph / report -->
+  <!-- RIGHT: results / hydrograph / report, one tab per simulated gauge -->
   <div id="right-panel" class="panel hidden">
     <div class="panel-head"><span id="rp-title">Gauge</span> <button class="close" data-target="right-panel">✕</button></div>
+    <div id="rp-tabs"></div>
     <div class="panel-body">
       <div id="rp-stats" class="stats"></div>
       <div id="rp-hydro" class="plot"></div>
@@ -62,22 +65,55 @@
     </div>
   </div>
 
-  <!-- BOTTOM-CENTER: streamflow time animation -->
+  <!-- streamflow legend (visible while a 2-D overlay is on the map) -->
+  <div id="q-legend" class="hidden">
+    <div class="q-title">Streamflow (m³/s)</div>
+    <div class="q-bar"></div>
+    <div class="q-ticks"><span>1</span><span id="q-max">1000</span></div>
+  </div>
+
+  <!-- BOTTOM-CENTER (above chat): streamflow time animation -->
   <div id="anim" class="hidden">
     <button id="anim-play" title="Play / pause">▶</button>
     <input type="range" id="anim-slider" min="0" max="0" value="0" step="1" />
     <span id="anim-time">—</span>
   </div>
 
-  <!-- BOTTOM: chat -->
+  <!-- BOTTOM: chat, full width -->
   <div id="chat">
     <div id="chat-log">
-      <div class="msg bot">Ask me about a flood — e.g. <i>“flood in Kerrville, Texas, Summer 2025”</i>. I’ll map the event and nearby USGS gauges. Then choose <b>a few gauges of interest</b> — click the pins near the event or draw a small box. This demo runs best with just a handful at a time.</div>
+      <div class="msg bot">Ask me about a flood — e.g. <i>“flood in Kerrville, Texas, Summer 2025”</i> — or just
+        <b>pick gauges straight from the map</b> (blue pins are USGS gauges; click them or draw a small box).
+        This demo runs best with a handful of gauges at a time.</div>
     </div>
     <div id="chat-input">
-      <input id="chat-text" placeholder="Describe a flood event…" autocomplete="off" />
+      <input id="chat-text" placeholder="Describe a flood event, paste a news link, or give a date range…" autocomplete="off" />
       <button id="chat-send">Send</button>
       <button id="btn-sim" class="primary" disabled>▶ Simulate (0)</button>
+    </div>
+  </div>
+
+  <!-- profile / security modal -->
+  <div id="profile-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head"><span id="pm-title">👤 Profile</span><button id="pm-close">✕</button></div>
+      <div class="modal-body">
+        <div class="pm-user"><img id="pm-avatar" src="" alt="" /><div>
+          <div id="pm-name" class="pm-name"></div><div id="pm-username" class="pm-sub"></div></div>
+        </div>
+        <h4>Profile</h4>
+        <label>Display name<input id="pf-display_name" /></label>
+        <label>Affiliation<input id="pf-affiliation" placeholder="e.g. University of Oklahoma" /></label>
+        <label>Contact email<input id="pf-email" type="email" /></label>
+        <label>Bio<textarea id="pf-bio" rows="3"></textarea></label>
+        <button id="pf-save" class="primary">Save profile</button>
+        <span id="pf-saved" class="pm-sub"></span>
+        <h4>Security</h4>
+        <p class="pm-sub">You sign in with your Hugging Face account — password and two-factor
+          authentication are managed there.</p>
+        <a class="btn-link" href="https://huggingface.co/settings/account" target="_blank" rel="noopener">🔑 Change password / 2FA on Hugging Face ↗</a>
+        <a class="btn-link" href="/logout">🚪 Sign out</a>
+      </div>
     </div>
   </div>
 

@@ -38,6 +38,35 @@ def available() -> list[str]:
     return [p["name"] for p in _providers()]
 
 
+def event_brief(label: str, t_start: str, t_end: str) -> tuple[str, str]:
+    """Short, readable brief about a flood event (impacts, damage, fatalities,
+    links) shown in chat while the model runs. Tries OpenAI's web-search tool
+    (Responses API) for post-cutoff events; falls back to plain LLM knowledge
+    with an explicit caveat. Returns (markdown_text, provider_tag)."""
+    q = (f"Flood event near {label}, roughly {t_start} to {t_end}. In <=150 words of "
+         "markdown, summarize for a dashboard reader: what happened, rainfall/river "
+         "context, damage, fatalities if known, and 1-3 source links (markdown links). "
+         "If you are not certain of specifics, say so plainly rather than inventing "
+         "numbers or links.")
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        try:                                    # web-grounded (Responses API)
+            from openai import OpenAI
+            r = OpenAI(api_key=key).responses.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
+                tools=[{"type": "web_search_preview"}],
+                input=q)
+            txt = getattr(r, "output_text", "") or ""
+            if txt.strip():
+                return txt.strip(), "openai+web"
+        except Exception:
+            pass
+    txt, prov = chat([{"role": "system",
+                       "content": "You are a concise flood-event briefer for a dashboard."},
+                      {"role": "user", "content": q}], temperature=0.3, max_tokens=400)
+    return txt.strip(), prov
+
+
 def chat(messages: list[dict], temperature: float = 0.2, max_tokens: int = 800,
          json_mode: bool = False) -> tuple[str, str]:
     """Try each provider in priority order; return (content, provider_name)."""

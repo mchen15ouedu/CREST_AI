@@ -45,3 +45,6 @@ openai                 # LLM client; used with vLLM (OpenAI-compatible) or OpenA
 fastapi
 uvicorn[standard]
 sse-starlette
+authlib                # HF OAuth (Sign in with Hugging Face)
+itsdangerous           # starlette SessionMiddleware
+httpx                  # authlib async client

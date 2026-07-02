@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from hf_data import basic, forcing, gauges, multipliers, obs, params, statecache
+from hf_data import basic, forcing, gauges, multipliers, obs, params, paramstore, statecache
 from hf_data import snow as _snow
 from hf_data.control import build_control, ControlSpec, Gauge
 from hf_data.runner import MockEF5, run_ef5, stream_run
@@ -38,6 +38,7 @@ class EventCtx:
     t_end: datetime
     label: str
     gauge_hint: str | None = None   # if the query named a gauge id
+    time_known: bool = True         # False -> dates are a guess; UI asks the user
 
 # tiny offline gazetteer so the demo works without an LLM key
 _GAZETTEER = {
@@ -54,13 +55,13 @@ def parse_query(query: str, hours: int = 48, llm_model: str | None = None) -> Ev
     if m:
         c = gauges.get_gauge_coordinates(m.group(1)) or (35.0, -97.0)
         return EventCtx(anchor=c, t_start=datetime(2025, 7, 3), t_end=datetime(2025, 7, 3) + timedelta(hours=hours),
-                        label=f"gauge {m.group(1)}", gauge_hint=m.group(1))
+                        label=f"gauge {m.group(1)}", gauge_hint=m.group(1), time_known=False)
     # explicit "lat,lon"
     m = re.search(r"(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)", q)
     if m:
         c = (float(m.group(1)), float(m.group(2)))
         return EventCtx(anchor=c, t_start=datetime(2025, 7, 3), t_end=datetime(2025, 7, 3) + timedelta(hours=hours),
-                        label=f"{c[0]:.3f},{c[1]:.3f}")
+                        label=f"{c[0]:.3f},{c[1]:.3f}", time_known=False)
     # LLM path — vLLM first, OpenAI last (hf_data.llm)
     from hf_data import llm as _llm
     if _llm.available():
@@ -73,7 +74,7 @@ def parse_query(query: str, hours: int = 48, llm_model: str | None = None) -> Ev
     for key, c in _GAZETTEER.items():
         if key in ql:
             return EventCtx(anchor=c, t_start=datetime(2025, 7, 3), t_end=datetime(2025, 7, 3) + timedelta(hours=hours),
-                            label=key.title())
+                            label=key.title(), time_known=False)
     raise ValueError("Could not parse a location. Try a place name, 'lat,lon', or a USGS gauge id "
                      "(an OpenAI key enables free-form parsing).")
 
@@ -82,18 +83,25 @@ def _parse_with_llm(query: str, hours: int) -> EventCtx:
     """Parse a free-form query via the LLM router (vLLM -> OpenAI)."""
     import json
     from hf_data import llm
-    sys_p = ("You extract a flood-event location and time window from a free-form query. "
+    sys_p = ("You extract a flood-event location and time window from a free-form query "
+             "(which may include a news-article URL — use its slug/date if present). "
              "Return STRICT JSON only.")
     user_p = (f'Query: "{query}".\n'
               'Return JSON: {"location_name": str (e.g. "Kerrville, TX"), '
               '"lat": float, "lon": float, '
-              '"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}. '
-              'lat/lon = the event centre; if only a season/month is given, pick a plausible '
-              'date range within it.')
+              '"start": "YYYY-MM-DD" or null, "end": "YYYY-MM-DD" or null}. '
+              'lat/lon = the event centre. If you can identify the specific event, give its '
+              'date range; if the query names a season/month, pick a plausible range within '
+              'it; if the query gives NO usable time information at all, set start to null.')
     txt, provider = llm.chat(
         [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
         temperature=0.1, json_mode=True)
     d = json.loads(txt)
+    if not d.get("start"):
+        t0 = datetime(2025, 7, 3)
+        return EventCtx(anchor=(float(d["lat"]), float(d["lon"])), t_start=t0,
+                        t_end=t0 + timedelta(hours=hours),
+                        label=f'{d["location_name"]} · {provider}', time_known=False)
     t0 = datetime.fromisoformat(d["start"])
     t1 = datetime.fromisoformat(d["end"]) if d.get("end") else t0 + timedelta(hours=hours)
     return EventCtx(anchor=(float(d["lat"]), float(d["lon"])), t_start=t0, t_end=t1,
@@ -195,6 +203,7 @@ def gauge_info(gauge_id: str):
 def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "auto",
               use_mock: bool = True, hours: int = 48, overrides: dict | None = None,
               snow: str = "auto", timestep: str = "1h", warmup_days: int = WARMUP_DAYS,
+              grids: bool = True, no_cache: bool = False,
               workdir: str | None = None):
     """Per-gauge streaming run (map flow: gauge already chosen). Yields events."""
     g = gauge_info(gauge_id)
@@ -216,11 +225,17 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
 
     # --- result cache: reuse overlap, simulate only the missing window (task #6) ---
     # the row cache is hourly; a sub-hourly run neither reuses nor writes it
-    hourly = timestep == "1h"
-    pl = (statecache.plan(g["id"], ef5_model, t_start, t_end) if hourly else
-          {"cached_rows": [], "run_start": t_start, "run_end": t_end,
-           "load_state_time": None, "warmup_from": None, "need_warmup": True,
-           "reason": "sub-hourly timestep — cache bypassed"})
+    hourly = timestep == "1h" and not no_cache
+    pl = statecache.plan(g["id"], ef5_model, t_start, t_end) if timestep == "1h" else {
+        "cached_rows": [], "run_start": t_start, "run_end": t_end,
+        "load_state_time": None, "warmup_from": None, "need_warmup": True,
+        "reason": "sub-hourly timestep — cache bypassed"}
+    if no_cache:            # calibration: fresh full-window run; candidates
+        # still warm-start from any state saved on disk at/near t_start
+        ex, wfrom, needw = statecache._state_choice(g["id"], ef5_model, t_start)
+        pl = {"cached_rows": [], "run_start": t_start, "run_end": t_end,
+              "load_state_time": ex, "warmup_from": wfrom, "need_warmup": needw,
+              "reason": "calibration run — row cache bypassed"}
     if pl["cached_rows"]:
         yield ("status", f"♻️ reused {len(pl['cached_rows'])} cached step(s) "
                          f"({pl['cached_rows'][0]['time']}…{pl['cached_rows'][-1]['time']})")
@@ -259,10 +274,19 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
         # HP water balance has its own 2 params (fractions in [0,1]);
         # calibrated KW routing params are still used
         wb = {"precip": 1.0, "split": 0.5}
+    stored = paramstore.get(g["id"], ef5_model)       # best-known set for this basin
+    if stored:
+        wb = {**wb, **{k: v for k, v in stored.get("wb", {}).items() if k in wb}}
+        kw = {**kw, **{k: v for k, v in stored.get("kw", {}).items() if k in kw}}
+        yield ("status", f"🎯 using stored best parameters ({stored.get('source','?')}, "
+                         f"NSE {stored.get('nse')}, {stored.get('when','')})")
     if overrides:                                     # advanced-panel overrides
         wb = {**wb, **{k: v for k, v in overrides.items() if k in wb}}
         kw = {**kw, **{k: v for k, v in overrides.items() if k in kw}}
-    grids = params.clip_param_grids(bbox, param_dir)
+    yield ("params", {"wb": wb, "kw": kw, "model": ef5_model,
+                      "source": ("override" if overrides else
+                                 stored.get("source", "stored") if stored else "a-priori")})
+    pgrids = params.clip_param_grids(bbox, param_dir)
 
     # --- snow detection (task #7): temp-driven, with user override ---
     snow_ov = ({k: overrides[k] for k in _snow.SNOW_DEFAULTS if overrides and k in overrides}
@@ -309,7 +333,8 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
         pet_dir=os.path.join(work, "PET"), output_dir=out_dir, usgs_dir=usgs_dir,
         gauges=[Gauge(g["id"], g["lon"], g["lat"], g["area"])],
         crest=wb, kw=kw, model=ef5_model.upper(),
-        param_grids=grids, state_dir=sdir, warmup_start=warmup_start,
+        param_grids=pgrids, output_grids=grids,
+        state_dir=sdir, warmup_start=warmup_start,
         snow_on=snow_on, snow_scalars=snow_scalars, snow_grids=snow_grids, temp_dir=temp_dir)
     build_control(spec)
 
@@ -340,6 +365,7 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
     if use_mock:
         handle = MockEF5(out_dir, gauge_id=g["id"], model=ef5_model, bounds=bbox,
                          n_steps=run_hours + 1, t0=run_start, delay=0.15,   # inclusive of run_end
+                         write_grids=grids,
                          facc_path=os.path.join(basic_dir, "facc_clip.tif")).start()
     else:
         handle = run_ef5(spec.control_path, out_dir, g["id"], model=ef5_model)

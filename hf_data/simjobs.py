@@ -37,6 +37,7 @@ class SimJob:
         self.frames: dict[str, list] = {}        # gid -> [(png_bytes, bounds, time_label)]
         self.hydro: dict[str, list] = {}         # gid -> accumulated rows
         self.meta: dict[str, dict] = {}          # gid -> {id,name,area,lat,lon,model}
+        self.params: dict[str, dict] = {}        # gid -> {wb,kw,model,source}
         self.done = threading.Event()
 
     def start(self):
@@ -60,6 +61,8 @@ class SimJob:
                     warmup_days=int(self.opts.get("warmup_days", 90))):
                 if kind == "meta":
                     self.meta[gid] = payload
+                elif kind == "params":
+                    self.params[gid] = payload      # effective wb/kw for paramstore
                 elif kind == "status":
                     self.q.put({"kind": "status", "gauge_id": gid, "msg": payload})
                 elif kind == "hydro":
@@ -105,6 +108,17 @@ class SimJob:
         try:
             rows = self.hydro.get(gid, [])
             metrics = analysis.compute_metrics(rows)
+            # any completed run that beats the stored NSE becomes the new best
+            # parameter set for this basin (manual overrides included)
+            p = self.params.get(gid)
+            if p and metrics.get("nsce") is not None and not USE_MOCK:
+                try:
+                    from hf_data import paramstore
+                    paramstore.maybe_save(gid, p["model"], p["wb"], p["kw"],
+                                          metrics["nsce"], source=p.get("source", "run"),
+                                          window=[str(self.t_start), str(self.t_end)])
+                except Exception:
+                    pass
             report = analysis.build_report(self.meta.get(gid), metrics,
                                            self.t_start, self.t_end)
             self.q.put({"kind": "result", "gauge_id": gid,

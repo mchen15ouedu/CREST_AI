@@ -5,6 +5,8 @@ colorFrom: blue
 colorTo: green
 sdk: docker
 app_port: 7860
+hf_oauth: true
+hf_oauth_expiration_minutes: 43200
 pinned: false
 license: cc0-1.0
 short_description: Agentic flash-flood analysis with live CREST hydrographs
