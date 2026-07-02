@@ -1,69 +1,78 @@
+"""CREST_demo — agentic flash-flood dashboard (HF Space, Docker SDK).
+
+A chat query drives the full pipeline (parse -> basin -> gauge -> data ->
+calibrated params -> run) with a LIVE hydrograph + 2-D streamflow that stream
+while CREST runs. Locally the run is mocked and parsing uses a deterministic
+fallback; on the Space (OPENAI_API_KEY + the fork binary) both are real.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import gradio as gr
-from huggingface_hub import InferenceClient
+from hf_data.pipeline import analyze
+from hf_data.viz import hydrograph_fig, q2d_fig, empty_fig
+
+USE_MOCK = os.environ.get("CREST_DEMO_MOCK", "1") == "1"   # real ef5 on the Space
+
+INTRO = ("Ask me to analyze a flood — e.g. *“flash flood near Allagash this July”*, "
+         "*“Kerr County, TX July 2025”*, a `lat,lon`, or a USGS gauge id like `01011000`.")
 
 
-def respond(
-    message,
-    history: list[dict[str, str]],
-    system_message,
-    max_tokens,
-    temperature,
-    top_p,
-    hf_token: gr.OAuthToken,
-):
-    """
-    For more information on `huggingface_hub` Inference API support, please check the docs: https://huggingface.co/docs/huggingface_hub/v0.22.2/en/guides/inference
-    """
-    client = InferenceClient(token=hf_token.token, model="openai/gpt-oss-20b")
-
-    messages = [{"role": "system", "content": system_message}]
-
-    messages.extend(history)
-
-    messages.append({"role": "user", "content": message})
-
-    response = ""
-
-    for message in client.chat_completion(
-        messages,
-        max_tokens=max_tokens,
-        stream=True,
-        temperature=temperature,
-        top_p=top_p,
-    ):
-        choices = message.choices
-        token = ""
-        if len(choices) and choices[0].delta.content:
-            token = choices[0].delta.content
-
-        response += token
-        yield response
+def chat_run(message, history):
+    history = (history or []) + [{"role": "user", "content": message},
+                                 {"role": "assistant", "content": "…"}]
+    hydro = empty_fig("hydrograph…")
+    q2d = empty_fig("2-D streamflow…")
+    rows, last_q, log = [], None, []
+    yield history, hydro, q2d
+    try:
+        for kind, payload in analyze(message, use_mock=USE_MOCK, hours=48):
+            if kind == "status":
+                log.append(payload)
+            elif kind == "hydro":
+                rows += payload["rows"]
+                hydro = hydrograph_fig(rows)
+            elif kind == "q2d":
+                last_q = payload["path"]
+                q2d = q2d_fig(last_q)
+            elif kind == "done":
+                peak = max((r["sim_q"] for r in rows if r["sim_q"] is not None), default=0.0)
+                log.append(f"✅ **Complete** — {len(rows)} timesteps · peak Q **{peak:.1f} m³/s**")
+                if last_q:
+                    q2d = q2d_fig(last_q)
+                hydro = hydrograph_fig(rows, "Hydrograph — complete") if rows else hydro
+            history[-1]["content"] = "\n\n".join(log) or "…"
+            yield history, hydro, q2d
+    except Exception as e:
+        history[-1]["content"] = f"⚠️ {e}"
+        yield history, hydro, q2d
 
 
-"""
-For information on how to customize the ChatInterface, peruse the gradio docs: https://www.gradio.app/docs/chatinterface
-"""
-chatbot = gr.ChatInterface(
-    respond,
-    additional_inputs=[
-        gr.Textbox(value="You are a friendly Chatbot.", label="System message"),
-        gr.Slider(minimum=1, maximum=2048, value=512, step=1, label="Max new tokens"),
-        gr.Slider(minimum=0.1, maximum=4.0, value=0.7, step=0.1, label="Temperature"),
-        gr.Slider(
-            minimum=0.1,
-            maximum=1.0,
-            value=0.95,
-            step=0.05,
-            label="Top-p (nucleus sampling)",
-        ),
-    ],
-)
+with gr.Blocks(title="CREST_demo") as demo:
+    gr.Markdown("## 🌊 CREST_demo — agentic flash-flood analysis\n"
+                "Natural-language query → CREST simulation with a **live** hydrograph + 2-D streamflow.")
+    with gr.Row():
+        with gr.Column(scale=1):
+            chatbot = gr.Chatbot(height=380, value=[{"role": "assistant", "content": INTRO}])
+            msg = gr.Textbox(placeholder="Describe a flood event…", label="Query", autofocus=True)
+            with gr.Row():
+                send = gr.Button("Analyze", variant="primary")
+                clear = gr.Button("Clear")
+            gr.Examples(["flash flood near Allagash this July", "Kerr County, TX July 2025",
+                         "Fort Cobb Oklahoma", "01011000"], inputs=msg)
+        with gr.Column(scale=2):
+            hydro_plot = gr.Plot(label="Hydrograph", value=empty_fig("ask a question to start"))
+            q2d_plot = gr.Plot(label="2-D streamflow", value=empty_fig("ask a question to start"))
 
-with gr.Blocks() as demo:
-    with gr.Sidebar():
-        gr.LoginButton()
-    chatbot.render()
+    outs = [chatbot, hydro_plot, q2d_plot]
+    send.click(chat_run, [msg, chatbot], outs).then(lambda: "", None, msg)
+    msg.submit(chat_run, [msg, chatbot], outs).then(lambda: "", None, msg)
+    clear.click(lambda: ([{"role": "assistant", "content": INTRO}],
+                         empty_fig("ask a question to start"), empty_fig("ask a question to start")),
+                None, outs)
 
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", server_port=7860, theme=gr.themes.Soft())

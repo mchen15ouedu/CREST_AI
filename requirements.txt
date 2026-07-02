@@ -1,0 +1,47 @@
+# --- Base scientific computing ---
+numpy<2.0.0
+pandas
+scipy
+matplotlib
+
+# --- Geospatial (GDAL/Shapely/GeoPandas/Rasterio) ---
+gdal==3.4.1
+shapely
+geopandas
+rasterio
+cartopy
+contextily
+dataretrieval
+
+# --- Visualization & maps ---
+folium
+mapclassify
+Pillow
+plotly
+
+# --- HF data layer (our additions: COG clip + PQF forcing + catalogs) ---
+huggingface_hub
+pyarrow
+truststore
+pysheds                # fallback: derive flow dir/acc from the clipped DEM
+
+# --- Utilities ---
+tqdm
+PyYAML
+opentelemetry-api
+
+# --- AI agents & tools ---
+requests==2.32.4
+tokenizers==0.22.0
+pypandoc
+crewai==0.75.0
+crewai-tools==0.13.2
+langchain_openai
+openai                 # LLM client; used with vLLM (OpenAI-compatible) or OpenAI API
+# NOTE: vLLM itself needs a GPU and runs as a SEPARATE endpoint (set VLLM_BASE_URL);
+#       it is NOT installed in this cpu-basic container.
+
+# --- Web app (FastAPI + Leaflet frontend) ---
+fastapi
+uvicorn[standard]
+sse-starlette

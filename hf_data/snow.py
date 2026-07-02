@@ -1,0 +1,171 @@
+"""SNOW17 snow detection + parameters (task #7-B).
+
+Snow decision (user-chosen: data-driven temp with LLM/user override):
+  - user override on/off wins;
+  - else a cheap season/region pre-screen skips obviously-warm cases (no temp
+    download); otherwise confirm from HF temperature forcing — enable SNOW17 if
+    the basin drops below ~freezing during the window.
+
+SNOW17 params: the 4 spatial grids (mfmax/mfmin/nmf/tipm) come from
+CREST_data param/snow17/ (grid x scalar-multiplier, default 1.0); the other 4
+(uadj/mbase/plwhc/scf) are scalars from hydro_cali_snow17.py defaults, overridable
+on the left panel.
+"""
+from __future__ import annotations
+
+import os
+from datetime import datetime, timedelta
+
+import numpy as np
+
+SNOW_THRESHOLD_C = float(os.environ.get("CREST_SNOW_TEMP_C", "1.0"))
+
+# scalar defaults (gridded ones are multipliers=1.0; others are absolute values)
+SNOW_DEFAULTS = {"uadj": 10.0, "mbase": -0.8, "mfmax": 1.0, "mfmin": 1.0,
+                 "tipm": 1.0, "nmf": 1.0, "plwhc": 0.10, "scf": 1.0}
+SNOW_GRID_COGS = {
+    "mfmax_grid": "param/snow17/mfmax_usa.tif",
+    "mfmin_grid": "param/snow17/mfmin_usa.tif",
+    "nmf_grid": "param/snow17/nmf_usa.tif",
+    "tipm_grid": "param/snow17/tipm_usa.tif",
+}
+_RESOLVE = "https://huggingface.co/datasets/vincewin/CREST_data/resolve/main"
+
+
+def snow_params(overrides: dict | None = None) -> dict:
+    p = dict(SNOW_DEFAULTS)
+    if overrides:
+        p.update({k: float(v) for k, v in overrides.items() if k in p})
+    return p
+
+
+def clip_snow_grids(bbox, out_dir: str, unsafe_ssl: bool | None = None) -> dict:
+    """Clip the 4 SNOW17 COGs to the basin. Returns {control_key: local_path}."""
+    import rasterio
+    from rasterio.windows import from_bounds
+    if unsafe_ssl is None:
+        unsafe_ssl = os.name == "nt"
+    if unsafe_ssl:
+        os.environ.setdefault("GDAL_HTTP_UNSAFESSL", "YES")
+    os.makedirs(out_dir, exist_ok=True)
+    W, S, E, N = bbox
+    out = {}
+    for key, cog in SNOW_GRID_COGS.items():
+        try:
+            with rasterio.open(f"/vsicurl/{_RESOLVE}/{cog}") as src:
+                win = from_bounds(W, S, E, N, src.transform).round_offsets().round_lengths()
+                data = src.read(1, window=win, boundless=True, fill_value=src.nodata)
+                if data.size == 0 or 0 in data.shape:
+                    continue
+                # standardized clip: Float32, strip-organized, nodata=-9999, WGS84
+                data = data.astype("float32")
+                if src.nodata is not None:
+                    data[data == float(src.nodata)] = -9999.0
+                profile = src.profile.copy()
+                profile.update(driver="GTiff", height=data.shape[0], width=data.shape[1],
+                               transform=src.window_transform(win),
+                               tiled=False, blockysize=1, dtype="float32",
+                               nodata=-9999.0, crs="EPSG:4326", interleave="pixel")
+                profile.pop("compress", None)  # EF5 TifGrid-safe: plain 1-row strips
+            path = os.path.join(out_dir, os.path.basename(cog).replace("_usa", ""))
+            with rasterio.open(path, "w", **profile) as dst:
+                dst.write(data, 1)
+            out[key] = path
+        except Exception:
+            pass
+    return out
+
+
+def _mean_elev(dem_path):
+    if not dem_path or not os.path.exists(dem_path):
+        return None
+    try:
+        import rasterio
+        with rasterio.open(dem_path) as ds:
+            a = ds.read(1).astype("float32")
+            nod = ds.nodata
+        v = a[(a != nod) & np.isfinite(a) & (a > -500) & (a < 9000)] if nod is not None else a
+        return float(np.nanmean(v)) if v.size else None
+    except Exception:
+        return None
+
+
+def _basin_min_temp(bbox, t_start, t_end, sample_hours=6):
+    """Min basin temperature (°C) over the window from HF temp forcing (sampled)."""
+    import io
+    import tarfile
+    import truststore
+    truststore.inject_into_ssl()
+    from huggingface_hub import hf_hub_download
+    from hf_data.forcing import VARS, _read_pqf, _clip
+    cfg = VARS["temp"]
+    steps = []
+    t = t_start.replace(minute=0, second=0, microsecond=0)
+    while t <= t_end:
+        steps.append(t)
+        t += timedelta(hours=sample_hours)
+    by_month = {}
+    for s in steps:
+        by_month.setdefault((s.year, s.month), []).append(s)
+    gmin = None
+    for (yr, mo), group in sorted(by_month.items()):
+        ref = group[0]
+        try:
+            tar_path = hf_hub_download("vincewin/CREST_data", ref.strftime(cfg.month_fmt), repo_type="dataset")
+        except Exception:
+            try:
+                tar_path = hf_hub_download("vincewin/CREST_data", ref.strftime(cfg.year_fmt), repo_type="dataset")
+            except Exception:
+                continue
+        with tarfile.open(tar_path) as tf:
+            names = set(tf.getnames())
+            for s in group:
+                member = s.strftime(cfg.member_fmt)
+                if member not in names:
+                    continue
+                a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())
+                clip = _clip(a, xll, yll, cell, nod, bbox)
+                if clip is None:
+                    continue
+                sub = clip[0]
+                v = sub[(sub > -90) & (sub < 60) & np.isfinite(sub)]     # plausible °C only
+                if v.size:
+                    m = float(v.min())
+                    gmin = m if gmin is None else min(gmin, m)
+    return gmin
+
+
+def detect_snow(bbox, t_start, t_end, dem_path=None, force: str | None = None, use_temp: bool = True) -> dict:
+    """Decide whether SNOW17 should be on. force in {'on','off',None}."""
+    if force == "on":
+        return {"snow": True, "reason": "user override: on"}
+    if force == "off":
+        return {"snow": False, "reason": "user override: off"}
+
+    lat = (bbox[1] + bbox[3]) / 2.0
+    months = {t_start.month, t_end.month}
+    cold_season = any(m in (10, 11, 12, 1, 2, 3, 4) for m in months)
+    elev = _mean_elev(dem_path)
+    warm = (not cold_season) and lat < 40 and (elev is None or elev < 1500)
+    if warm:
+        return {"snow": False, "reason": f"warm season/region (lat {lat:.0f}°, "
+                f"{'elev %.0f m' % elev if elev is not None else 'low elev'})"}
+
+    if use_temp:                                          # data-driven confirmation
+        try:
+            mn = _basin_min_temp(bbox, t_start, t_end)
+        except Exception:
+            mn = None
+        if mn is not None:
+            return {"snow": mn < SNOW_THRESHOLD_C, "min_temp_c": round(mn, 1),
+                    "reason": f"basin min temperature {mn:.1f}°C"}
+    return {"snow": True, "reason": f"cold season/region (lat {lat:.0f}°, "
+            f"{'elev %.0f m' % elev if elev is not None else 'elev n/a'})"}
+
+
+if __name__ == "__main__":
+    # warm case (Kerrville, July) -> no download; cold case (Colorado, Jan) -> temp confirm
+    print("Kerrville Jul:", detect_snow((-99.6, 29.8, -98.6, 30.6),
+          datetime(2025, 7, 3), datetime(2025, 7, 6), use_temp=False))
+    print("Colorado Jan (temp): ", detect_snow((-106.5, 38.5, -105.5, 39.5),
+          datetime(2025, 1, 1), datetime(2025, 1, 3), use_temp=True))

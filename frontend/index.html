@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CREST_demo — agentic flood analysis</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="topbar">
+    <span class="brand">🌊 CREST_demo</span>
+    <span class="sub">agentic flash-flood analysis</span>
+    <span id="selinfo" class="selinfo"></span>
+  </div>
+
+  <!-- LEFT: model operation knobs -->
+  <div id="left-panel" class="panel collapsed">
+    <div class="panel-head">⚙️ Model options <button class="toggle" data-target="left-panel">⟨</button></div>
+    <div class="panel-body">
+      <label>Simulation start<input type="date" id="k-start" /></label>
+      <label>Duration (hours)<input type="number" id="k-hours" value="48" min="6" max="240" /></label>
+      <label>Time step
+        <select id="k-step"><option value="1h">1 h</option><option value="30u">30 min</option><option value="2u">2 min</option></select>
+      </label>
+      <label>Warm-up (days)<input type="number" id="k-warmup" value="90" min="0" max="180" /></label>
+      <label>Water-balance model
+        <select id="k-model">
+          <option value="auto">Auto (by longitude)</option>
+          <option value="crestphys">CRESTPHYS</option>
+          <option value="crest">CREST</option>
+          <option value="hp">HP (hydrophobic)</option>
+        </select>
+      </label>
+      <label>Snow (SNOW17)
+        <select id="k-snow">
+          <option value="auto">Auto-detect (from temperature)</option>
+          <option value="on">Force on</option>
+          <option value="off">Force off</option>
+        </select>
+      </label>
+
+      <div class="adv">
+        <div class="adv-head" id="adv-toggle"><span id="adv-arrow">▸</span> Advanced parameters</div>
+        <div id="adv-body" class="hidden">
+          <p class="adv-note">Leave blank to use the calibrated / auto value; enter a number to override.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: results / hydrograph / report -->
+  <div id="right-panel" class="panel hidden">
+    <div class="panel-head"><span id="rp-title">Gauge</span> <button class="close" data-target="right-panel">✕</button></div>
+    <div class="panel-body">
+      <div id="rp-stats" class="stats"></div>
+      <div id="rp-hydro" class="plot"></div>
+      <div id="rp-report" class="report"></div>
+    </div>
+  </div>
+
+  <!-- BOTTOM-CENTER: streamflow time animation -->
+  <div id="anim" class="hidden">
+    <button id="anim-play" title="Play / pause">▶</button>
+    <input type="range" id="anim-slider" min="0" max="0" value="0" step="1" />
+    <span id="anim-time">—</span>
+  </div>
+
+  <!-- BOTTOM: chat -->
+  <div id="chat">
+    <div id="chat-log">
+      <div class="msg bot">Ask me about a flood — e.g. <i>“flood in Kerrville, Texas, Summer 2025”</i>. I’ll map the event and nearby USGS gauges. Then choose <b>a few gauges of interest</b> — click the pins near the event or draw a small box. This demo runs best with just a handful at a time.</div>
+    </div>
+    <div id="chat-input">
+      <input id="chat-text" placeholder="Describe a flood event…" autocomplete="off" />
+      <button id="chat-send">Send</button>
+      <button id="btn-sim" class="primary" disabled>▶ Simulate (0)</button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
