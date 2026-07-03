@@ -125,12 +125,14 @@ def plan(gauge, model, a: datetime, b: datetime) -> dict:
         return [r for r in rec["rows"] if lo <= _rt(r["time"]) <= hi]
 
     if rec and rec.get("window"):
-        c0, c1 = _rt(rec["window"][0]), _rt(rec["window"][1])
-        if c0 <= a and c1 >= b:                              # fully cached
+        from datetime import timedelta
+        slack = timedelta(hours=1)      # EF5's first ts row lands one step AFTER
+        c0, c1 = _rt(rec["window"][0]), _rt(rec["window"][1])   # TIME_BEGIN
+        if c0 <= a + slack and c1 >= b:                      # fully cached
             return {"cached_rows": slice_rows(a, b), "run_start": None, "run_end": None,
                     "load_state_time": None, "warmup_from": None,
                     "need_warmup": False, "reason": "fully cached"}
-        if c0 <= a <= c1 < b:                                # extend forward from the cache end
+        if c0 <= a + slack and a <= c1 < b:                  # extend forward from the cache end
             lt, wf, nw = _state_choice(gauge, model, c1)
             return {"cached_rows": slice_rows(a, c1), "run_start": c1, "run_end": b,
                     "load_state_time": lt, "warmup_from": wf, "need_warmup": nw,
