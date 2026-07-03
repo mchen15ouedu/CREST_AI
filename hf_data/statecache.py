@@ -88,6 +88,23 @@ def nearest_state(gauge, model, t: datetime, tol_days: float = STATE_TOL_DAYS):
     return best
 
 
+def _state_times_on_disk(gauge, model) -> set[datetime]:
+    """State-save times parsed from the actual EF5 state files on disk
+    (e.g. crestphys_SM_20250704_0000.tif). The JSON index can lag or be
+    invalidated (paramstore drops the row cache) while the files remain."""
+    import glob as _glob
+    import re as _re
+    out = set()
+    for p in _glob.glob(os.path.join(state_dir(gauge, model), "*.tif")):
+        m = _re.search(r"_(\d{8})_(\d{4})\.tif$", os.path.basename(p))
+        if m:
+            try:
+                out.add(datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M"))
+            except ValueError:
+                pass
+    return out
+
+
 def _state_choice(gauge, model, t: datetime, tol_days: float = STATE_TOL_DAYS):
     """(load_time, warmup_from, need_warmup) for warm-starting a run at t:
         exact state         -> load it directly, no warm-up
@@ -96,11 +113,16 @@ def _state_choice(gauge, model, t: datetime, tol_days: float = STATE_TOL_DAYS):
     A state in the *future* of t can't warm forward, so it isn't used here.
     """
     rec = load_record(gauge, model)
-    if not rec:
+    times = _state_times_on_disk(gauge, model)
+    for s in (rec or {}).get("state_times", []):
+        try:
+            times.add(_rt(s))
+        except ValueError:
+            pass
+    if not times:
         return None, None, True
     best_before = None                                       # nearest state at/just before t
-    for s in rec.get("state_times", []):
-        dt = _rt(s)
+    for dt in times:
         gap = (t - dt).total_seconds() / 86400.0             # >0 when dt precedes t
         if gap == 0:
             return t, None, False                            # exact -> no warm-up
