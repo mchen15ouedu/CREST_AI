@@ -60,6 +60,14 @@ input, select, textarea { width: 100%; padding: 6px 8px; background: #0d141c; co
 label.chk input { width: auto; }
 .hidden { display: none !important; }
 
+/* simulation history (profile modal) */
+.hist-row { display: flex; align-items: center; gap: 10px; padding: 7px 0;
+  border-bottom: 1px solid #1d2936; }
+.hist-info { flex: 1; font-size: 12.5px; line-height: 1.45; }
+.hist-load { padding: 5px 12px; border: 1px solid #2a3a49; background: #142230;
+  color: #e8eef4; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+.hist-load:hover { background: #1b3040; }
+
 /* manual time override (Set / Clear) */
 .k-time { border: 1px solid #223140; border-radius: 8px; padding: 8px; margin-bottom: 10px; }
 .k-time label:first-child { margin-top: 0; }

@@ -236,13 +236,27 @@ class SimRequest(BaseModel):
     timestep: str = "1h"
     warmup_days: int = 90
     overrides: dict | None = None
+    label: str | None = None          # event label for the history entry
+
+
+MAX_HISTORY = 20
+
+
+def _save_history(username: str, entry: dict):
+    """Registered-user benefit: keep their simulation history server-side."""
+    prof = _load_profile(username)
+    hist = [h for h in prof.get("history", []) if h.get("sim_id") != entry["sim_id"]]
+    hist.insert(0, entry)
+    prof["history"] = hist[:MAX_HISTORY]
+    with open(_profile_path(username), "w", encoding="utf-8") as fh:
+        json.dump(prof, fh, indent=1)
 
 
 MAX_SIM_HOURS = int(os.environ.get("CREST_MAX_SIM_HOURS", "2160"))   # 90 days
 
 
 @app.post("/api/simulate")
-def api_simulate(req: SimRequest):
+def api_simulate(req: SimRequest, request: Request):
     warnings = []
     if len(req.gauge_ids) > MAX_SIMS:
         warnings.append(f"This demo simulates at most {MAX_SIMS} gauges at once; "
@@ -260,10 +274,34 @@ def api_simulate(req: SimRequest):
             "timestep": req.timestep, "warmup_days": req.warmup_days,
             "overrides": req.overrides}
     job = simjobs.start_job(req.gauge_ids, t0, t1, opts)
+    u = request.session.get("user")
+    if u:                                              # signed-in -> history entry
+        try:
+            _save_history(u["username"], {
+                "sim_id": job.id, "gauge_ids": job.gauge_ids,
+                "t_start": t0.isoformat(), "t_end": t1.isoformat(),
+                "label": req.label, "model": req.model, "snow": req.snow,
+                "when": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")})
+        except Exception:
+            pass
     return {"sim_id": job.id, "gauge_ids": job.gauge_ids,
             "t_start": t0.isoformat(), "t_end": t1.isoformat(),
             "warning": " ".join(warnings) or None,
             "max_concurrent": simjobs.MAX_CONCURRENT}
+
+
+@app.get("/api/history")
+def api_history(request: Request):
+    """Signed-in users: their saved simulations, with live job status."""
+    u = request.session.get("user")
+    if not u:
+        return JSONResponse({"error": "not signed in"}, status_code=401)
+    hist = _load_profile(u["username"]).get("history", [])
+    for h in hist:
+        job = simjobs.get_job(h.get("sim_id", ""))
+        h["status"] = ("done" if job and job.done.is_set() else
+                       "running" if job else "expired")   # expired -> cache re-run
+    return {"history": hist}
 
 
 async def _drain(job, cursor: int = 0):

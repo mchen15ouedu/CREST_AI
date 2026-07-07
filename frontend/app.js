@@ -81,19 +81,92 @@ function statusMsg(gid, text) {           // raw log line — only when AI info 
   if (!aiInfo) addMsg(`<b>${gid}</b> · ${text}`, "status");
 }
 
+// ---- HUC8 basin guide layer ---------------------------------------------
+// Zoomed out: HUC8 polygons show WHERE the gauged basins are (fast, clean).
+// Zoomed in (>= PIN_ZOOM) inside a basin: that basin's USGS gauge pins appear.
+const PIN_ZOOM = 8;
+let huc8Layer = null;
+
+async function loadHuc8() {
+  try {
+    const r = await fetch("/static/data/huc8.geojson");
+    if (!r.ok) return;
+    huc8Layer = L.geoJSON(await r.json(), {
+      renderer: L.canvas({ padding: 0.3 }),
+      style: { color: "#3aa3ff", weight: 1, opacity: 0.5, fillColor: "#3aa3ff", fillOpacity: 0.07 },
+      onEachFeature: (f, layer) => {
+        layer.bindTooltip(
+          `🗺 ${f.properties.name} · HUC ${f.properties.huc} · ${(f.properties.gauge_ids || []).length} gauges` +
+          `<br><i>click to zoom in</i>`, { sticky: true });
+        layer.on("click", () => map.fitBounds(layer.getBounds(), { padding: [30, 30] }));
+        layer.on("mouseover", () => layer.setStyle({ weight: 2.5, fillOpacity: 0.18 }));
+        layer.on("mouseout", () => huc8Layer.resetStyle(layer));
+      },
+    });
+    updateMapMode();
+  } catch (_) { /* guide layer is optional */ }
+}
+
+// polygons visible in the current viewport
+function visibleHucLayers() {
+  const out = [];
+  if (!huc8Layer) return out;
+  const b = map.getBounds();
+  huc8Layer.eachLayer((l) => { if (b.intersects(l.getBounds())) out.push(l); });
+  return out;
+}
+
+// ray-cast point-in-polygon on GeoJSON coords (outer rings; holes ignored)
+function pipGeom(geom, lat, lon) {
+  const polys = geom.type === "Polygon" ? [geom.coordinates] :
+    geom.type === "MultiPolygon" ? geom.coordinates : [];
+  for (const poly of polys) {
+    const ring = poly[0];
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+      if (((yi > lat) !== (yj > lat)) && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi)) inside = !inside;
+    }
+    if (inside) return true;
+  }
+  return false;
+}
+
+function updateMapMode() {
+  const zoomedIn = map.getZoom() >= PIN_ZOOM;
+  if (huc8Layer) {
+    if (zoomedIn) { if (map.hasLayer(huc8Layer)) map.removeLayer(huc8Layer); }
+    else if (!map.hasLayer(huc8Layer)) huc8Layer.addTo(map);
+  }
+  // pins: zoomed-in views, or an AI-located event (its pins stay visible)
+  const showPins = zoomedIn || !!queryCtx;
+  if (showPins) { if (!map.hasLayer(gaugeLayer)) gaugeLayer.addTo(map); }
+  else if (map.hasLayer(gaugeLayer)) map.removeLayer(gaugeLayer);
+}
+
 // ---- map-first gauge pins (no AI needed) --------------------------------
 let vpTimer = null;
 async function loadViewportGauges() {
+  if (map.getZoom() < PIN_ZOOM) return;      // zoomed out -> HUC8 guide instead
   const b = map.getBounds();
   try {
     const r = await fetch(`/api/gauges?w=${b.getWest()}&s=${b.getSouth()}&e=${b.getEast()}&n=${b.getNorth()}`);
     if (!r.ok) return;
     const d = await r.json();
     MAX_SIMS = d.max_sims || MAX_SIMS;
-    addGaugePins(d.gauge_pins || []);
+    let pins = d.gauge_pins || [];
+    if (huc8Layer) {                          // only gauges inside visible HUC8s
+      const vis = visibleHucLayers();
+      pins = pins.filter((g) => vis.some((l) =>
+        l.getBounds().contains([g.lat, g.lon]) && pipGeom(l.feature.geometry, g.lat, g.lon)));
+    }
+    addGaugePins(pins);
   } catch (_) { /* offline / transient */ }
 }
-map.on("moveend", () => { clearTimeout(vpTimer); vpTimer = setTimeout(loadViewportGauges, 400); });
+map.on("moveend zoomend", () => {
+  updateMapMode();
+  clearTimeout(vpTimer); vpTimer = setTimeout(loadViewportGauges, 400);
+});
 
 function addGaugePins(pins) {
   pins.forEach((g) => {
@@ -276,7 +349,8 @@ async function simulate() {
   try {
     const r = await fetch("/api/simulate", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ gauge_ids: ids, t_start: win.tStart, t_end: win.tEnd, ...opt }),
+      body: JSON.stringify({ gauge_ids: ids, t_start: win.tStart, t_end: win.tEnd,
+                             label: queryCtx ? queryCtx.label : null, ...opt }),
     });
     d = await r.json();
     if (!r.ok || !d.sim_id) throw new Error(d.detail || "simulation could not start");
@@ -814,6 +888,53 @@ function openProfile(d) {
   ["display_name", "affiliation", "email", "bio"].forEach((k) => {
     document.getElementById("pf-" + k).value = p[k] || "";
   });
+  loadHistory();
+}
+
+// ---- registered-user benefit: per-account simulation history --------------
+async function loadHistory() {
+  const el = document.getElementById("pf-history");
+  try {
+    const r = await fetch("/api/history");
+    if (!r.ok) { el.innerHTML = '<i class="pm-sub">sign in to keep a history</i>'; return; }
+    const hist = (await r.json()).history || [];
+    if (!hist.length) { el.innerHTML = '<i class="pm-sub">no simulations yet</i>'; return; }
+    el.innerHTML = "";
+    hist.forEach((h) => {
+      const row = document.createElement("div");
+      row.className = "hist-row";
+      const badge = h.status === "running" ? "🟢 running" : h.status === "done" ? "✓ done" : "♻ cached";
+      row.innerHTML =
+        `<div class="hist-info"><b>${escapeHtml(h.label || h.gauge_ids.join(", "))}</b><br>` +
+        `<span class="pm-sub">${h.gauge_ids.length} gauge(s) · ${h.t_start.slice(0, 10)} → ` +
+        `${h.t_end.slice(0, 10)} · ${h.when || ""} · ${badge}</span></div>` +
+        `<button class="hist-load">Open</button>`;
+      row.querySelector(".hist-load").onclick = () => restoreFromHistory(h);
+      el.appendChild(row);
+    });
+  } catch (_) {
+    el.innerHTML = '<i class="pm-sub">history unavailable</i>';
+  }
+}
+
+function restoreFromHistory(h) {
+  document.getElementById("profile-modal").classList.add("hidden");
+  chatTime = { start: h.t_start.slice(0, 19), end: h.t_end.slice(0, 19) };
+  selected.clear();
+  h.gauge_ids.forEach((id) => selected.add(id));
+  refreshSelection();
+  if (h.status === "expired") {
+    // job no longer in RAM (e.g. server restarted) — re-run; the result cache
+    // + frame cache serve it back almost instantly
+    addMsg(`🔁 Restoring <b>${escapeHtml(h.label || h.gauge_ids.join(", "))}</b> — ` +
+      `re-running from the result cache…`, "status");
+    allowResim();
+    simulate();
+  } else {
+    addMsg(`🔁 Reopening <b>${escapeHtml(h.label || h.gauge_ids.join(", "))}</b>…`, "status");
+    localStorage.setItem("lastSimId", h.sim_id);
+    reattach(h.sim_id);
+  }
 }
 
 document.getElementById("pm-close").onclick = () =>
@@ -942,14 +1063,15 @@ document.querySelectorAll("#left-panel input, #left-panel select").forEach((el) 
 });
 
 // ---- reattach: a run keeps going in the backend even if the app is closed --
-async function reattach() {
-  const simId = localStorage.getItem("lastSimId");
+async function reattach(explicitId) {
+  const simId = explicitId || localStorage.getItem("lastSimId");
   if (!simId) return;
   try {
     const r = await fetch(`/api/job/${simId}`);
-    if (!r.ok) { localStorage.removeItem("lastSimId"); return; }
+    if (!r.ok) { if (!explicitId) localStorage.removeItem("lastSimId"); return; }
     const j = await r.json();
-    if (j.done && j.age_s > 24 * 3600) { localStorage.removeItem("lastSimId"); return; }
+    if (!explicitId && j.done && j.age_s > 24 * 3600) { localStorage.removeItem("lastSimId"); return; }
+    zoomedToOverlay = false;               // zoom to the 2-D layer on first frame
     const tS = j.t_start.slice(0, 19), tE = j.t_end.slice(0, 19);
     const H = windowHours(tS, tE);
     lastSim = { tStart: tS, tEnd: tE, hours: H, expectedSteps: H + 1 };
@@ -974,5 +1096,6 @@ async function reattach() {
 
 // ---- boot ----------------------------------------------------------------
 initAuth();
-loadViewportGauges();               // gauge pins visible with zero AI interaction
+loadHuc8();                         // HUC8 basin guide (zoom in for gauge pins)
+loadViewportGauges();               // gauge pins when already zoomed in
 reattach();                         // pick up a run started before the app was closed

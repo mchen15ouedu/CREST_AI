@@ -20,9 +20,11 @@ from datetime import datetime, timedelta
 
 TS_TIME_FMT = "%Y-%m-%d %H:%M"
 
-# hard cap on a single EF5 process — a run stuck past this is killed, not
-# abandoned (env CREST_RUN_TIMEOUT_S, default 10 hours)
-RUN_TIMEOUT_S = float(os.environ.get("CREST_RUN_TIMEOUT_S", str(10 * 3600)))
+# Watchdog policy: a run that KEEPS PRODUCING OUTPUT is never killed for
+# running long. Killed only when it goes silent (no new ts rows / q grids)
+# for STALL_TIMEOUT_S, or exceeds the RUN_TIMEOUT_S hard cap.
+RUN_TIMEOUT_S = float(os.environ.get("CREST_RUN_TIMEOUT_S", str(10 * 3600)))    # 10 h
+STALL_TIMEOUT_S = float(os.environ.get("CREST_STALL_TIMEOUT_S", str(45 * 60)))  # 45 min
 
 
 # --------------------------------------------------------------------------- #
@@ -115,18 +117,26 @@ def run_ef5(control_path: str, output_dir: str, gauge_id: str, model: str = "cre
     return RunHandle(output_dir=output_dir, ts_path=ts, model=model, proc=proc)
 
 
-def stream_run(handle: RunHandle, poll: float = 0.4, timeout: float = RUN_TIMEOUT_S):
+def stream_run(handle: RunHandle, poll: float = 0.4, timeout: float = RUN_TIMEOUT_S,
+               stall_timeout: float = STALL_TIMEOUT_S):
     """Yield {'kind': 'hydro'|'q2d'|'done', ...} as EF5 writes output.
-    On timeout the EF5 process is KILLED (not abandoned) before reporting."""
+
+    A run that keeps producing output is left alone no matter how long it
+    takes. The process is KILLED only when it goes silent for `stall_timeout`
+    (stuck) or passes the `timeout` hard cap."""
     tail = _TsTail(handle.ts_path)
     seen: set = set()
     t0 = time.time()
+    last_progress = t0                       # last time ANY output appeared
     while True:
         rows = tail.read_new()
         if rows:
             yield {"kind": "hydro", "rows": rows}
-        for p in _new_q_grids(handle.output_dir, handle.model, seen):
+        fresh = _new_q_grids(handle.output_dir, handle.model, seen)
+        for p in fresh:
             yield {"kind": "q2d", "path": p}
+        if rows or fresh:
+            last_progress = time.time()
         done = not handle.alive()
         if done:
             # final drain
@@ -138,10 +148,17 @@ def stream_run(handle: RunHandle, poll: float = 0.4, timeout: float = RUN_TIMEOU
             rc = handle.proc.returncode if handle.proc else 0
             yield {"kind": "done", "returncode": rc}
             return
-        if time.time() - t0 > timeout:
-            handle.kill()                    # watchdog: stop the stuck process
+        now = time.time()
+        if now - last_progress > stall_timeout:
+            handle.kill()                    # silent too long -> stuck
             yield {"kind": "done", "returncode": -1,
-                   "error": f"killed after {timeout / 3600:.1f} h (stuck-run watchdog)"}
+                   "error": f"no model output for {stall_timeout / 60:.0f} min — "
+                            "killed (stall watchdog)"}
+            return
+        if now - t0 > timeout:
+            handle.kill()                    # absolute cap
+            yield {"kind": "done", "returncode": -1,
+                   "error": f"killed after {timeout / 3600:.1f} h (run-time cap)"}
             return
         time.sleep(poll)
 

@@ -13,6 +13,7 @@ rule-based routing (gazetteer, date regex).
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from hf_data import llm
 
@@ -68,8 +69,11 @@ def respond(message: str, history: list | None, context: dict | None) -> dict | 
     """One routed conversational turn. None => no LLM (caller falls back)."""
     if not llm.available():
         return None
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     msgs = [{"role": "system",
-             "content": SYSTEM + "\nCONTEXT: " + json.dumps(context or {}, default=str)}]
+             "content": SYSTEM + f"\nToday's date is {today} — resolve relative time "
+                                 "references ('this February', 'last summer') against it.\n"
+                                 "CONTEXT: " + json.dumps(context or {}, default=str)}]
     for h in (history or [])[-16:]:                    # short rolling window
         if h.get("role") in ("user", "assistant") and h.get("content"):
             msgs.append({"role": h["role"], "content": str(h["content"])[:2000]})
