@@ -457,7 +457,8 @@ function handleSimEvent(simId, ev) {
   } else if (ev.kind === "timeline") {
     gaugeFrames[ev.gauge_id] = { n: ev.n, bounds: ev.bounds };
     if (ev.n - 1 > animMax) { animMax = ev.n - 1; animTimes = ev.times || animTimes; }
-    if (ev.vmax) document.getElementById("q-max").textContent = Math.round(ev.vmax).toLocaleString();
+    if (ev.vmax) document.getElementById("q-max").textContent =
+      `peak ${Math.round(ev.vmax).toLocaleString()} m³/s`;
     showAnim();
   } else if (ev.kind === "all_done") {
     addMsg("✅ All simulations complete — use the time bar to replay the flood, and the tabs " +
@@ -659,10 +660,17 @@ async function startCalibration(gid) {
         return;
       }
       stage.textContent = `done — NSE ${ev.baseline_nse} → ${ev.best_nse}`;
-      addMsg(`🎯 Calibration finished for <b>${gid}</b>: NSE <b>${ev.baseline_nse}</b> → <b>${ev.best_nse}</b>` +
+      allowResim();          // the same selection may be re-run with the calibrated set
+      const doneCard = addMsg(`🎯 Calibration finished for <b>${gid}</b>: NSE <b>${ev.baseline_nse}</b> → <b>${ev.best_nse}</b>` +
         (ev.saved ? " — saved as this basin's best parameter set (it will be used automatically from now on)."
                   : " — did not beat the stored parameters, keeping the previous set.") +
-        ` Hit <b>Simulate</b> again to re-run with the ${ev.saved ? "new" : "existing"} parameters (with the 2-D map).`, "bot");
+        `<div class="btn-row"><button class="primary" data-act="rerun">▶ Re-run now with the ` +
+        `${ev.saved ? "new" : "stored"} parameters (2-D map included)</button></div>`, "bot");
+      doneCard.querySelector('[data-act="rerun"]').onclick = () => {
+        doneCard.querySelector(".btn-row").remove();
+        allowResim();
+        simulate();
+      };
     }
   };
   es.onerror = () => es.close();

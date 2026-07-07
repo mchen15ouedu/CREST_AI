@@ -137,7 +137,9 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 .pg-row { display: flex; align-items: center; gap: 10px; margin: 4px 0; }
 .pg-name { font-size: 12px; color: #ffd479; min-width: 88px; font-weight: 600; }
 .pg-track { flex: 1; height: 10px; background: #0d141c; border: 1px solid #223; border-radius: 6px; overflow: hidden; }
-.pg-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #3a6ea5, #4cc9a0); transition: width .5s; }
+.pg-fill { display: block; height: 100%; width: 0%;   /* display:block — a plain
+  inline <span> ignores width, leaving the bar permanently empty */
+  background: linear-gradient(90deg, #3a6ea5, #4cc9a0); transition: width .5s; }
 .pg-fill.cal { background: linear-gradient(90deg, #a56ea5, #ffd479); }
 .pg-stage { font-size: 11.5px; color: #9fdcc0; min-width: 240px; }
 .pg-pct { font-size: 11px; color: #8fa3b3; min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -168,8 +170,10 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 }
 #q-legend .q-title { font-size: 11px; color: #8fa3b3; margin-bottom: 5px; }
 #q-legend .q-bar { height: 10px; border-radius: 4px;
-  background: linear-gradient(90deg, #ffffb2, #fecc5c, #fd8d3c, #f03b20, #bd0026); }
+  background: linear-gradient(90deg, #59626c 0%, #7e8a95 14%, #3fae5a 23%, #57c258 36%,
+    #c9dd45 48%, #ffd23f 57%, #fd8d3c 70%, #f03b20 84%, #bd0026 100%); }
 #q-legend .q-ticks { display: flex; justify-content: space-between; font-size: 10px; color: #8fa3b3; margin-top: 2px; }
+#q-legend .q-peak { font-size: 10px; color: #8fa3b3; margin-top: 3px; }
 
 /* modal */
 .modal { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,.55);

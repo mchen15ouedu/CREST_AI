@@ -80,56 +80,127 @@ def q2d_fig(tif_path: str, title: str | None = None) -> go.Figure:
     return fig
 
 
-def q2d_png(tif_path: str, vmin: float = 1.0, vmax: float | None = None):
-    """Render a streamflow raster the EF5 way: discharge on the stream network
-    only, LOG color scale (yellow→orange→red), transparent off-network — for a
-    Leaflet imageOverlay. Returns (png_bytes, bounds=[[S,W],[N,E]], vmax).
-    """
-    import io
+# --------------------------------------------------------------------------- #
+# 2-D streamflow rendering — BASEFLOW-RELATIVE color scale:
+#   grey  ≈ nearly dry (well below baseflow)
+#   green ≈ normal baseflow
+#   yellow → orange → red = flooding (multiples of baseflow)
+# The per-cell baseline is the window minimum of the simulated grids, anchored
+# to the USGS observed baseflow at the outlet cell when observations exist.
+# --------------------------------------------------------------------------- #
+NET_MIN = float(os.environ.get("CREST_Q2D_MIN", "0.1"))   # m³/s — a cell that ever exceeds this is drawn
+_BASE_FLOOR = NET_MIN / 5.0                               # avoid absurd ratios on trickle cells
+_R_LO, _R_HI = -0.5, 1.7                                  # color scale spans log10(q/baseflow)
+_RAMP = [(0.00, "#59626c"), (0.14, "#7e8a95"),            # r≈0.3–0.6  dry — grey
+         (0.23, "#3fae5a"), (0.36, "#57c258"),            # r≈1–2      baseflow — green
+         (0.48, "#c9dd45"), (0.57, "#ffd23f"),            # r≈3        rising — yellow
+         (0.70, "#fd8d3c"), (0.84, "#f03b20"),            # r≈10–20    flood — orange/red
+         (1.00, "#bd0026")]                               # r≥50       extreme — dark red
+_CMAP = None
+
+
+def _q_cmap():
+    global _CMAP
+    if _CMAP is None:
+        from matplotlib.colors import LinearSegmentedColormap
+        _CMAP = LinearSegmentedColormap.from_list("qflow", _RAMP)
+    return _CMAP
+
+
+def _read_q(tif_path: str):
     import rasterio
-    from matplotlib import cm
-    from matplotlib.colors import LogNorm
-    from PIL import Image
     with rasterio.open(tif_path) as ds:
         a = ds.read(1).astype("float32")
         b = ds.bounds
         nod = ds.nodata
     a = np.where((a == nod) if nod is not None else ~np.isfinite(a), np.nan, a)
-    show = np.isfinite(a) & (a >= vmin)              # only the flowing network
-    if vmax is None or vmax <= vmin:
-        top = float(np.nanmax(a)) if np.isfinite(np.nanmax(a)) else vmin * 10
-        vmax = max(top, vmin * 10)
-    norm = LogNorm(vmin=vmin, vmax=vmax)
-    clipped = np.clip(np.where(show, a, vmin), vmin, vmax)
-    rgba = cm.get_cmap("YlOrRd")(norm(clipped))      # pale-yellow -> dark-red
-    rgba[..., 3] = np.where(show, 0.92, 0.0)         # transparent off-network
+    return a, [[b.bottom, b.left], [b.top, b.right]]
+
+
+def _render_ratio(a, base, mask) -> bytes:
+    """RGBA PNG of q/baseflow: grey→green→yellow→red, transparent off-network."""
+    import io
+    from PIL import Image
+    r = a / np.maximum(base, _BASE_FLOOR)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        x = (np.log10(np.clip(r, 10 ** _R_LO, 10 ** _R_HI)) - _R_LO) / (_R_HI - _R_LO)
+    draw = mask & np.isfinite(x)
+    rgba = _q_cmap()(np.where(draw, x, 0.0))
+    rgba[..., 3] = np.where(draw, 0.9, 0.0)
     img = Image.fromarray((rgba * 255).astype("uint8"), "RGBA")
     buf = io.BytesIO()
     img.save(buf, "PNG")
-    bounds = [[b.bottom, b.left], [b.top, b.right]]
-    return buf.getvalue(), bounds, vmax
+    return buf.getvalue()
 
 
-def q2d_frames(tif_paths: list[str], vmin: float = 1.0):
-    """Render a whole time series of q.*.tif to PNG frames with ONE fixed vmax
-    (so colors are stable during animation). Returns (frames, vmax) where
-    frames = [(png_bytes, bounds, time_label), ...] in path order."""
-    import rasterio
-    vmax = vmin * 10.0
-    for p in tif_paths:                              # pass 1: global max
-        with rasterio.open(p) as ds:
-            a = ds.read(1)
-            nod = ds.nodata
-        a = a[a != nod] if nod is not None else a[np.isfinite(a)]
-        if a.size:
-            m = float(np.nanmax(a))
-            if np.isfinite(m):
-                vmax = max(vmax, m)
+def q2d_png(tif_path: str, base=None, mask=None):
+    """Render one streamflow raster for a Leaflet imageOverlay.
+    base = per-cell baseflow grid (None → this frame is treated as baseflow,
+    i.e. everything plots green). Returns (png_bytes, bounds, peak_q)."""
+    a, bounds = _read_q(tif_path)
+    valid = np.isfinite(a)
+    if mask is None:
+        mask = valid & (a >= NET_MIN)
+    if base is None:
+        base = np.where(valid, np.maximum(a, _BASE_FLOOR), np.nan)
+    png = _render_ratio(a, base, mask & valid)
+    peak = float(np.nanmax(a)) if valid.any() else 0.0
+    return png, bounds, peak
+
+
+def q2d_live(tif_path: str, prev_min=None):
+    """Incremental renderer for frames arriving DURING a run: the baseline is
+    the running per-cell minimum seen so far (the first frames read as normal
+    flow, the flood then heats up against them).
+    Returns (png_bytes, bounds, updated_min)."""
+    a, bounds = _read_q(tif_path)
+    cur_min = a if prev_min is None or prev_min.shape != a.shape else np.fmin(prev_min, a)
+    mask = np.isfinite(a) & (np.fmax(np.nan_to_num(a, nan=0.0), 0.0) >= NET_MIN)
+    base = np.where(np.isfinite(cur_min), np.maximum(cur_min, _BASE_FLOOR), np.nan)
+    png = _render_ratio(a, base, mask)
+    return png, bounds, cur_min
+
+
+def obs_baseflow(rows: list[dict]) -> float | None:
+    """Baseflow from the USGS observed discharge in the hydrograph rows:
+    the 25th percentile of the observations (a standard low-flow proxy)."""
+    obs = sorted(v for v in (r.get("obs_q") for r in rows)
+                 if isinstance(v, (int, float)) and np.isfinite(v) and v > 0)
+    if len(obs) < 8:
+        return None
+    return float(obs[int(0.25 * (len(obs) - 1))])
+
+
+def q2d_frames(tif_paths: list[str], baseflow_cms: float | None = None):
+    """Render a whole time series of q.*.tif with ONE fixed baseline (stable
+    colors while scrubbing). Per-cell baseline = window minimum, scaled so the
+    outlet cell's baseline matches the USGS observed baseflow when given.
+    Returns (frames, peak_q) with frames = [(png_bytes, bounds, time_label), ...]."""
+    cellmin = cellmax = None
+    for p in tif_paths:                              # pass 1: per-cell min/max
+        a, _ = _read_q(p)
+        if cellmin is None or cellmin.shape != a.shape:
+            cellmin, cellmax = a.copy(), a.copy()
+        else:
+            cellmin = np.fmin(cellmin, a)
+            cellmax = np.fmax(cellmax, a)
+    if cellmin is None:
+        return [], 0.0
+    mask = np.isfinite(cellmax) & (cellmax >= NET_MIN)
+    base = np.where(np.isfinite(cellmin), np.maximum(cellmin, _BASE_FLOOR), np.nan)
+    if baseflow_cms and mask.any():                  # anchor to the gauge's real baseflow
+        outlet = np.unravel_index(int(np.nanargmax(np.where(mask, cellmax, -np.inf))),
+                                  cellmax.shape)
+        sim_base = float(base[outlet])
+        if np.isfinite(sim_base) and sim_base > 0:
+            base = base * float(np.clip(baseflow_cms / sim_base, 0.05, 20.0))
+    peak = float(np.nanmax(np.where(mask, cellmax, np.nan))) if mask.any() else 0.0
     frames = []
     for p in tif_paths:                              # pass 2: render each
-        png, bounds, _ = q2d_png(p, vmin=vmin, vmax=vmax)
+        a, bounds = _read_q(p)
+        png = _render_ratio(a, base, mask & np.isfinite(a))
         frames.append((png, bounds, _q_time_from_name(p)))
-    return frames, vmax
+    return frames, peak
 
 
 # --------------------------------------------------------------------------- #
@@ -137,6 +208,8 @@ def q2d_frames(tif_paths: list[str], vmin: float = 1.0):
 # (frames rendered once per (gauge, model, window); invalidated on param change)
 # --------------------------------------------------------------------------- #
 _WIN_FMT = "%Y-%m-%d %H:%M"
+_FRAMES_VER = 2                    # bump when the render style changes — stale
+                                   # caches are rejected and re-rendered
 
 
 def frames_cache_dir(gauge: str, model: str) -> str:
@@ -156,7 +229,8 @@ def save_frames_cache(gauge: str, model: str, t0: datetime, t1: datetime,
     for i, (png, _b, _t) in enumerate(frames):
         with open(os.path.join(d, f"frame_{i:04d}.png"), "wb") as fh:
             fh.write(png)
-    idx = {"window": [t0.strftime(_WIN_FMT), t1.strftime(_WIN_FMT)],
+    idx = {"ver": _FRAMES_VER,
+           "window": [t0.strftime(_WIN_FMT), t1.strftime(_WIN_FMT)],
            "times": [f[2] for f in frames], "bounds": frames[0][1] if frames else None,
            "vmax": vmax, "n": len(frames)}
     with open(os.path.join(d, "index.json"), "w") as fh:
@@ -171,7 +245,8 @@ def load_frames_cache(gauge: str, model: str, t0: datetime, t1: datetime):
     try:
         with open(os.path.join(d, "index.json")) as fh:
             idx = json.load(fh)
-        if idx.get("window") != [t0.strftime(_WIN_FMT), t1.strftime(_WIN_FMT)]:
+        if (idx.get("ver") != _FRAMES_VER
+                or idx.get("window") != [t0.strftime(_WIN_FMT), t1.strftime(_WIN_FMT)]):
             return None
         frames = []
         for i, label in enumerate(idx["times"]):
@@ -186,7 +261,9 @@ def has_frames_cache(gauge: str, model: str, t0: datetime, t1: datetime) -> bool
     import json
     try:
         with open(os.path.join(frames_cache_dir(gauge, model), "index.json")) as fh:
-            return json.load(fh).get("window") == [t0.strftime(_WIN_FMT), t1.strftime(_WIN_FMT)]
+            idx = json.load(fh)
+            return (idx.get("ver") == _FRAMES_VER and
+                    idx.get("window") == [t0.strftime(_WIN_FMT), t1.strftime(_WIN_FMT)])
     except Exception:
         return False
 

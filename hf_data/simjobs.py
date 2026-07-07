@@ -43,6 +43,7 @@ class SimJob:
         self.params: dict[str, dict] = {}        # gid -> {wb,kw,model,source}
         self.done = threading.Event()
         self._q2d_err: set = set()               # gauges with a reported render error
+        self._q2d_min: dict = {}                 # gid -> running per-cell min (live baseline)
 
     def _emit(self, ev: dict):
         self.events.append(ev)               # append-only; readers poll by index
@@ -78,7 +79,8 @@ class SimJob:
                 elif kind == "q2d":
                     self.q_paths.setdefault(gid, []).append(payload["path"])
                     try:
-                        png, bounds, _ = viz.q2d_png(payload["path"])
+                        png, bounds, self._q2d_min[gid] = viz.q2d_live(
+                            payload["path"], self._q2d_min.get(gid))
                         frame = self.overlays.get(gid, (None, None, 0))[2] + 1
                         self.overlays[gid] = (png, bounds, frame)
                         self._emit({"kind": "q2d", "gauge_id": gid, "bounds": bounds, "frame": frame})
@@ -115,7 +117,9 @@ class SimJob:
         if not paths:
             return
         try:
-            frames, vmax = viz.q2d_frames(paths)
+            # anchor the color scale to the gauge's real (USGS-observed) baseflow
+            baseflow = viz.obs_baseflow(self.hydro.get(gid, []))
+            frames, vmax = viz.q2d_frames(paths, baseflow_cms=baseflow)
             self.frames[gid] = frames
             self._emit({"kind": "timeline", "gauge_id": gid, "n": len(frames),
                         "times": [f[2] for f in frames],
