@@ -250,10 +250,12 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                     overrides, snow, timestep, warmup_days, grids, no_cache, workdir):
     """The actual per-gauge run — called with the (gauge, model) lock held."""
     work = workdir or tempfile.mkdtemp(prefix=f"crest_{g['id']}_")
-    basic_dir = os.path.join(work, "BasicData_Clip")
-    param_dir = os.path.join(work, "param")
     out_dir = os.path.join(work, "CREST_output")
     bbox = basin_bbox(g)
+    # shared per-basin clip stores: repeat runs + calibration candidates reuse
+    # the clipped terrain/param grids instead of re-reading the remote COGs
+    basic_dir = basic.store_dir(bbox)
+    param_dir = os.path.join(basic_dir, "param")
 
     # --- result cache: reuse overlap, simulate only the missing window (task #6) ---
     # the row cache is hourly; a sub-hourly run neither reuses nor writes it
@@ -393,16 +395,16 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     if not use_mock:                                  # real run: forcing over the full span
         f0 = warmup_start or run_start
         n_days = max(1, int((run_end - f0).total_seconds() // 86400))
-        yield ("status", f"⬇️ downloading rainfall (MRMS) forcing — "
+        yield ("status", f"🌧 preparing rainfall (MRMS) forcing from the archive — "
                          f"{n_days} day(s) incl. warm-up…")
         fr = forcing.prepare_forcing("mrms", bbox, f0, run_end, mrms_dir)
         if fr.reused:
             yield ("status", f"♻️ forcing store: reused {fr.reused} MRMS timestep(s), "
-                             f"fetched {len(fr.written)} new")
-        yield ("status", "⬇️ downloading PET forcing…")
+                             f"prepared {len(fr.written)} new")
+        yield ("status", "🌡 preparing PET forcing…")
         forcing.prepare_forcing("pet", bbox, f0, run_end, pet_dir)
         if snow_on:
-            yield ("status", "⬇️ downloading temperature forcing (snow module)…")
+            yield ("status", "❄ preparing temperature forcing (snow module)…")
             forcing.prepare_forcing("temp", bbox, f0, run_end, temp_dir)
 
     # warm-up: separate blocking ef5 process (own control); its state files at

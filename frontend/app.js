@@ -442,7 +442,11 @@ function handleSimEvent(simId, ev) {
   } else if (ev.kind === "gauge_done") {
     gaugeState[ev.gauge_id] = "done";
     renderTabs();
-    if (aiInfo) setProgress(ev.gauge_id, 100, "complete ✓");
+    if (ev.returncode != null && ev.returncode !== 0) {
+      if (aiInfo) setProgress(ev.gauge_id, 100, "failed ✗");
+      explainError("simulation", `EF5 run failed (rc=${ev.returncode}), ` +
+        `${ev.n || 0} output rows produced`, ev.gauge_id);
+    } else if (aiInfo) setProgress(ev.gauge_id, 100, "complete ✓");
     else addMsg(`✅ <b>${ev.gauge_id}</b> complete (${ev.n} steps)`, "status");
     if (ev.gauge_id === panelGauge) renderHydro(ev.gauge_id);
   } else if (ev.kind === "result") {
@@ -509,10 +513,11 @@ const STAGES = [
   [/short warm-up/i,     20, null],
   [/warm-up disabled/i,  20, "cold start (no warm-up)"],
   [/warm start from exact/i, 22, "warm-starting from a saved model state"],
-  [/USGS observed/i,     24, "downloading observed discharge (USGS)…"],
-  [/downloading rainfall/i, 28, "downloading rainfall forcing (MRMS)…"],
-  [/downloading PET/i,   36, "downloading PET forcing…"],
-  [/downloading temperature/i, 38, "downloading temperature forcing (snow)…"],
+  [/USGS observed/i,     24, "fetching observed discharge (USGS)…"],
+  [/preparing rainfall/i, 28, "preparing rainfall forcing (MRMS) from the archive…"],
+  [/forcing store: reused/i, 34, null],
+  [/preparing PET/i,     36, "preparing PET forcing…"],
+  [/preparing temperature/i, 38, "preparing temperature forcing (snow)…"],
   [/running warm-up/i,   42, "running the warm-up simulation (builds the initial soil state)…"],
   [/warm-up done/i,      58, "warm-up finished — initial state saved"],
   [/running CREST/i,     60, "CREST is running — hydrograph streaming live…"],
@@ -564,6 +569,28 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+// ---- AI error interpreter: backend error -> plain-words chat message -------
+const explained = new Set();          // one explanation per (source, gauge)
+async function explainError(source, rawError, gid) {
+  const key = `${source}:${gid}`;
+  if (explained.has(key)) return;
+  explained.add(key);
+  const card = addMsg(`🧯 <b>${gid}</b> — the ${source} hit an error. <i>Interpreting…</i>`, "bot");
+  let text = null;
+  try {
+    const r = await fetch("/api/explain", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ error: String(rawError), where: source,
+                             context: { gauge: gid, window: lastSim } }),
+    });
+    text = (await r.json()).text;
+  } catch (_) {}
+  card.innerHTML = `🧯 <b>${gid}</b> — ` + (text ? mdLite(text)
+    : `the ${source} failed with: <code>${escapeHtml(String(rawError).slice(0, 200))}</code>. ` +
+      `This is often a temporary data-read hiccup — trying again usually works. ` +
+      `If it keeps failing, report it with 💡 Feedback.`);
+}
+
 // ---- auto-calibration offer (NSE < 0.3) ---------------------------------
 const calOffered = new Set();
 function maybeOfferCalibration(gid, metrics) {
@@ -578,6 +605,7 @@ function maybeOfferCalibration(gid, metrics) {
   card.querySelector('[data-act="ai"]').onclick = () => { card.querySelector(".btn-row").remove(); startCalibration(gid); };
   card.querySelector('[data-act="manual"]').onclick = () => {
     card.querySelector(".btn-row").remove();
+    sessionStorage.setItem("expertOk", "1");   // user chose manual tuning
     const lp = document.getElementById("left-panel");
     lp.classList.remove("collapsed");
     document.getElementById("adv-body").classList.remove("hidden");
@@ -625,7 +653,11 @@ async function startCalibration(gid) {
     } else if (ev.kind === "cal_done") {
       es.close();
       fill.style.width = "100%"; pct.textContent = "100%";
-      if (ev.error) { stage.textContent = "failed: " + ev.error; return; }
+      if (ev.error) {
+        stage.textContent = "failed ✗";
+        explainError("calibration", ev.error, gid);
+        return;
+      }
       stage.textContent = `done — NSE ${ev.baseline_nse} → ${ev.best_nse}`;
       addMsg(`🎯 Calibration finished for <b>${gid}</b>: NSE <b>${ev.baseline_nse}</b> → <b>${ev.best_nse}</b>` +
         (ev.saved ? " — saved as this basin's best parameter set (it will be used automatically from now on)."
@@ -1016,11 +1048,36 @@ document.getElementById("chat-text").addEventListener("keydown", (e) => {
   if (e.key === "Enter") document.getElementById("chat-send").click();
 });
 document.getElementById("btn-sim").onclick = simulate;
+
+// Model options is an expert panel — confirm once per session before opening
+function expertGateOk() { return sessionStorage.getItem("expertOk") === "1"; }
+function openExpertGate(onYes) {
+  const m = document.getElementById("expert-modal");
+  m.classList.remove("hidden");
+  document.getElementById("xp-yes").onclick = () => {
+    sessionStorage.setItem("expertOk", "1");
+    m.classList.add("hidden");
+    onYes();
+  };
+  const deny = () => {
+    m.classList.add("hidden");
+    addMsg("👍 No problem — just tell me about the flood you're interested in " +
+      "(a place, a date, or a news link) and I'll set everything up for you.", "bot");
+  };
+  document.getElementById("xp-no").onclick = deny;
+  document.getElementById("xp-close").onclick = deny;
+}
+
 document.querySelectorAll(".panel-head .toggle, .panel-head .close").forEach((btn) => {
   btn.onclick = () => {
     const p = document.getElementById(btn.dataset.target);
-    if (btn.classList.contains("close")) p.classList.add("hidden");
-    else p.classList.toggle("collapsed");
+    if (btn.classList.contains("close")) { p.classList.add("hidden"); return; }
+    const opening = p.classList.contains("collapsed");
+    if (p.id === "left-panel" && opening && !expertGateOk()) {
+      openExpertGate(() => p.classList.remove("collapsed"));
+      return;
+    }
+    p.classList.toggle("collapsed");
   };
 });
 // ---- advanced parameters (all model/routing/snow params) ---------------

@@ -48,6 +48,10 @@ def clip_param_grids(bbox, out_dir: str, keys=None, unsafe_ssl: bool | None = No
     out, skipped = {}, {}
     for key in keys:
         cog, fname = PARAM_GRIDS[key]
+        cached = os.path.join(out_dir, fname)
+        if os.path.exists(cached):             # shared-store hit: no remote read
+            out[key] = cached
+            continue
         with rasterio.open(_vsicurl(cog)) as src:
             b = src.bounds
             # guard: bbox must intersect the grid (catches mis-georeferenced grids)

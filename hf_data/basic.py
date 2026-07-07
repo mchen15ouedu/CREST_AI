@@ -13,6 +13,7 @@ that is LOCAL-ONLY and not set on HF cloud runners.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 
 import rasterio
@@ -95,11 +96,23 @@ def derive_dir_acc(dem_path: str, fdir_path: str, facc_path: str) -> None:
             dst.write(out, 1)
 
 
+def store_dir(bbox) -> str:
+    """Shared per-basin clip store: repeated runs (and every calibration
+    candidate) reuse the same clipped DEM/DDM/FAM instead of re-reading the
+    remote COGs — faster AND immune to transient network read failures."""
+    from hf_data.statecache import CACHE_DIR
+    key = "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p")
+    d = os.path.join(CACHE_DIR, "basic", key)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def clip_basic_data(bbox, out_dir: str, unsafe_ssl: bool | None = None) -> ClipResult:
     """Clip DEM/DDM/FAM to `bbox` (W, S, E, N in EPSG:4326) from the HF COGs.
 
     Writes dem_clip.tif / fdir_clip.tif / facc_clip.tif into `out_dir`, all on
-    the same window/geotransform. Returns a ClipResult.
+    the same window/geotransform. Returns a ClipResult. If all three clips are
+    already present in `out_dir` (shared store), they are reused as-is.
     """
     W, S, E, N = bbox
     # local-network MITM workaround; harmless (and unset) on HF runners
@@ -113,13 +126,30 @@ def clip_basic_data(bbox, out_dir: str, unsafe_ssl: bool | None = None) -> ClipR
     ref_shape = None
     ref_bounds = None
 
+    existing = {n: os.path.join(out_dir, n) for n in BASIC_GRIDS}
+    if all(os.path.exists(p) for p in existing.values()):     # store hit
+        with rasterio.open(existing["dem_clip.tif"]) as ds:
+            t = ds.transform
+            return ClipResult(out_dir=out_dir, files=existing,
+                              width=ds.width, height=ds.height,
+                              bounds=(t.c, t.f + ds.height * t.e,
+                                      t.c + ds.width * t.a, t.f),
+                              derived=False)
+
     fetch_failed: list[str] = []
     for out_name, cog in BASIC_GRIDS.items():
-        try:
-            _clip_one(cog, out_name, bbox, out_dir, files)
-        except Exception:
+        err = None
+        for attempt in range(3):               # /vsicurl reads fail transiently
+            try:
+                _clip_one(cog, out_name, bbox, out_dir, files)
+                err = None
+                break
+            except Exception as e:
+                err = e
+                time.sleep(2 * (attempt + 1))
+        if err is not None:
             if out_name == "dem_clip.tif":
-                raise                          # DEM is required — no fallback
+                raise err                      # DEM is required — no fallback
             fetch_failed.append(out_name)
     _shapes = {}
     for out_name, path in files.items():

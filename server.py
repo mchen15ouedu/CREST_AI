@@ -276,6 +276,38 @@ def api_chat(req: ChatReq):
     return d if d else {"action": "fallback"}
 
 
+class ExplainReq(BaseModel):
+    error: str
+    where: str | None = None       # e.g. "simulation" | "calibration"
+    context: dict = {}
+
+
+@app.post("/api/explain")
+def api_explain(req: ExplainReq):
+    """Translate a backend error into a human-readable chat explanation."""
+    from hf_data import llm
+    if not llm.available():
+        return {"text": None}
+    try:
+        sys_p = ("You are the assistant in a flood-simulation dashboard (CREST/EF5 "
+                 "hydrologic model, data streamed from Hugging Face). A backend step "
+                 "failed. Explain to a NON-developer user in 2-4 short sentences: "
+                 "(1) what went wrong in plain words, (2) the most likely cause, "
+                 "(3) what to do — e.g. simply try again (transient network reads are "
+                 "common), pick a different time period/gauge, or use the 💡 Feedback "
+                 "button to report it. No stack traces, no jargon, no blame.")
+        user_p = (f"Failed step: {req.where or 'simulation'}\n"
+                  f"Raw error: {req.error[:1500]}\n"
+                  f"Context: {str(req.context)[:500]}")
+        text, provider = llm.chat([{"role": "system", "content": sys_p},
+                                   {"role": "user", "content": user_p}],
+                                  temperature=0.2)
+        return {"text": text, "provider": provider}
+    except Exception as e:
+        crashlog.capture("explain", e)
+        return {"text": None}
+
+
 class EventInfoReq(BaseModel):
     label: str
     t_start: str

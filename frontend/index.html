@@ -116,6 +116,24 @@
     </div>
   </div>
 
+  <!-- expert-mode confirmation (Model options gate) -->
+  <div id="expert-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head"><span>⚙️ Advanced controls</span><button id="xp-close">✕</button></div>
+      <div class="modal-body">
+        <p>The <b>Model options</b> panel is meant for <b>experienced CREST/EF5 users</b> —
+          it directly overrides the simulation window, time step, warm-up, model choice and
+          calibration parameters that go into the control file.</p>
+        <p class="pm-sub">If you'd rather not tune these by hand, the assistant in the chat
+          box can find the event, set the time window, and pick sensible settings for you.</p>
+        <div class="btn-row">
+          <button id="xp-yes" class="primary">Yes — I know what I'm doing</button>
+          <button id="xp-no">No — let the assistant guide me</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- test-user feedback modal -->
   <div id="feedback-modal" class="modal hidden">
     <div class="modal-card">
