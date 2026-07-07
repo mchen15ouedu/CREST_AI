@@ -1147,14 +1147,19 @@ const SNOW_KEYS = ["uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "s
 function paramEnabled(k) {
   const m = document.getElementById("k-model").value;     // auto|crestphys|crest|hp
   const s = document.getElementById("k-snow").value;      // auto|on|off
+  if (m === "auto") return false;   // Auto = the agent's calibrated parameter
+                                    // set from the database — nothing editable
   if (SNOW_KEYS.includes(k)) return s !== "off";
   if (HP_KEYS.includes(k)) return m === "hp";
-  if (CRESTPHYS_ONLY.includes(k)) return m === "crestphys" || m === "auto";
+  if (CRESTPHYS_ONLY.includes(k)) return m === "crestphys";
   if (WB_KEYS.includes(k)) return m !== "hp";
-  return true;                                            // KW routing: all models
+  return true;                                            // KW routing
 }
 
 function updateParamAvailability() {
+  const auto = document.getElementById("k-model").value === "auto";
+  const note = document.getElementById("adv-auto-note");
+  if (note) note.classList.toggle("hidden", !auto);
   document.querySelectorAll("#adv-body input[data-param]").forEach((i) => {
     const on = paramEnabled(i.dataset.param);
     i.disabled = !on;
