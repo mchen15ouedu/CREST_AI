@@ -405,7 +405,14 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         wu_out = os.path.join(out_dir, "warmup")
         wu_ctl = os.path.join(os.path.dirname(spec.control_path), "control_warmup.txt")
         wu = run_ef5(wu_ctl, wu_out, g["id"], model=ef5_model)
+        from hf_data.runner import RUN_TIMEOUT_S
+        wu_deadline = time.time() + RUN_TIMEOUT_S
         while wu.alive():
+            if time.time() > wu_deadline:            # stuck-run watchdog
+                wu.kill()
+                yield ("status", f"⚠️ warm-up killed after {RUN_TIMEOUT_S / 3600:.1f} h "
+                                 "(stuck-run watchdog) — Simu will cold-start")
+                break
             time.sleep(2)
         n_states = len(glob.glob(os.path.join(sdir, f"*_{run_start:%Y%m%d_%H%M}.tif")))
         if n_states:

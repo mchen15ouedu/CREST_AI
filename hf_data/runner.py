@@ -20,6 +20,10 @@ from datetime import datetime, timedelta
 
 TS_TIME_FMT = "%Y-%m-%d %H:%M"
 
+# hard cap on a single EF5 process — a run stuck past this is killed, not
+# abandoned (env CREST_RUN_TIMEOUT_S, default 10 hours)
+RUN_TIMEOUT_S = float(os.environ.get("CREST_RUN_TIMEOUT_S", str(10 * 3600)))
+
 
 # --------------------------------------------------------------------------- #
 # output readers
@@ -88,6 +92,16 @@ class RunHandle:
             return self.proc.poll() is None
         return not self.stop_flag.is_set()
 
+    def kill(self):
+        """Hard-stop a stuck run (watchdog)."""
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=10)
+            except Exception:
+                pass
+        self.stop_flag.set()
+
 
 def run_ef5(control_path: str, output_dir: str, gauge_id: str, model: str = "crestphys",
             ef5_bin: str = "./EF5/bin/ef5") -> RunHandle:
@@ -101,8 +115,9 @@ def run_ef5(control_path: str, output_dir: str, gauge_id: str, model: str = "cre
     return RunHandle(output_dir=output_dir, ts_path=ts, model=model, proc=proc)
 
 
-def stream_run(handle: RunHandle, poll: float = 0.4, timeout: float = 1800):
-    """Yield {'kind': 'hydro'|'q2d'|'done', ...} as EF5 writes output."""
+def stream_run(handle: RunHandle, poll: float = 0.4, timeout: float = RUN_TIMEOUT_S):
+    """Yield {'kind': 'hydro'|'q2d'|'done', ...} as EF5 writes output.
+    On timeout the EF5 process is KILLED (not abandoned) before reporting."""
     tail = _TsTail(handle.ts_path)
     seen: set = set()
     t0 = time.time()
@@ -124,7 +139,9 @@ def stream_run(handle: RunHandle, poll: float = 0.4, timeout: float = 1800):
             yield {"kind": "done", "returncode": rc}
             return
         if time.time() - t0 > timeout:
-            yield {"kind": "done", "returncode": -1, "error": "timeout"}
+            handle.kill()                    # watchdog: stop the stuck process
+            yield {"kind": "done", "returncode": -1,
+                   "error": f"killed after {timeout / 3600:.1f} h (stuck-run watchdog)"}
             return
         time.sleep(poll)
 

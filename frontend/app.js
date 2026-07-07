@@ -106,8 +106,8 @@ function addGaugePins(pins) {
   });
 }
 
-async function runQuery(text, userDates) {
-  addMsg(escapeHtml(text), "user");
+async function runQuery(text, userDates, echo = true) {
+  if (echo) addMsg(escapeHtml(text), "user");
   const s = addMsg("🧭 Analyzing…", "status");
   try {
     const r = await fetch("/api/query", {
@@ -129,8 +129,18 @@ async function runQuery(text, userDates) {
     } else if (userDates) {
       confirmDates(userDates, d);
     }
+    if (aiInfo) fetchEventInfo();      // event background BEFORE simulating
   } catch (err) {
-    s.textContent = "⚠️ " + err.message;
+    if (/could not parse a location/i.test(err.message)) {
+      s.remove();
+      addMsg("🧭 I couldn't place that yet — let's narrow it down together. " +
+        "Which <b>region</b> are you interested in (a state, city or river)? " +
+        "And roughly <b>when</b> — a recent event or a historic one? For example: " +
+        "<i>“flood in Kerrville, Texas, July 2025”</i>, <i>“Allagash River spring flood”</i>, " +
+        "or just click any blue gauge pin on the map.", "bot");
+    } else {
+      s.textContent = "⚠️ " + err.message;
+    }
   }
 }
 
@@ -276,6 +286,7 @@ async function simulate() {
     return;
   }
   if (d.warning) addMsg("⚠️ " + d.warning, "status");
+  localStorage.setItem("lastSimId", d.sim_id);   // reattach after closing the app
   resetAnim();
   zoomedToOverlay = false;
   const tS = d.t_start || win.tStart, tE = d.t_end || win.tEnd;   // server may clamp
@@ -411,8 +422,10 @@ function progressFromRows(gid) {
               `simulating — ${n}/${exp} timesteps`);
 }
 
+let lastEventInfoLabel = null;      // one news card per event, not per click
 async function fetchEventInfo() {
-  if (!queryCtx?.label) return;
+  if (!queryCtx?.label || queryCtx.label === lastEventInfoLabel) return;
+  lastEventInfoLabel = queryCtx.label;
   const card = addMsg(`<div class="news-h">📰 About this event — ${escapeHtml(queryCtx.label)}</div>` +
                       `<i>looking up impacts, damage and news…</i>`, "news");
   try {
@@ -694,7 +707,29 @@ function setChatTime(ud, note) {
   allowResim();
 }
 
-function handleChat(text) {
+let chatHistory = [];             // rolling conversation for the agent
+
+function chatContext() {
+  return {
+    event: queryCtx ? { label: queryCtx.label, t_start: queryCtx.t_start, t_end: queryCtx.t_end } : null,
+    selected: [...selected],
+    sim_running: simRunning,
+    last_window: lastSim ? { start: lastSim.tStart, end: lastSim.tEnd } : null,
+    results: Object.entries(gaugeResult).map(([id, r]) => ({
+      gauge: id, name: gaugeData[id] ? gaugeData[id].name : null,
+      nse: r.metrics ? r.metrics.nsce : null,
+      peak_sim: r.metrics ? r.metrics.peak_sim : null,
+    })),
+    manual_time_override: manualTime, chat_time: chatTime,
+  };
+}
+
+function remember(role, content) {
+  chatHistory.push({ role, content });
+  if (chatHistory.length > 24) chatHistory = chatHistory.slice(-24);
+}
+
+async function handleChat(text) {
   const t = text.trim();
   const tl = t.toLowerCase();
   if (/simulate all|all gauges|run all/.test(tl)) {
@@ -712,6 +747,7 @@ function handleChat(text) {
   if (ud && (awaitingTime || leftover.length < 8)) {
     awaitingTime = false;
     addMsg(escapeHtml(t), "user");
+    remember("user", t);
     setChatTime(ud);
     return;
   }
@@ -721,7 +757,37 @@ function handleChat(text) {
     runQuery(`${pendingQuery || ""} ${t}`.trim());
     return;
   }
-  runQuery(t, ud);      // free-form query; embedded dates are checked against the AI's
+  // everything else -> the conversational agent decides (guide / answer / locate)
+  addMsg(escapeHtml(t), "user");
+  remember("user", t);
+  const thinking = addMsg("💬 thinking…", "status");
+  let d = null;
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: t, history: chatHistory.slice(0, -1), context: chatContext() }),
+    });
+    d = await r.json();
+  } catch (_) { /* offline -> fallback below */ }
+  thinking.remove();
+  if (!d || d.action === "fallback" || !d.reply) {
+    runQuery(t, ud, false);              // rule-based fallback (no LLM configured)
+    return;
+  }
+  addMsg(mdLite(d.reply), "bot");
+  remember("assistant", d.reply);
+  if (d.start) {                          // agent extracted/confirmed a window
+    chatTime = { start: d.start, end: d.end || null };
+    awaitingTime = false;
+    allowResim();
+  }
+  if (d.action === "locate" && d.location_query) {
+    awaitingTime = false;
+    runQuery(d.location_query, ud || (d.start ? { start: d.start, end: d.end || null } : null), false);
+  } else if (d.event_info) {
+    lastEventInfoLabel = null;            // user explicitly asked -> refresh the card
+    fetchEventInfo();
+  }
 }
 
 // ---- auth: HF OAuth + profile modal ---------------------------------------
@@ -875,6 +941,38 @@ document.querySelectorAll("#left-panel input, #left-panel select").forEach((el) 
   el.addEventListener("change", allowResim);
 });
 
+// ---- reattach: a run keeps going in the backend even if the app is closed --
+async function reattach() {
+  const simId = localStorage.getItem("lastSimId");
+  if (!simId) return;
+  try {
+    const r = await fetch(`/api/job/${simId}`);
+    if (!r.ok) { localStorage.removeItem("lastSimId"); return; }
+    const j = await r.json();
+    if (j.done && j.age_s > 24 * 3600) { localStorage.removeItem("lastSimId"); return; }
+    const tS = j.t_start.slice(0, 19), tE = j.t_end.slice(0, 19);
+    const H = windowHours(tS, tE);
+    lastSim = { tStart: tS, tEnd: tE, hours: H, expectedSteps: H + 1 };
+    j.gauge_ids.forEach((id) => {
+      simHydro[id] = [];
+      gaugeState[id] = j.done ? "done" : "running";
+    });
+    renderTabs();
+    addMsg(j.done
+      ? "🔁 Restored your previous simulation — the run finished in the background while you were away."
+      : "🔁 Reattached to your running simulation — it kept going in the background.", "status");
+    if (!j.done) {
+      simRunning = true;
+      selKeyAtRun = j.gauge_ids.slice().sort().join(",");
+      if (aiInfo) initProgress(j.gauge_ids);
+    }
+    refreshSelection();
+    openStream(simId);              // cursor 0 -> full event replay rebuilds the UI
+    if (j.gauge_ids.length) focusGauge(j.gauge_ids[0]);
+  } catch (_) { /* server restarted; job registry is gone */ }
+}
+
 // ---- boot ----------------------------------------------------------------
 initAuth();
 loadViewportGauges();               // gauge pins visible with zero AI interaction
+reattach();                         // pick up a run started before the app was closed

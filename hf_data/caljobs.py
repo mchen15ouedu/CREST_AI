@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import queue
 import threading
 import uuid
 from datetime import datetime
@@ -20,8 +19,11 @@ class CalJob:
         self.gauge_id = gauge_id
         self.t_start, self.t_end = t_start, t_end
         self.opts = opts or {}
-        self.q: queue.Queue = queue.Queue()
+        self.events: list[dict] = []          # append-only, replayable (see simjobs)
         self.done = threading.Event()
+
+    def _emit(self, ev: dict):
+        self.events.append(ev)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -36,16 +38,16 @@ class CalJob:
                     rounds=int(self.opts.get("rounds", 4)),
                     k=int(self.opts.get("k", 3))):
                 if kind == "status":
-                    self.q.put({"kind": "cal_status", "gauge_id": self.gauge_id, "msg": payload})
+                    self._emit({"kind": "cal_status", "gauge_id": self.gauge_id, "msg": payload})
                 elif kind == "round":
-                    self.q.put({"kind": "cal_round", "gauge_id": self.gauge_id, **payload})
+                    self._emit({"kind": "cal_round", "gauge_id": self.gauge_id, **payload})
                 elif kind == "hydro":
-                    self.q.put({"kind": "cal_hydro", "gauge_id": self.gauge_id,
+                    self._emit({"kind": "cal_hydro", "gauge_id": self.gauge_id,
                                 "rows": payload["rows"]})
                 elif kind == "done":
-                    self.q.put({"kind": "cal_done", "gauge_id": self.gauge_id, **payload})
+                    self._emit({"kind": "cal_done", "gauge_id": self.gauge_id, **payload})
         except Exception as e:
-            self.q.put({"kind": "cal_done", "gauge_id": self.gauge_id, "error": str(e)})
+            self._emit({"kind": "cal_done", "gauge_id": self.gauge_id, "error": str(e)})
         finally:
             self.done.set()
 

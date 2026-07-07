@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import asyncio
 import json
-import queue
 import secrets
+import time
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Request, Response
@@ -188,6 +188,25 @@ def api_query(q: Query):
     }
 
 
+class ChatReq(BaseModel):
+    message: str
+    history: list = []
+    context: dict = {}
+
+
+@app.post("/api/chat")
+def api_chat(req: ChatReq):
+    """Conversational agent turn: guides users to an event, answers questions
+    about the current simulation, and routes locate/set_time actions.
+    {"action": "fallback"} tells the client to use its rule-based path."""
+    from hf_data import chatagent
+    try:
+        d = chatagent.respond(req.message, req.history, req.context)
+    except Exception as e:
+        return {"action": "fallback", "error": str(e)}
+    return d if d else {"action": "fallback"}
+
+
 class EventInfoReq(BaseModel):
     label: str
     t_start: str
@@ -247,26 +266,41 @@ def api_simulate(req: SimRequest):
             "max_concurrent": simjobs.MAX_CONCURRENT}
 
 
-async def _drain(job):
+async def _drain(job, cursor: int = 0):
+    """Replay the job's event log from `cursor`, then follow it live. Multiple
+    clients (or a reopened browser) can each attach with their own cursor."""
     while True:
-        try:
-            ev = job.q.get_nowait()
-        except queue.Empty:
-            if job.done.is_set():
+        if cursor < len(job.events):
+            ev = job.events[cursor]
+            cursor += 1
+            yield {"data": json.dumps(ev)}
+            if ev.get("kind") in ("all_done", "cal_done"):
                 break
-            await asyncio.sleep(0.15)
-            continue
-        yield {"data": json.dumps(ev)}
-        if ev.get("kind") in ("all_done", "cal_done"):
+        elif job.done.is_set():
             break
+        else:
+            await asyncio.sleep(0.15)
 
 
 @app.get("/api/stream/{sim_id}")
-async def api_stream(sim_id: str):
+async def api_stream(sim_id: str, cursor: int = 0):
     job = simjobs.get_job(sim_id)
     if not job:
         return Response(status_code=404)
-    return EventSourceResponse(_drain(job))
+    return EventSourceResponse(_drain(job, cursor))
+
+
+@app.get("/api/job/{sim_id}")
+def api_job(sim_id: str):
+    """Job descriptor for reattaching after the browser was closed. The run
+    keeps going server-side; the client replays the event log via /api/stream."""
+    job = simjobs.get_job(sim_id)
+    if not job:
+        return JSONResponse({"error": "unknown or expired job"}, status_code=404)
+    return {"sim_id": job.id, "gauge_ids": job.gauge_ids,
+            "t_start": job.t_start.isoformat(), "t_end": job.t_end.isoformat(),
+            "done": job.done.is_set(), "n_events": len(job.events),
+            "age_s": int(time.time() - job.created)}
 
 
 class CalRequest(BaseModel):
@@ -290,11 +324,11 @@ def api_calibrate(req: CalRequest):
 
 
 @app.get("/api/calstream/{cal_id}")
-async def api_calstream(cal_id: str):
+async def api_calstream(cal_id: str, cursor: int = 0):
     job = caljobs.get_job(cal_id)
     if not job:
         return Response(status_code=404)
-    return EventSourceResponse(_drain(job))
+    return EventSourceResponse(_drain(job, cursor))
 
 
 @app.get("/api/overlay/{sim_id}/{gauge_id}.png")

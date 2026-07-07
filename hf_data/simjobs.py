@@ -9,8 +9,8 @@ rendered to PNG overlays served by the backend.
 from __future__ import annotations
 
 import os
-import queue
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -31,7 +31,10 @@ class SimJob:
         self.gauge_ids = gauge_ids[:MAX_SIMS]
         self.t_start, self.t_end = t_start, t_end
         self.opts = opts or {}
-        self.q: queue.Queue = queue.Queue()
+        self.created = time.time()
+        # append-only event log — SSE clients replay from any cursor, so a
+        # closed/reopened browser reattaches without losing the run
+        self.events: list[dict] = []
         self.overlays: dict[str, tuple] = {}     # gid -> (png_bytes, bounds, frame)  (live latest)
         self.q_paths: dict[str, list] = {}       # gid -> [q.*.tif paths] (for the animation)
         self.frames: dict[str, list] = {}        # gid -> [(png_bytes, bounds, time_label)]
@@ -41,13 +44,16 @@ class SimJob:
         self.done = threading.Event()
         self._q2d_err: set = set()               # gauges with a reported render error
 
+    def _emit(self, ev: dict):
+        self.events.append(ev)               # append-only; readers poll by index
+
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as ex:
             list(ex.map(self._run_one, self.gauge_ids))
-        self.q.put({"kind": "all_done"})
+        self._emit({"kind": "all_done"})
         self.done.set()
 
     def _run_one(self, gid):
@@ -65,34 +71,34 @@ class SimJob:
                 elif kind == "params":
                     self.params[gid] = payload      # effective wb/kw for paramstore
                 elif kind == "status":
-                    self.q.put({"kind": "status", "gauge_id": gid, "msg": payload})
+                    self._emit({"kind": "status", "gauge_id": gid, "msg": payload})
                 elif kind == "hydro":
                     self.hydro.setdefault(gid, []).extend(payload["rows"])
-                    self.q.put({"kind": "hydro", "gauge_id": gid, "rows": payload["rows"]})
+                    self._emit({"kind": "hydro", "gauge_id": gid, "rows": payload["rows"]})
                 elif kind == "q2d":
                     self.q_paths.setdefault(gid, []).append(payload["path"])
                     try:
                         png, bounds, _ = viz.q2d_png(payload["path"])
                         frame = self.overlays.get(gid, (None, None, 0))[2] + 1
                         self.overlays[gid] = (png, bounds, frame)
-                        self.q.put({"kind": "q2d", "gauge_id": gid, "bounds": bounds, "frame": frame})
+                        self._emit({"kind": "q2d", "gauge_id": gid, "bounds": bounds, "frame": frame})
                     except Exception as e:
                         if gid not in self._q2d_err:      # report once, don't spam
                             self._q2d_err.add(gid)
-                            self.q.put({"kind": "status", "gauge_id": gid,
+                            self._emit({"kind": "status", "gauge_id": gid,
                                         "msg": f"⚠️ 2-D frame render failed: {e}"})
                 elif kind == "done":
                     if payload.get("cached"):
                         self._cached_timeline(gid)        # replay frames from disk
                     else:
                         self._build_timeline(gid)
-                    self.q.put({"kind": "gauge_done", "gauge_id": gid,
+                    self._emit({"kind": "gauge_done", "gauge_id": gid,
                                 "returncode": payload.get("returncode"),
                                 "n": len(self.hydro.get(gid, []))})
                     self._build_result(gid)
         except Exception as e:
-            self.q.put({"kind": "status", "gauge_id": gid, "msg": f"⚠️ {e}"})
-            self.q.put({"kind": "gauge_done", "gauge_id": gid, "returncode": -1})
+            self._emit({"kind": "status", "gauge_id": gid, "msg": f"⚠️ {e}"})
+            self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -1})
 
     def _build_timeline(self, gid):
         """After a gauge finishes, pre-render all frames with a fixed color scale
@@ -103,7 +109,7 @@ class SimJob:
         try:
             frames, vmax = viz.q2d_frames(paths)
             self.frames[gid] = frames
-            self.q.put({"kind": "timeline", "gauge_id": gid, "n": len(frames),
+            self._emit({"kind": "timeline", "gauge_id": gid, "n": len(frames),
                         "times": [f[2] for f in frames],
                         "bounds": frames[0][1] if frames else None,
                         "vmax": vmax})
@@ -115,7 +121,7 @@ class SimJob:
             if len(frames) >= 0.9 * expected:
                 viz.save_frames_cache(gid, model, self.t_start, self.t_end, frames, vmax)
         except Exception as e:
-            self.q.put({"kind": "status", "gauge_id": gid,
+            self._emit({"kind": "status", "gauge_id": gid,
                         "msg": f"⚠️ animation build failed: {e}"})
 
     def _cached_timeline(self, gid):
@@ -128,9 +134,9 @@ class SimJob:
         self.frames[gid] = frames
         if frames:                                    # latest frame as live overlay
             self.overlays[gid] = (frames[-1][0], frames[-1][1], len(frames))
-            self.q.put({"kind": "q2d", "gauge_id": gid,
+            self._emit({"kind": "q2d", "gauge_id": gid,
                         "bounds": frames[-1][1], "frame": len(frames)})
-        self.q.put({"kind": "timeline", "gauge_id": gid, "n": len(frames),
+        self._emit({"kind": "timeline", "gauge_id": gid, "n": len(frames),
                     "times": [f[2] for f in frames],
                     "bounds": frames[0][1] if frames else None, "vmax": vmax})
 
@@ -152,10 +158,10 @@ class SimJob:
                     pass
             report = analysis.build_report(self.meta.get(gid), metrics,
                                            self.t_start, self.t_end)
-            self.q.put({"kind": "result", "gauge_id": gid,
+            self._emit({"kind": "result", "gauge_id": gid,
                         "meta": self.meta.get(gid), "metrics": metrics, "report": report})
         except Exception as e:
-            self.q.put({"kind": "result", "gauge_id": gid, "metrics": {},
+            self._emit({"kind": "result", "gauge_id": gid, "metrics": {},
                         "report": f"(report unavailable: {e})"})
 
     def overlay_png(self, gid):
@@ -169,9 +175,18 @@ class SimJob:
         return None
 
 
+MAX_KEPT_JOBS = 30            # finished jobs kept in RAM for reattach/replay
+
+
 def start_job(gauge_ids, t_start: datetime, t_end: datetime, opts) -> SimJob:
     job = SimJob(gauge_ids, t_start, t_end, opts)
     _JOBS[job.id] = job
+    if len(_JOBS) > MAX_KEPT_JOBS:            # prune the oldest FINISHED jobs
+        for jid in sorted(_JOBS, key=lambda j: _JOBS[j].created):
+            if len(_JOBS) <= MAX_KEPT_JOBS:
+                break
+            if _JOBS[jid].done.is_set():
+                del _JOBS[jid]
     job.start()
     return job
 
