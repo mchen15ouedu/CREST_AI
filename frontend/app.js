@@ -1023,6 +1023,23 @@ document.getElementById("pf-save").onclick = async () => {
   setTimeout(() => { document.getElementById("pf-saved").textContent = ""; }, 2500);
 };
 
+// ---- display font size (everything except the top bar) ---------------------
+const FONT_MODES = [["", "🔠 A", "normal"], ["font-lg", "🔠 A+", "bigger"],
+                    ["font-xl", "🔠 A++", "much bigger"]];
+let fontIdx = Math.max(0, FONT_MODES.findIndex(([c]) => c === (localStorage.getItem("fontSize") || "")));
+function applyFont() {
+  document.body.classList.remove("font-lg", "font-xl");
+  const [cls, label] = FONT_MODES[fontIdx];
+  if (cls) document.body.classList.add(cls);
+  document.getElementById("font-btn").textContent = label;
+  localStorage.setItem("fontSize", cls);
+}
+document.getElementById("font-btn").onclick = () => {
+  fontIdx = (fontIdx + 1) % FONT_MODES.length;
+  applyFont();
+};
+applyFont();
+
 // ---- AI info toggle --------------------------------------------------------
 const aiBtn = document.getElementById("ai-info-btn");
 function renderAiBtn() {
@@ -1112,14 +1129,48 @@ function buildAdvanced() {
 }
 buildAdvanced();
 
-// collect only the overridden (non-empty) advanced params
+// collect only the overridden (non-empty, ENABLED) advanced params
 function advancedOverrides() {
   const out = {};
   document.querySelectorAll("#adv-body input[data-param]").forEach((i) => {
-    if (i.value.trim() !== "") out[i.dataset.param] = parseFloat(i.value);
+    if (!i.disabled && i.value.trim() !== "") out[i.dataset.param] = parseFloat(i.value);
   });
   return out;
 }
+
+// ---- grey out parameters that don't belong to the chosen model/snow -------
+const CRESTPHYS_ONLY = ["igw", "hmaxaq", "gwc", "gwe"];   // groundwater terms
+const WB_KEYS = ["wm", "b", "im", "ke", "fc", "iwu", ...CRESTPHYS_ONLY];
+const HP_KEYS = ["precip", "split"];
+const SNOW_KEYS = ["uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "scf"];
+
+function paramEnabled(k) {
+  const m = document.getElementById("k-model").value;     // auto|crestphys|crest|hp
+  const s = document.getElementById("k-snow").value;      // auto|on|off
+  if (SNOW_KEYS.includes(k)) return s !== "off";
+  if (HP_KEYS.includes(k)) return m === "hp";
+  if (CRESTPHYS_ONLY.includes(k)) return m === "crestphys" || m === "auto";
+  if (WB_KEYS.includes(k)) return m !== "hp";
+  return true;                                            // KW routing: all models
+}
+
+function updateParamAvailability() {
+  document.querySelectorAll("#adv-body input[data-param]").forEach((i) => {
+    const on = paramEnabled(i.dataset.param);
+    i.disabled = !on;
+    i.parentElement.classList.toggle("off", !on);
+  });
+  // grey a whole group header when none of its params apply
+  document.querySelectorAll("#adv-body .adv-group").forEach((h) => {
+    const grid = h.nextElementSibling;
+    if (!grid) return;
+    const inputs = [...grid.querySelectorAll("input[data-param]")];
+    h.classList.toggle("off", inputs.length > 0 && inputs.every((i) => i.disabled));
+  });
+}
+document.getElementById("k-model").addEventListener("change", updateParamAvailability);
+document.getElementById("k-snow").addEventListener("change", updateParamAvailability);
+updateParamAvailability();      // initial state (auto model, auto snow)
 
 document.getElementById("adv-toggle").onclick = () => {
   const b = document.getElementById("adv-body");
@@ -1168,6 +1219,7 @@ document.getElementById("k-time-clear").onclick = () => {
   document.getElementById("k-snow").value = "auto";
   document.querySelectorAll("#adv-body input[data-param]").forEach((i) => { i.value = ""; });
   document.getElementById("k-time-state").textContent = "";
+  updateParamAvailability();
   addMsg("🔓 Model options cleared — back to defaults, with the AI/chat-defined window.", "bot");
   allowResim();
 };

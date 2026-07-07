@@ -61,6 +61,17 @@ label.chk input { width: auto; }
 .hidden { display: none !important; }
 
 #btn-feedback { white-space: nowrap; }
+
+/* display size — scales everything except the top bar (and the map itself) */
+body.font-lg #chat, body.font-lg .panel, body.font-lg .modal-card,
+body.font-lg #anim, body.font-lg #q-legend { zoom: 1.18; }
+body.font-xl #chat, body.font-xl .panel, body.font-xl .modal-card,
+body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
+
+/* parameters that don't apply to the chosen model / snow setting */
+.adv-grid label.off { opacity: 0.32; }
+.adv-grid label.off input { cursor: not-allowed; }
+.adv-group.off { opacity: 0.32; }
 .k-step-row { display: flex; gap: 6px; }
 .k-step-row input { width: 64px; }
 #feedback-modal textarea { resize: vertical; }
