@@ -23,17 +23,21 @@ import numpy as np
 
 SNOW_THRESHOLD_C = float(os.environ.get("CREST_SNOW_TEMP_C", "1.0"))
 
-# all 8 params gridded -> scalars are ×1.0 multipliers on the grids
+# all 9 params gridded -> scalars are ×1.0 multipliers on the grids
+# (pxtemp needs fork >= 5a26a86, which made it a real SNOW17 parameter)
 SNOW_DEFAULTS = {"uadj": 1.0, "mbase": 1.0, "mfmax": 1.0, "mfmin": 1.0,
-                 "tipm": 1.0, "nmf": 1.0, "plwhc": 1.0, "scf": 1.0}
+                 "tipm": 1.0, "nmf": 1.0, "plwhc": 1.0, "scf": 1.0, "pxtemp": 1.0}
 # absolute fallbacks (mid-range of the calibrated set) for params whose grid
 # could not be clipped — a bare multiplier of 1.0 would be nonsense then
+# (except pxtemp, where 1.0 °C IS the legacy hardcoded threshold)
 SNOW_ABS_FALLBACK = {"uadj": 0.10, "mbase": 0.3, "mfmax": 1.2, "mfmin": 0.2,
-                     "tipm": 0.3, "nmf": 0.15, "plwhc": 0.10, "scf": 1.0}
+                     "tipm": 0.3, "nmf": 0.15, "plwhc": 0.10, "scf": 1.0,
+                     "pxtemp": 1.0}
 _V1 = "param/snow17/v1"
 SNOW_GRID_COGS = {
     f"{p}_grid": f"{_V1}/{p}_conus_0p1deg.tif"
-    for p in ("uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "scf")
+    for p in ("uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "scf",
+              "pxtemp")
 }
 _RESOLVE = "https://huggingface.co/datasets/vincewin/CREST_data/resolve/main"
 

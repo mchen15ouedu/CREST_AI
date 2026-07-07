@@ -31,7 +31,7 @@ RUN wget -q https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-so
 # ---- Build EF5 fork (CRESTPHYS + lake + native Parquet forcing) ----
 WORKDIR /EF5
 RUN git clone https://github.com/mchen15ouedu/EF5.git . \
- && git checkout b28c838 \
+ && git checkout 5a26a86 \
  && autoreconf --force --install \
  && ./configure --with-arrow CXXFLAGS="-std=c++20 -Wall -O2" CFLAGS="-Wall -O2" \
  && sed -i 's/-Werror//g' Makefile \

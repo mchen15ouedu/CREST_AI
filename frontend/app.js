@@ -1148,7 +1148,7 @@ const PARAM_GROUPS = [
   { title: "Routing — kinematic wave",
     keys: ["under", "leaki", "th", "isu", "alpha", "beta", "alpha0"] },
   { title: "Snow — SNOW17",
-    keys: ["uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "scf"] },
+    keys: ["uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "scf", "pxtemp"] },
   { title: "HP — hydrophobic",
     keys: ["precip", "split"] },
 ];
@@ -1186,7 +1186,7 @@ function advancedOverrides() {
 const CRESTPHYS_ONLY = ["igw", "hmaxaq", "gwc", "gwe"];   // groundwater terms
 const WB_KEYS = ["wm", "b", "im", "ke", "fc", "iwu", ...CRESTPHYS_ONLY];
 const HP_KEYS = ["precip", "split"];
-const SNOW_KEYS = ["uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "scf"];
+const SNOW_KEYS = ["uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "scf", "pxtemp"];
 
 function paramEnabled(k) {
   const m = document.getElementById("k-model").value;     // auto|crestphys|crest|hp
