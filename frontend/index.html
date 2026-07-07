@@ -6,7 +6,7 @@
   <title>CREST_demo — agentic flood analysis</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=__V__" />
 </head>
 <body>
   <div id="map"></div>
@@ -37,7 +37,14 @@
       </div>
       <label>Duration (hours)<input type="number" id="k-hours" value="48" min="6" max="240" /></label>
       <label>Time step
-        <select id="k-step"><option value="1h">1 h</option><option value="30u">30 min</option><option value="2u">2 min</option></select>
+        <span class="k-step-row">
+          <input type="number" id="k-step-n" value="1" min="1" max="60" step="1" />
+          <select id="k-step-u">
+            <option value="u">minute(s)</option>
+            <option value="h" selected>hour(s)</option>
+            <option value="d">day(s)</option>
+          </select>
+        </span>
       </label>
       <label>Warm-up (days)<input type="number" id="k-warmup" value="90" min="0" max="180" /></label>
       <label>Water-balance model
@@ -154,6 +161,6 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=__V__"></script>
 </body>
 </html>

@@ -289,13 +289,26 @@ function allowResim() {
   refreshSelection();
 }
 
+// timestep = integer + unit (u=minutes, h=hours, d=days — EF5 TIME_STEP syntax)
+function readTimestep() {
+  const n = Math.max(1, Math.min(60, parseInt(document.getElementById("k-step-n").value, 10) || 1));
+  const u = document.getElementById("k-step-u").value;
+  return `${n}${u}`;
+}
+function timestepHours(ts) {
+  const m = String(ts).match(/^(\d+)([uhd])$/);
+  if (!m) return 1;
+  const n = parseInt(m[1], 10);
+  return m[2] === "d" ? n * 24 : m[2] === "h" ? n : n / 60;
+}
+
 function readOptions() {
   const ov = advancedOverrides();
   return {
     hours: parseInt(document.getElementById("k-hours").value) || 48,
     model: document.getElementById("k-model").value,
     snow: document.getElementById("k-snow").value,
-    timestep: document.getElementById("k-step").value,
+    timestep: readTimestep(),
     warmup_days: (() => { const v = parseInt(document.getElementById("k-warmup").value, 10);
                           return Number.isFinite(v) ? v : 90; })(),
     overrides: Object.keys(ov).length ? ov : null,
@@ -365,7 +378,9 @@ async function simulate() {
   zoomedToOverlay = false;
   const tS = d.t_start || win.tStart, tE = d.t_end || win.tEnd;   // server may clamp
   const HH = windowHours(tS, tE);
-  lastSim = { tStart: tS, tEnd: tE, hours: HH, expectedSteps: HH + 1 };
+  const stepH = timestepHours(opt.timestep);
+  lastSim = { tStart: tS, tEnd: tE, hours: HH,
+              expectedSteps: Math.max(1, Math.round(HH / stepH)) + 1 };
   ids.forEach((id) => { simHydro[id] = []; gaugeState[id] = "running"; delete gaugeResult[id]; });
   renderTabs();
   if (ids.length && !panelGauge) focusGauge(ids[0]);

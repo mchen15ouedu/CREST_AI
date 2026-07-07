@@ -61,6 +61,8 @@ label.chk input { width: auto; }
 .hidden { display: none !important; }
 
 #btn-feedback { white-space: nowrap; }
+.k-step-row { display: flex; gap: 6px; }
+.k-step-row input { width: 64px; }
 #feedback-modal textarea { resize: vertical; }
 
 /* simulation history (profile modal) */

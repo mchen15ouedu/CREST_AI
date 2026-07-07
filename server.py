@@ -108,9 +108,18 @@ def api_datacleanup():
     return rep
 
 
+APP_VERSION = str(int(time.time()))    # changes every deploy/restart
+
+
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(FRONTEND, "index.html"))
+    """index.html is never browser-cached, and its asset URLs carry a version
+    that changes on every deploy — users always get the latest frontend
+    without needing a hard refresh."""
+    with open(os.path.join(FRONTEND, "index.html"), encoding="utf-8") as fh:
+        html = fh.read().replace("__V__", APP_VERSION)
+    return Response(html, media_type="text/html",
+                    headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/login")
