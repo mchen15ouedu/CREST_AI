@@ -24,17 +24,18 @@
     <div class="panel-head">⚙️ Model options <button class="toggle" data-target="left-panel">⟨</button></div>
     <div class="panel-body">
       <div class="k-time">
-        <label>Simulation start<input type="date" id="k-start" /></label>
-        <label>Simulation end<input type="date" id="k-end" /></label>
-        <p class="adv-note">⚠ <b>Set</b> makes these dates override the AI- or chat-defined
-          event window. Fields left blank keep the AI/chat value. <b>Clear</b> releases
-          the override.</p>
         <div class="k-time-btns">
           <button id="k-time-set" class="primary">Set</button>
           <button id="k-time-clear">Clear</button>
           <span id="k-time-state" class="adv-note"></span>
         </div>
+        <p class="adv-note">⚠ <b>Set</b> applies <b>everything</b> in this panel to the next
+          simulation — dates override the AI/chat-defined event window. Fields left at their
+          default (or blank dates) keep the AI/default value. <b>Clear</b> resets the panel
+          and releases the override.</p>
       </div>
+      <label>Simulation start<input type="date" id="k-start" /></label>
+      <label>Simulation end<input type="date" id="k-end" /></label>
       <label>Duration (hours)<input type="number" id="k-hours" value="48" min="6" max="240" /></label>
       <label>Time step
         <span class="k-step-row">

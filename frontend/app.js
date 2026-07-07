@@ -28,7 +28,8 @@ let MAX_SIMS = 10;
 
 let queryCtx = null;              // {t_start, t_end, bbox, label}  (AI-defined window)
 let chatTime = null;              // {start, end|null} — dates the user typed in chat
-let manualTime = null;            // {start|null, end|null} — Model options “Set” override
+let manualOpts = null;            // FULL Model-options snapshot taken on “Set” —
+                                  // nothing in the panel applies until Set is hit
 let lastSim = null;               // {tStart, tEnd, hours, expectedSteps}
 let awaitingTime = false;         // waiting for the user to give a date range/link
 let pendingQuery = null;          // original query text while awaiting time
@@ -302,9 +303,12 @@ function timestepHours(ts) {
   return m[2] === "d" ? n * 24 : m[2] === "h" ? n : n / 60;
 }
 
-function readOptions() {
+// snapshot of EVERYTHING in the Model options panel (dates + knobs + advanced)
+function readPanel() {
   const ov = advancedOverrides();
   return {
+    start: document.getElementById("k-start").value || null,
+    end: document.getElementById("k-end").value || null,
     hours: parseInt(document.getElementById("k-hours").value) || 48,
     model: document.getElementById("k-model").value,
     snow: document.getElementById("k-snow").value,
@@ -315,13 +319,28 @@ function readOptions() {
   };
 }
 
+const DEFAULT_OPTS = { start: null, end: null, hours: 48, model: "auto", snow: "auto",
+                       timestep: "1h", warmup_days: 90, overrides: null };
+
+function panelDirty() {
+  return JSON.stringify(readPanel()) !== JSON.stringify(DEFAULT_OPTS);
+}
+
+// options used for a run: the Set snapshot if one is active, else defaults.
+// Panel edits WITHOUT hitting Set are intentionally ignored.
+function readOptions() {
+  const src = manualOpts || DEFAULT_OPTS;
+  return { hours: src.hours, model: src.model, snow: src.snow, timestep: src.timestep,
+           warmup_days: src.warmup_days, overrides: src.overrides };
+}
+
 // ---- time-window resolution -------------------------------------------
 // precedence per field: Model-options “Set” override  >  chat-typed dates  >
 // AI-identified event window. A field left blank at a higher level falls
 // through to the next. No end anywhere -> start + Duration knob.
 function resolveWindow(hours) {
   const pick = (k) =>
-    manualTime && manualTime[k] ? [manualTime[k], "manual"] :
+    manualOpts && manualOpts[k] ? [manualOpts[k], "manual"] :
     chatTime && chatTime[k] ? [chatTime[k], "chat"] :
     queryCtx && queryCtx["t_" + k] ? [queryCtx["t_" + k].slice(0, 10), "AI"] : [null, null];
   const [s, srcS] = pick("start");
@@ -345,6 +364,10 @@ function windowHours(t0, t1) {
 async function simulate() {
   if (simRunning && selKey() === selKeyAtRun) return;   // double-click guard
   const ids = [...selected];
+  if (!manualOpts && panelDirty()) {
+    addMsg("ℹ️ You changed Model options but didn't hit <b>Set</b> — running with the " +
+      "defaults and the AI/chat window. Hit <b>Set</b> in ⚙️ Model options to apply your values.", "status");
+  }
   const opt = readOptions();
   const win = resolveWindow(opt.hours);
   if (!win) {                             // map-first flow with no time context
@@ -809,7 +832,7 @@ function chatContext() {
       nse: r.metrics ? r.metrics.nsce : null,
       peak_sim: r.metrics ? r.metrics.peak_sim : null,
     })),
-    manual_time_override: manualTime, chat_time: chatTime,
+    manual_options_override: manualOpts, chat_time: chatTime,
   };
 }
 
@@ -1050,25 +1073,45 @@ document.getElementById("adv-toggle").onclick = () => {
 document.getElementById("anim-play").onclick = togglePlay;
 document.getElementById("anim-slider").oninput = (e) => { stopPlay(); setFrame(parseInt(e.target.value)); };
 
-// ---- manual time override (Set / Clear) ----------------------------------
+// ---- Model options Set / Clear (applies to the WHOLE panel) ---------------
+function describeOpts(o) {
+  const bits = [];
+  if (o.start || o.end) bits.push(`window ${o.start || "(AI start)"} → ${o.end || "(AI end)"}`);
+  if (o.hours !== DEFAULT_OPTS.hours) bits.push(`duration ${o.hours} h`);
+  if (o.timestep !== DEFAULT_OPTS.timestep) bits.push(`step ${o.timestep}`);
+  if (o.warmup_days !== DEFAULT_OPTS.warmup_days) bits.push(`warm-up ${o.warmup_days} d`);
+  if (o.model !== DEFAULT_OPTS.model) bits.push(`model ${o.model.toUpperCase()}`);
+  if (o.snow !== DEFAULT_OPTS.snow) bits.push(`snow ${o.snow}`);
+  if (o.overrides) bits.push(`${Object.keys(o.overrides).length} advanced param(s)`);
+  return bits.length ? bits.join(" · ") : "all defaults";
+}
+
 document.getElementById("k-time-set").onclick = () => {
-  const s = document.getElementById("k-start").value || null;
-  const e = document.getElementById("k-end").value || null;
-  if (!s && !e) { addMsg("⚠ Enter a start and/or end date before hitting Set.", "status"); return; }
-  if (s && e && e <= s) { addMsg("⚠ The end date must be after the start date.", "status"); return; }
-  manualTime = { start: s, end: e };
-  document.getElementById("k-time-state").textContent = "🔒 override active";
-  addMsg(`🔒 Manual time override <b>active</b>: <b>${s || "(AI/chat start)"}</b> → <b>${e || "(AI/chat end)"}</b>. ` +
-    `It overrides the AI- and chat-defined windows until you hit <b>Clear</b>. ` +
-    `Fields left blank fall back to the AI/chat value.`, "bot");
+  const o = readPanel();
+  if (o.start && o.end && o.end <= o.start) {
+    addMsg("⚠ The end date must be after the start date.", "status");
+    return;
+  }
+  manualOpts = o;
+  document.getElementById("k-time-state").textContent = "🔒 options set";
+  addMsg(`🔒 Model options <b>set</b> — ${describeOpts(o)}. These override the AI/chat ` +
+    `values for every simulation until you hit <b>Clear</b>. Fields left at their ` +
+    `default (or blank dates) keep the AI/default value.`, "bot");
   allowResim();
 };
 document.getElementById("k-time-clear").onclick = () => {
-  manualTime = null;
+  manualOpts = null;
   document.getElementById("k-start").value = "";
   document.getElementById("k-end").value = "";
+  document.getElementById("k-hours").value = "48";
+  document.getElementById("k-step-n").value = "1";
+  document.getElementById("k-step-u").value = "h";
+  document.getElementById("k-warmup").value = "90";
+  document.getElementById("k-model").value = "auto";
+  document.getElementById("k-snow").value = "auto";
+  document.querySelectorAll("#adv-body input[data-param]").forEach((i) => { i.value = ""; });
   document.getElementById("k-time-state").textContent = "";
-  addMsg("🔓 Manual time override cleared — the AI/chat-defined window is used again.", "bot");
+  addMsg("🔓 Model options cleared — back to defaults, with the AI/chat-defined window.", "bot");
   allowResim();
 };
 
