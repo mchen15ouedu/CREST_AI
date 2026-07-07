@@ -189,6 +189,17 @@ def analyze(query: str, use_mock: bool = True, hours: int = 48, model: str = "cr
 WEST_LON = -105.0          # west of the Rocky Mountain front -> CREST (task #8)
 WARMUP_DAYS = 90           # 3-month warm-up to build the initial model state (task #6)
 
+# speed run: a cut gauge's observations REPLACE its upstream basin, so gaps in
+# the record become missing river — require nearly complete coverage
+BC_MIN_COVER = float(os.environ.get("CREST_BC_MIN_COVER", "0.95"))
+
+
+def _obs_coverage(series, a, b) -> float:
+    """Fraction of hours in [a, b] with at least one observation."""
+    total_h = max(1, int((b - a).total_seconds() // 3600))
+    hours = {dt.replace(minute=0, second=0, microsecond=0) for dt, _ in series}
+    return min(1.0, len(hours) / total_h)
+
 # one EF5 run per (gauge, model) at a time: concurrent runs of the SAME gauge
 # would race on the shared state dir + result-cache JSON. A second request
 # (double-click, or another user picking the same gauge) waits, then usually
@@ -220,7 +231,7 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
               use_mock: bool = True, hours: int = 48, overrides: dict | None = None,
               snow: str = "auto", timestep: str = "1h", warmup_days: int = WARMUP_DAYS,
               grids: bool = True, no_cache: bool = False,
-              workdir: str | None = None, cancel=None):
+              workdir: str | None = None, cancel=None, scheme: str = "full"):
     """Per-gauge streaming run (map flow: gauge already chosen). Yields events.
     `cancel` (threading.Event) stops the run: the EF5 process is killed and the
     (gauge, model) lock released, so a superseding run can start immediately."""
@@ -247,14 +258,15 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
     try:
         yield from _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end,
                                    use_mock, overrides, snow, timestep,
-                                   warmup_days, grids, no_cache, workdir, cancel)
+                                   warmup_days, grids, no_cache, workdir, cancel,
+                                   scheme)
     finally:
         lock.release()
 
 
 def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                     overrides, snow, timestep, warmup_days, grids, no_cache, workdir,
-                    cancel=None):
+                    cancel=None, scheme="full"):
     """The actual per-gauge run — called with the (gauge, model) lock held."""
     work = workdir or tempfile.mkdtemp(prefix=f"crest_{g['id']}_")
     out_dir = os.path.join(work, "CREST_output")
@@ -296,7 +308,57 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                          f"({names}){f' — {n_edge} at the DEM edge' if n_edge else ''}; "
                          "their USGS observations feed the run as boundary conditions "
                          "(EF5 data assimilation)")
-    variant = "bc:" + (",".join(sorted(b_["id"] for b_ in bc_gauges)) or "none")
+    # --- scheme: ⚡ speed run truncates the domain at the boundary gauges ------
+    # (🏞 full run simulates the whole basin; DA still injects obs at BC gauges)
+    speed = None                    # domain info dict when a speed run is active
+    bc_obs = {}                     # gid -> (series, obs_csv_path), reused below
+    if scheme == "speed":
+        if not bc_gauges:
+            yield ("status", "⚡ speed run requested, but no upstream gauges exist "
+                             "in this domain — running the full basin")
+        else:
+            qualified = bc_gauges
+            if not use_mock:        # obs-coverage gate: a cut gauge's record IS the river
+                qualified = []
+                bc_dir = os.path.join(work, "USGS_bc")
+                f0_est = t_start - timedelta(days=warmup_days)
+                for b_ in bc_gauges:
+                    try:
+                        s = obs.fetch_usgs_discharge(b_["id"], f0_est, t_end)
+                    except Exception:
+                        s = []
+                    cov = _obs_coverage(s, f0_est, t_end) if s else 0.0
+                    p = obs.write_ef5_obs(b_["id"], s, bc_dir) if s else None
+                    if p and cov >= BC_MIN_COVER:
+                        bc_obs[b_["id"]] = (s, p)
+                        qualified.append(b_)
+                    else:
+                        yield ("status", f"gauge {b_['id']}: obs coverage {cov:.0%} "
+                                         f"< {BC_MIN_COVER:.0%} — its area stays simulated")
+            try:
+                from hf_data import domain as _domain
+                speed = _domain.build_speed_domain(g, qualified, basic_dir) if qualified else None
+            except Exception as e:
+                from hf_data import crashlog
+                crashlog.capture("speed-domain", e, gauge=g["id"])
+                yield ("status", f"⚠️ speed-run domain build failed ({e}) — "
+                                 "running the full basin")
+                speed = None
+            if speed:
+                cut_ids = ", ".join(c["id"] for c in speed["cut"])
+                yield ("status", f"⚡ speed run: domain cut at {len(speed['cut'])} "
+                                 f"boundary gauge(s) [{cut_ids}] — simulating "
+                                 f"{speed['kept_frac']:.0%} of the basin "
+                                 f"(≈{speed['speedup']:.1f}× faster); observed flow "
+                                 "is injected at the cut gauges")
+            elif bc_gauges:
+                yield ("status", "⚡ speed run not possible here (no qualifying cut "
+                                 "gauges) — running the full basin")
+    # separate cache/state keys per scheme: rows, frames and EF5 state grids
+    # from a truncated domain must never mix with full-basin ones
+    cache_model = ef5_model + ("-spd" if speed else "")
+    variant = (("cut:" + ",".join(sorted(c["id"] for c in speed["cut"]))) if speed
+               else "bc:" + (",".join(sorted(b_["id"] for b_ in bc_gauges)) or "none"))
 
     if cancel is not None and cancel.is_set():
         yield ("status", "⏹ stopped")
@@ -306,14 +368,14 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     # --- result cache: reuse overlap, simulate only the missing window (task #6) ---
     # the row cache is hourly; a sub-hourly run neither reuses nor writes it
     hourly = timestep == "1h" and not no_cache
-    pl = statecache.plan(g["id"], ef5_model, t_start, t_end, variant=variant) \
+    pl = statecache.plan(g["id"], cache_model, t_start, t_end, variant=variant) \
         if timestep == "1h" else {
         "cached_rows": [], "run_start": t_start, "run_end": t_end,
         "load_state_time": None, "warmup_from": None, "need_warmup": True,
         "reason": "sub-hourly timestep — cache bypassed"}
     if no_cache:            # calibration: fresh full-window run; candidates
         # still warm-start from any state saved on disk at/near t_start
-        ex, wfrom, needw = statecache._state_choice(g["id"], ef5_model, t_start)
+        ex, wfrom, needw = statecache._state_choice(g["id"], cache_model, t_start)
         pl = {"cached_rows": [], "run_start": t_start, "run_end": t_end,
               "load_state_time": ex, "warmup_from": wfrom, "need_warmup": needw,
               "reason": "calibration run — row cache bypassed"}
@@ -322,8 +384,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         # if none are cached on disk, re-run the window (fast: warm-starts
         # from the saved state) so the map animation always appears
         from hf_data import viz as _viz
-        if not _viz.has_frames_cache(g["id"], ef5_model, t_start, t_end):
-            lt, wf, nw = statecache._state_choice(g["id"], ef5_model, t_start)
+        if not _viz.has_frames_cache(g["id"], cache_model, t_start, t_end):
+            lt, wf, nw = statecache._state_choice(g["id"], cache_model, t_start)
             pl = {"cached_rows": [], "run_start": t_start, "run_end": t_end,
                   "load_state_time": lt, "warmup_from": wf, "need_warmup": nw,
                   "reason": "re-run to render the 2-D streamflow maps"}
@@ -334,6 +396,9 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                          f"({pl['cached_rows'][0]['time']}…{pl['cached_rows'][-1]['time']})")
         yield ("hydro", {"rows": pl["cached_rows"], "cached": True})
     if pl["run_start"] is None:                       # fully cached -> no simulation
+        # no wb/kw here on purpose: the frames-cache key must be scheme-aware,
+        # but an empty param set must never reach the param store
+        yield ("params", {"model": ef5_model, "cache_model": cache_model})
         yield ("status", "✓ served entirely from cache")
         yield ("done", {"returncode": 0, "cached": True,
                         "window": [t_start.strftime(statecache.TS_FMT),
@@ -364,6 +429,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         wb = {**wb, **{k: v for k, v in overrides.items() if k in wb}}
         kw = {**kw, **{k: v for k, v in overrides.items() if k in kw}}
     yield ("params", {"wb": wb, "kw": kw, "model": ef5_model,
+                      "cache_model": cache_model,      # frames-cache key (scheme-aware)
                       "source": ("override" if overrides else
                                  stored.get("source", "stored") if stored else "a-priori")})
     pgrids = params.clip_param_grids(bbox, param_dir)
@@ -384,7 +450,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     pet_dir = forcing.store_dir("pet", bbox)
     temp_dir = forcing.store_dir("temp", bbox)
 
-    sdir = statecache.state_dir(g["id"], ef5_model)
+    sdir = statecache.state_dir(g["id"], cache_model)
     warmup_start = None
     if pl["need_warmup"] and (pl.get("warmup_from") or warmup_days > 0):
         # nearby state -> short gap; else the full warm-up (knob, default 90 d; 0 = cold start)
@@ -410,38 +476,53 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         except Exception:
             usgs_dir = ""
 
-    # boundary-condition gauges: fetch their obs over the FULL span (warm-up
-    # included — the assimilated inflow matters there too) and switch DA on
-    ctl_gauges = [Gauge(g["id"], g["lon"], g["lat"], g["area"])]  # outlet: WANTDA=false
+    # boundary-condition gauges + DA file. Speed run: the CUT gauges (snapped
+    # coordinates + incremental drainage areas matching the truncated FAM) —
+    # their obs ARE the upstream river. Full run: every upstream gauge is a
+    # DA point layered on top of the full simulation.
+    if speed:
+        o = speed["outlet"]
+        ctl_gauges = [Gauge(g["id"], o["lon"], o["lat"], o["area_inc"])]
+    else:
+        ctl_gauges = [Gauge(g["id"], g["lon"], g["lat"], g["area"])]  # outlet: WANTDA=false
     da_file = None
-    if bc_gauges and not use_mock:
-        f0 = warmup_start or run_start
-        bc_dir = os.path.join(work, "USGS_bc")
+    if not use_mock:
+        from hf_data import neighbors
         da_series = {}
-        for b_ in bc_gauges:
-            try:
-                s = obs.fetch_usgs_discharge(b_["id"], f0, run_end)
-            except Exception:
-                s = []
-            p = obs.write_ef5_obs(b_["id"], s, bc_dir) if s else None
-            if p:
-                da_series[b_["id"]] = s
-                ctl_gauges.append(Gauge(b_["id"], b_["lon"], b_["lat"], b_["area"] or 0.0,
-                                        obs_path=p, want_da=True, output_ts=False))
+        if speed:
+            for c in speed["cut"]:                    # obs fetched by the gate above
+                s, p = bc_obs.get(c["id"], (None, None))
+                if p:
+                    da_series[c["id"]] = s
+                    ctl_gauges.append(Gauge(c["id"], c["lon"], c["lat"], c["area_inc"],
+                                            obs_path=p, want_da=True, output_ts=False))
+        elif bc_gauges:
+            f0 = warmup_start or run_start
+            bc_dir = os.path.join(work, "USGS_bc")
+            for b_ in bc_gauges:
+                try:
+                    s = obs.fetch_usgs_discharge(b_["id"], f0, run_end)
+                except Exception:
+                    s = []
+                p = obs.write_ef5_obs(b_["id"], s, bc_dir) if s else None
+                if p:
+                    da_series[b_["id"]] = s
+                    ctl_gauges.append(Gauge(b_["id"], b_["lon"], b_["lat"], b_["area"] or 0.0,
+                                            obs_path=p, want_da=True, output_ts=False))
         if da_series:
-            from hf_data import neighbors
             da_file = neighbors.write_da_file(da_series, os.path.join(work, "da_obs.csv"))
             yield ("status", f"🛰 assimilating observed flow at "
                              f"{len(da_series)} upstream gauge(s) — "
                              f"{sum(len(v) for v in da_series.values())} obs points")
-        else:
+        elif bc_gauges:
             yield ("status", "(no usable USGS observations at the upstream gauges — "
                              "running without boundary conditions)")
 
+    grid_dir = speed["dir"] if speed else basic_dir   # dem/fdir/facc for EF5
     spec = ControlSpec(
         control_path=os.path.join(work, "control.txt"),
         time_begin=run_start, time_end=run_end, timestep=timestep,
-        basic_dir=basic_dir, precip_dir=mrms_dir,
+        basic_dir=grid_dir, precip_dir=mrms_dir,
         pet_dir=pet_dir, output_dir=out_dir, usgs_dir=usgs_dir,
         gauges=ctl_gauges,
         crest=wb, kw=kw, model=ef5_model.upper(),
@@ -504,7 +585,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         handle = MockEF5(out_dir, gauge_id=g["id"], model=ef5_model, bounds=bbox,
                          n_steps=run_hours + 1, t0=run_start, delay=0.15,   # inclusive of run_end
                          write_grids=grids,
-                         facc_path=os.path.join(basic_dir, "facc_clip.tif")).start()
+                         facc_path=os.path.join(grid_dir, "facc_clip.tif")).start()
     else:
         handle = run_ef5(spec.control_path, out_dir, g["id"], model=ef5_model)
 
@@ -533,7 +614,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         if warmup_start:
             st.append(run_start.strftime(statecache.TS_FMT))
         try:
-            statecache.save_record(g["id"], ef5_model, pl["cached_rows"] + new_rows, st,
+            statecache.save_record(g["id"], cache_model, pl["cached_rows"] + new_rows, st,
                                    variant=variant)
         except Exception:
             pass

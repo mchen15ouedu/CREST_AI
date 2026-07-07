@@ -79,9 +79,9 @@ function addMsg(html, cls = "bot") {
   log.scrollTop = log.scrollHeight; return d;
 }
 function statusMsg(gid, text) {           // raw log line — only when AI info is OFF
-  // exception: the upstream-gauge discovery is worth a chat card either way —
-  // it tells the user their run is constrained by real observations
-  if (aiInfo && /upstream gauge\(s\) inside the domain/.test(text)) {
+  // exception: upstream-gauge discovery + speed-run decisions are worth a chat
+  // card either way — they change what the run actually computes
+  if (aiInfo && /upstream gauge\(s\) inside the domain|speed run/i.test(text)) {
     addMsg(`<b>${gid}</b> · ${text}`, "status");
     return;
   }
@@ -393,6 +393,7 @@ async function simulate() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ gauge_ids: ids, t_start: win.tStart, t_end: win.tEnd,
                              label: queryCtx ? queryCtx.label : null,
+                             scheme: document.getElementById("run-scheme").value,
                              // a still-running previous job would hold the per-gauge
                              // lock — the server stops it so this run starts now
                              prev_sim_id: localStorage.getItem("lastSimId") || null,
@@ -527,6 +528,10 @@ const STAGES = [
   [/simulation window/i, 10, null],
   [/clip DEM/i,          12, "preparing terrain (DEM, flow direction, accumulation)…"],
   [/clip @gauge/i,       14, null],
+  [/speed run: domain cut/i, 16, "⚡ speed-run domain built — observed inflow at the cut gauges"],
+  [/speed run (requested|not possible)/i, 16, null],
+  [/obs coverage .* stays simulated/i, 15, null],
+  [/assimilating observed flow/i, 26, null],
   [/derived from the DEM/i, 15, "flow network rebuilt from the DEM (pysheds)"],
   [/SNOW17 enabled/i,    17, "snow module ON (cold basin detected)"],
   [/no snow/i,           17, "snow module off (warm basin)"],
@@ -1090,6 +1095,20 @@ document.getElementById("chat-text").addEventListener("keydown", (e) => {
   if (e.key === "Enter") document.getElementById("chat-send").click();
 });
 document.getElementById("btn-sim").onclick = simulate;
+
+// run scheme (🏞 full / ⚡ speed) — persisted; changing it makes a new run differ
+const schemeSel = document.getElementById("run-scheme");
+schemeSel.value = localStorage.getItem("runScheme") || "full";
+schemeSel.onchange = () => {
+  localStorage.setItem("runScheme", schemeSel.value);
+  addMsg(schemeSel.value === "speed"
+    ? "⚡ <b>Speed run</b> — the basin is cut at upstream USGS gauges and their observed " +
+      "flow is injected as boundary conditions. Much faster on big rivers; needs " +
+      "near-complete observations (otherwise it falls back to the full basin)."
+    : "🏞 <b>Full run</b> — the whole basin is simulated (required for forecasts, " +
+      "where no future observations exist).", "status");
+  allowResim();
+};
 
 // Model options is an expert panel — confirm once per session before opening
 function expertGateOk() { return sessionStorage.getItem("expertOk") === "1"; }

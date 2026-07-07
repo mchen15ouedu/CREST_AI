@@ -149,6 +149,9 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 .pg-stop-btn:disabled { opacity: .5; cursor: default; }
 
 #chat-input { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid #223; }
+#run-scheme { width: auto; flex: none;   /* undo the global select width:100% */
+  padding: 8px 6px; border: 1px solid #2a3a49; background: #142230; color: #e8eef4;
+  border-radius: 6px; font-size: 13px; cursor: pointer; }
 #chat-text { flex: 1; font-size: 14px; padding: 9px 12px; }
 #chat button { padding: 8px 16px; border: 1px solid #2a3a49; background: #142230; color: #e8eef4; border-radius: 6px; cursor: pointer; font-size: 13px; }
 #chat button.primary { background: #3a6ea5; border-color: #3a6ea5; font-weight: 600; }

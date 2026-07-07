@@ -339,6 +339,8 @@ class SimRequest(BaseModel):
     overrides: dict | None = None
     label: str | None = None          # event label for the history entry
     prev_sim_id: str | None = None    # caller's previous job — superseded (cancelled)
+    scheme: str = "full"              # "full" = whole basin; "speed" = domain
+                                      # truncated at boundary gauges (obs = inflow)
 
 
 MAX_HISTORY = 20
@@ -382,7 +384,8 @@ def api_simulate(req: SimRequest, request: Request):
                             "it was stopped and replaced by this one.")
     opts = {"model": req.model, "hours": req.hours, "snow": req.snow,
             "timestep": req.timestep, "warmup_days": req.warmup_days,
-            "overrides": req.overrides}
+            "overrides": req.overrides,
+            "scheme": req.scheme if req.scheme in ("full", "speed") else "full"}
     job = simjobs.start_job(req.gauge_ids, t0, t1, opts)
     u = request.session.get("user")
     if u:                                              # signed-in -> history entry

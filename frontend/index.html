@@ -116,6 +116,10 @@
     <div id="chat-input">
       <input id="chat-text" placeholder="Describe a flood event, paste a news link, or give a date range…" autocomplete="off" />
       <button id="chat-send">Send</button>
+      <select id="run-scheme" title="Full run simulates the whole basin. Speed run cuts the domain at upstream USGS gauges and injects their observed flow as boundary conditions — much faster on large basins, but needs near-complete observations (falls back to a full run otherwise).">
+        <option value="full" selected>🏞 Full run</option>
+        <option value="speed">⚡ Speed run</option>
+      </select>
       <button id="btn-sim" class="primary" disabled>▶ Simulate (0)</button>
       <button id="btn-feedback" title="Suggest an improvement to this system">💡 Feedback</button>
     </div>

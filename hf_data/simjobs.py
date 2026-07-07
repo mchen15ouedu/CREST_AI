@@ -68,6 +68,7 @@ class SimJob:
                     snow=self.opts.get("snow", "auto"),
                     timestep=self.opts.get("timestep", "1h"),
                     warmup_days=int(self.opts.get("warmup_days", 90)),
+                    scheme=self.opts.get("scheme", "full"),
                     cancel=self.cancel):
                 if kind == "meta":
                     self.meta[gid] = payload
@@ -135,8 +136,10 @@ class SimJob:
                         "vmax": vmax})
             # persist for future cache-hit runs (only when the frames cover the
             # whole requested window — a tail-only extension must not masquerade
-            # as the full animation)
-            model = (self.meta.get(gid) or {}).get("model", "crestphys")
+            # as the full animation). Key = scheme-aware cache model, so speed-
+            # and full-run animations never mix.
+            model = ((self.params.get(gid) or {}).get("cache_model")
+                     or (self.meta.get(gid) or {}).get("model", "crestphys"))
             expected = (self.t_end - self.t_start).total_seconds() / 3600 + 1
             if len(frames) >= 0.9 * expected:
                 viz.save_frames_cache(gid, model, self.t_start, self.t_end, frames, vmax)
@@ -146,7 +149,8 @@ class SimJob:
 
     def _cached_timeline(self, gid):
         """Cache-served run: replay the previously rendered frames from disk."""
-        model = (self.meta.get(gid) or {}).get("model", "crestphys")
+        model = ((self.params.get(gid) or {}).get("cache_model")
+                 or (self.meta.get(gid) or {}).get("model", "crestphys"))
         got = viz.load_frames_cache(gid, model, self.t_start, self.t_end)
         if not got:
             return
