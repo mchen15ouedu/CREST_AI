@@ -143,6 +143,10 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 .pg-fill.cal { background: linear-gradient(90deg, #a56ea5, #ffd479); }
 .pg-stage { font-size: 11.5px; color: #9fdcc0; min-width: 240px; }
 .pg-pct { font-size: 11px; color: #8fa3b3; min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
+.pg-stop { margin-top: 6px; text-align: right; }
+.pg-stop-btn { padding: 3px 10px; font-size: 11.5px; border: 1px solid #5a3038; background: #2a161b;
+  color: #f0a3ab; border-radius: 6px; cursor: pointer; }
+.pg-stop-btn:disabled { opacity: .5; cursor: default; }
 
 #chat-input { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid #223; }
 #chat-text { flex: 1; font-size: 14px; padding: 9px 12px; }

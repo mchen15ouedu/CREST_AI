@@ -338,6 +338,7 @@ class SimRequest(BaseModel):
     warmup_days: int = 90
     overrides: dict | None = None
     label: str | None = None          # event label for the history entry
+    prev_sim_id: str | None = None    # caller's previous job — superseded (cancelled)
 
 
 MAX_HISTORY = 20
@@ -371,6 +372,14 @@ def api_simulate(req: SimRequest, request: Request):
         t1 = t0 + timedelta(hours=MAX_SIM_HOURS)
         warnings.append(f"Window capped at {MAX_SIM_HOURS // 24} days for this demo "
                         f"(now ends {t1:%Y-%m-%d %H:%M}).")
+    # supersede the caller's previous run: a stale in-flight job would otherwise
+    # hold the per-gauge lock and the new run would queue behind it indefinitely
+    if req.prev_sim_id:
+        prev = simjobs.get_job(req.prev_sim_id)
+        if prev and not prev.done.is_set():
+            prev.cancel.set()
+            warnings.append("Your previous simulation was still running — "
+                            "it was stopped and replaced by this one.")
     opts = {"model": req.model, "hours": req.hours, "snow": req.snow,
             "timestep": req.timestep, "warmup_days": req.warmup_days,
             "overrides": req.overrides}
@@ -389,6 +398,19 @@ def api_simulate(req: SimRequest, request: Request):
             "t_start": t0.isoformat(), "t_end": t1.isoformat(),
             "warning": " ".join(warnings) or None,
             "max_concurrent": simjobs.MAX_CONCURRENT}
+
+
+@app.post("/api/cancel/{sim_id}")
+def api_cancel(sim_id: str):
+    """Stop a running simulation job: the EF5 processes are killed and the
+    per-gauge run locks released so a new run can start immediately."""
+    job = simjobs.get_job(sim_id)
+    if not job:
+        return JSONResponse({"error": "unknown job"}, status_code=404)
+    if job.done.is_set():
+        return {"ok": True, "already_done": True}
+    job.cancel.set()
+    return {"ok": True}
 
 
 @app.get("/api/history")

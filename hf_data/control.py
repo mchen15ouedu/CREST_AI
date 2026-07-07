@@ -22,6 +22,12 @@ class Gauge:
     lon: float
     lat: float
     area: float
+    # multi-gauge support: interior/upstream gauges carry their own OBS file and
+    # WANTDA=true so EF5 assimilates their observed flow (boundary condition);
+    # the outlet keeps WANTDA=false (its obs are for skill scoring, not injection)
+    obs_path: str | None = None       # explicit OBS csv (overrides usgs_dir pattern)
+    want_da: bool = False
+    output_ts: bool = True
 
 
 @dataclass
@@ -61,6 +67,8 @@ class ControlSpec:
     snow_grids: dict | None = None                   # {mfmax_grid: path, ...}
     temp_dir: str | None = None                      # TEMPForcing LOC
     temp_name: str = "temp_YYYYMMDDHH.pqf"
+    # --- data assimilation (multi-gauge boundary conditions) ---
+    da_file: str | None = None                       # DA_FILE= switches assimilation on
 
 
 def _param_block(header: str, gauges, scalar_keys, scalars, grids: dict | None) -> str:
@@ -100,12 +108,23 @@ def build_control(spec: ControlSpec) -> str:
         f"LOC={os.path.abspath(spec.temp_dir) if spec.temp_dir else ''}\nNAME={spec.temp_name}\n\n"
         if spec.snow_on else ""
     )
-    gauges_sec = "".join(
-        f"[Gauge {g.id}]\nLON={g.lon}\nLAT={g.lat}\n"
-        + (f"OBS={usgs}/USGS_{g.id}_UTC_m3s.csv\n" if usgs else "")
-        + f"OUTPUTTS=TRUE\nWANTCO=TRUE\nBASINAREA={g.area}\n\n"
-        for g in spec.gauges
-    )
+    def _gauge_sec(g: Gauge) -> str:
+        obs = (os.path.abspath(g.obs_path) if g.obs_path
+               else f"{usgs}/USGS_{g.id}_UTC_m3s.csv" if usgs else "")
+        s = f"[Gauge {g.id}]\nLON={g.lon}\nLAT={g.lat}\n"
+        if obs:
+            s += f"OBS={obs}\n"
+        s += f"OUTPUTTS={'TRUE' if g.output_ts else 'FALSE'}\n"
+        if g.output_ts:
+            s += "WANTCO=TRUE\n"
+        # EF5 defaults WANTDA to TRUE — always say it explicitly, or the outlet's
+        # own observations would be assimilated and overwrite the simulation
+        s += f"WANTDA={'TRUE' if g.want_da else 'FALSE'}\n"
+        if g.area is not None and g.area == g.area and g.area > 0:
+            s += f"BASINAREA={g.area}\n"
+        return s + "\n"
+
+    gauges_sec = "".join(_gauge_sec(g) for g in spec.gauges)
     basin_sec = "[Basin 0]\n" + "".join(f"GAUGE={g.id}\n" for g in spec.gauges) + "\n"
 
     # param grids: split the {..._grid} map into crest vs kw sets
@@ -134,6 +153,8 @@ def build_control(spec: ControlSpec) -> str:
             b += "TEMP=TEMP\nSNOW=SNOW17\nSNOW_PARAM_SET=SnowParam\n"
         b += (f"OUTPUT={task_out}\nPARAM_SET=CrestParam\n"
               f"ROUTING_PARAM_Set=KWParam\nTIMESTEP={spec.timestep}\n")
+        if spec.da_file:               # assimilate upstream-gauge observations
+            b += f"DA_FILE={os.path.abspath(spec.da_file)}\n"
         if grids:
             b += "output_grids=streamflow\n"          # per EF5 manual; writes q.<time>.<model>.tif
         if sd:                                         # STATES= -> load state dated TIME_BEGIN

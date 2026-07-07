@@ -55,9 +55,15 @@ def load_record(gauge, model) -> dict | None:
         return None
 
 
-def save_record(gauge, model, rows: list[dict], state_times: list[str]):
+def save_record(gauge, model, rows: list[dict], state_times: list[str],
+                variant: str | None = None):
     rec = load_record(gauge, model) or {"gauge": str(gauge).zfill(8), "model": model,
                                         "rows": [], "window": None, "state_times": []}
+    if variant is not None and rec.get("variant") != variant:
+        # run configuration changed (e.g. different boundary-condition gauges) —
+        # rows from the old configuration must not be mixed with the new ones
+        rec["rows"], rec["window"] = [], None
+        rec["variant"] = variant
     by_time = {r["time"]: r for r in rec["rows"]}
     for r in rows:
         by_time[r["time"]] = r
@@ -133,13 +139,17 @@ def _state_choice(gauge, model, t: datetime, tol_days: float = STATE_TOL_DAYS):
     return None, None, True                                  # full warm-up
 
 
-def plan(gauge, model, a: datetime, b: datetime) -> dict:
+def plan(gauge, model, a: datetime, b: datetime, variant: str | None = None) -> dict:
     """Decide how to satisfy a request for [a, b]: reuse cache + minimal run,
-    warm-starting from the nearest state within +/- STATE_TOL_DAYS if possible."""
+    warm-starting from the nearest state within +/- STATE_TOL_DAYS if possible.
+    `variant` fingerprints the run configuration (boundary-condition gauges) —
+    rows cached under a different variant are not reused (states still are)."""
     if os.environ.get("CREST_CACHE", "1") == "0":            # force a fresh full run
         return {"cached_rows": [], "run_start": a, "run_end": b, "load_state_time": None,
                 "warmup_from": None, "need_warmup": True, "reason": "cache disabled"}
     rec = load_record(gauge, model)
+    if rec and variant is not None and rec.get("variant") != variant:
+        rec = {**rec, "rows": [], "window": None}            # states remain usable
 
     def slice_rows(lo, hi):
         if not rec:

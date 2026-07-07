@@ -220,8 +220,10 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
               use_mock: bool = True, hours: int = 48, overrides: dict | None = None,
               snow: str = "auto", timestep: str = "1h", warmup_days: int = WARMUP_DAYS,
               grids: bool = True, no_cache: bool = False,
-              workdir: str | None = None):
-    """Per-gauge streaming run (map flow: gauge already chosen). Yields events."""
+              workdir: str | None = None, cancel=None):
+    """Per-gauge streaming run (map flow: gauge already chosen). Yields events.
+    `cancel` (threading.Event) stops the run: the EF5 process is killed and the
+    (gauge, model) lock released, so a superseding run can start immediately."""
     g = gauge_info(gauge_id)
     if g is None:
         yield ("status", f"⚠️ gauge {gauge_id} not found")
@@ -237,17 +239,22 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
     if not lock.acquire(blocking=False):
         yield ("status", "⏳ another simulation of this gauge is already running — "
                          "queued behind it (its results are shared via the cache)")
-        lock.acquire()
+        while not lock.acquire(timeout=2):       # keep the queue cancellable
+            if cancel is not None and cancel.is_set():
+                yield ("status", "⏹ stopped while queued")
+                yield ("done", {"returncode": -9, "cancelled": True})
+                return
     try:
         yield from _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end,
                                    use_mock, overrides, snow, timestep,
-                                   warmup_days, grids, no_cache, workdir)
+                                   warmup_days, grids, no_cache, workdir, cancel)
     finally:
         lock.release()
 
 
 def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
-                    overrides, snow, timestep, warmup_days, grids, no_cache, workdir):
+                    overrides, snow, timestep, warmup_days, grids, no_cache, workdir,
+                    cancel=None):
     """The actual per-gauge run — called with the (gauge, model) lock held."""
     work = workdir or tempfile.mkdtemp(prefix=f"crest_{g['id']}_")
     out_dir = os.path.join(work, "CREST_output")
@@ -257,10 +264,50 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     basic_dir = basic.store_dir(bbox)
     param_dir = os.path.join(basic_dir, "param")
 
+    # --- terrain first: the upstream-gauge scan below needs the clipped grids ---
+    yield ("status", f"clip DEM/DDM/FAM · model {model.upper()}")
+    clip = basic.clip_basic_data(bbox, basic_dir)
+    if clip.derived:
+        yield ("status", "⚠️ HydroSHEDS dir/acc unusable here — flow direction + "
+                         "accumulation re-derived from the DEM (pysheds)")
+    try:                                   # sanity: clip values at the gauge cell
+        import rasterio as _rio
+        vals = {}
+        for tag in ("dem", "fdir", "facc"):
+            with _rio.open(os.path.join(basic_dir, f"{tag}_clip.tif")) as ds:
+                r_, c_ = ds.index(g["lon"], g["lat"])
+                vals[tag] = float(ds.read(1)[r_, c_])
+        yield ("status", f"clip @gauge (r{r_},c{c_}): dem={vals['dem']:.0f} "
+                         f"fdir={vals['fdir']:.0f} facc={vals['facc']:.0f}")
+    except Exception as e:
+        yield ("status", f"(clip sample failed: {e})")
+
+    # --- upstream/interior gauges -> boundary conditions (data assimilation) ---
+    bc_gauges = []
+    try:
+        from hf_data import neighbors
+        bc_gauges = neighbors.upstream_gauges(g, bbox, basic_dir)
+    except Exception as e:
+        yield ("status", f"(upstream-gauge scan failed: {e})")
+    if bc_gauges:
+        n_edge = sum(1 for b_ in bc_gauges if b_["at_edge"])
+        names = ", ".join(b_["id"] for b_ in bc_gauges)
+        yield ("status", f"🔗 {len(bc_gauges)} upstream gauge(s) inside the domain "
+                         f"({names}){f' — {n_edge} at the DEM edge' if n_edge else ''}; "
+                         "their USGS observations feed the run as boundary conditions "
+                         "(EF5 data assimilation)")
+    variant = "bc:" + (",".join(sorted(b_["id"] for b_ in bc_gauges)) or "none")
+
+    if cancel is not None and cancel.is_set():
+        yield ("status", "⏹ stopped")
+        yield ("done", {"returncode": -9, "cancelled": True})
+        return
+
     # --- result cache: reuse overlap, simulate only the missing window (task #6) ---
     # the row cache is hourly; a sub-hourly run neither reuses nor writes it
     hourly = timestep == "1h" and not no_cache
-    pl = statecache.plan(g["id"], ef5_model, t_start, t_end) if timestep == "1h" else {
+    pl = statecache.plan(g["id"], ef5_model, t_start, t_end, variant=variant) \
+        if timestep == "1h" else {
         "cached_rows": [], "run_start": t_start, "run_end": t_end,
         "load_state_time": None, "warmup_from": None, "need_warmup": True,
         "reason": "sub-hourly timestep — cache bypassed"}
@@ -296,23 +343,6 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     run_hours = max(1, int(round((run_end - run_start).total_seconds() / 3600)))
     yield ("status", f"🕐 simulation window {run_start:%Y-%m-%d %H:%M} → "
                      f"{run_end:%Y-%m-%d %H:%M} ({run_hours} h @ {timestep})")
-
-    yield ("status", f"clip DEM/DDM/FAM · model {model.upper()}")
-    clip = basic.clip_basic_data(bbox, basic_dir)
-    if clip.derived:
-        yield ("status", "⚠️ HydroSHEDS dir/acc unusable here — flow direction + "
-                         "accumulation re-derived from the DEM (pysheds)")
-    try:                                   # sanity: clip values at the gauge cell
-        import rasterio as _rio
-        vals = {}
-        for tag in ("dem", "fdir", "facc"):
-            with _rio.open(os.path.join(basic_dir, f"{tag}_clip.tif")) as ds:
-                r_, c_ = ds.index(g["lon"], g["lat"])
-                vals[tag] = float(ds.read(1)[r_, c_])
-        yield ("status", f"clip @gauge (r{r_},c{c_}): dem={vals['dem']:.0f} "
-                         f"fdir={vals['fdir']:.0f} facc={vals['facc']:.0f}")
-    except Exception as e:
-        yield ("status", f"(clip sample failed: {e})")
 
     wbkw = multipliers.to_control_params(g["id"], model=wb_model)
     if wbkw is None:
@@ -380,17 +410,51 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         except Exception:
             usgs_dir = ""
 
+    # boundary-condition gauges: fetch their obs over the FULL span (warm-up
+    # included — the assimilated inflow matters there too) and switch DA on
+    ctl_gauges = [Gauge(g["id"], g["lon"], g["lat"], g["area"])]  # outlet: WANTDA=false
+    da_file = None
+    if bc_gauges and not use_mock:
+        f0 = warmup_start or run_start
+        bc_dir = os.path.join(work, "USGS_bc")
+        da_series = {}
+        for b_ in bc_gauges:
+            try:
+                s = obs.fetch_usgs_discharge(b_["id"], f0, run_end)
+            except Exception:
+                s = []
+            p = obs.write_ef5_obs(b_["id"], s, bc_dir) if s else None
+            if p:
+                da_series[b_["id"]] = s
+                ctl_gauges.append(Gauge(b_["id"], b_["lon"], b_["lat"], b_["area"] or 0.0,
+                                        obs_path=p, want_da=True, output_ts=False))
+        if da_series:
+            from hf_data import neighbors
+            da_file = neighbors.write_da_file(da_series, os.path.join(work, "da_obs.csv"))
+            yield ("status", f"🛰 assimilating observed flow at "
+                             f"{len(da_series)} upstream gauge(s) — "
+                             f"{sum(len(v) for v in da_series.values())} obs points")
+        else:
+            yield ("status", "(no usable USGS observations at the upstream gauges — "
+                             "running without boundary conditions)")
+
     spec = ControlSpec(
         control_path=os.path.join(work, "control.txt"),
         time_begin=run_start, time_end=run_end, timestep=timestep,
         basic_dir=basic_dir, precip_dir=mrms_dir,
         pet_dir=pet_dir, output_dir=out_dir, usgs_dir=usgs_dir,
-        gauges=[Gauge(g["id"], g["lon"], g["lat"], g["area"])],
+        gauges=ctl_gauges,
         crest=wb, kw=kw, model=ef5_model.upper(),
         param_grids=pgrids, output_grids=grids,
         state_dir=sdir, warmup_start=warmup_start,
-        snow_on=snow_on, snow_scalars=snow_scalars, snow_grids=snow_grids, temp_dir=temp_dir)
+        snow_on=snow_on, snow_scalars=snow_scalars, snow_grids=snow_grids, temp_dir=temp_dir,
+        da_file=da_file)
     build_control(spec)
+
+    if cancel is not None and cancel.is_set():
+        yield ("status", "⏹ stopped")
+        yield ("done", {"returncode": -9, "cancelled": True})
+        return
 
     if not use_mock:                                  # real run: forcing over the full span
         f0 = warmup_start or run_start
@@ -417,6 +481,11 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         from hf_data.runner import RUN_TIMEOUT_S
         wu_deadline = time.time() + RUN_TIMEOUT_S
         while wu.alive():
+            if cancel is not None and cancel.is_set():
+                wu.kill()
+                yield ("status", "⏹ stopped during warm-up")
+                yield ("done", {"returncode": -9, "cancelled": True})
+                return
             if time.time() > wu_deadline:            # stuck-run watchdog
                 wu.kill()
                 yield ("status", f"⚠️ warm-up killed after {RUN_TIMEOUT_S / 3600:.1f} h "
@@ -440,7 +509,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         handle = run_ef5(spec.control_path, out_dir, g["id"], model=ef5_model)
 
     new_rows = []
-    for ev in stream_run(handle, poll=0.2):
+    for ev in stream_run(handle, poll=0.2, cancel=cancel):
         if ev["kind"] == "hydro":
             new_rows += ev["rows"]
         ev["bbox"] = bbox
@@ -464,7 +533,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         if warmup_start:
             st.append(run_start.strftime(statecache.TS_FMT))
         try:
-            statecache.save_record(g["id"], ef5_model, pl["cached_rows"] + new_rows, st)
+            statecache.save_record(g["id"], ef5_model, pl["cached_rows"] + new_rows, st,
+                                   variant=variant)
         except Exception:
             pass
 

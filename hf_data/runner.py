@@ -118,17 +118,22 @@ def run_ef5(control_path: str, output_dir: str, gauge_id: str, model: str = "cre
 
 
 def stream_run(handle: RunHandle, poll: float = 0.4, timeout: float = RUN_TIMEOUT_S,
-               stall_timeout: float = STALL_TIMEOUT_S):
+               stall_timeout: float = STALL_TIMEOUT_S, cancel=None):
     """Yield {'kind': 'hydro'|'q2d'|'done', ...} as EF5 writes output.
 
     A run that keeps producing output is left alone no matter how long it
     takes. The process is KILLED only when it goes silent for `stall_timeout`
-    (stuck) or passes the `timeout` hard cap."""
+    (stuck), passes the `timeout` hard cap, or `cancel` (a threading.Event)
+    is set — the user stopped or superseded the job."""
     tail = _TsTail(handle.ts_path)
     seen: set = set()
     t0 = time.time()
     last_progress = t0                       # last time ANY output appeared
     while True:
+        if cancel is not None and cancel.is_set():
+            handle.kill()
+            yield {"kind": "done", "returncode": -9, "cancelled": True}
+            return
         rows = tail.read_new()
         if rows:
             yield {"kind": "hydro", "rows": rows}

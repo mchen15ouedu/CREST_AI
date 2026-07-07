@@ -79,6 +79,12 @@ function addMsg(html, cls = "bot") {
   log.scrollTop = log.scrollHeight; return d;
 }
 function statusMsg(gid, text) {           // raw log line — only when AI info is OFF
+  // exception: the upstream-gauge discovery is worth a chat card either way —
+  // it tells the user their run is constrained by real observations
+  if (aiInfo && /upstream gauge\(s\) inside the domain/.test(text)) {
+    addMsg(`<b>${gid}</b> · ${text}`, "status");
+    return;
+  }
   if (!aiInfo) addMsg(`<b>${gid}</b> · ${text}`, "status");
 }
 
@@ -386,7 +392,11 @@ async function simulate() {
     const r = await fetch("/api/simulate", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ gauge_ids: ids, t_start: win.tStart, t_end: win.tEnd,
-                             label: queryCtx ? queryCtx.label : null, ...opt }),
+                             label: queryCtx ? queryCtx.label : null,
+                             // a still-running previous job would hold the per-gauge
+                             // lock — the server stops it so this run starts now
+                             prev_sim_id: localStorage.getItem("lastSimId") || null,
+                             ...opt }),
     });
     d = await r.json();
     if (!r.ok || !d.sim_id) throw new Error(d.detail || "simulation could not start");
@@ -442,7 +452,10 @@ function handleSimEvent(simId, ev) {
   } else if (ev.kind === "gauge_done") {
     gaugeState[ev.gauge_id] = "done";
     renderTabs();
-    if (ev.returncode != null && ev.returncode !== 0) {
+    if (ev.returncode === -9) {                       // user stop / superseded — not an error
+      if (aiInfo) setProgress(ev.gauge_id, 100, "stopped ⏹");
+      allowResim();
+    } else if (ev.returncode != null && ev.returncode !== 0) {
       if (aiInfo) setProgress(ev.gauge_id, 100, "failed ✗");
       explainError("simulation", `EF5 run failed (rc=${ev.returncode}), ` +
         `${ev.n || 0} output rows produced`, ev.gauge_id);
@@ -484,6 +497,14 @@ function initProgress(ids) {
     progressEls[gid] = { fill: row.querySelector(".pg-fill"), stage: row.querySelector(".pg-stage"),
                          pct: row.querySelector(".pg-pct"), value: 0 };
   });
+  const stopRow = document.createElement("div"); stopRow.className = "pg-stop";
+  stopRow.innerHTML = `<button class="pg-stop-btn" title="Stop this simulation">⏹ Stop</button>`;
+  const btn = stopRow.querySelector("button");
+  btn.onclick = async () => {
+    btn.disabled = true; btn.textContent = "⏹ stopping…";
+    try { await fetch(`/api/cancel/${currentSim}`, { method: "POST" }); } catch (_) {}
+  };
+  progressBox.appendChild(stopRow);
   log.scrollTop = log.scrollHeight;
 }
 
@@ -660,17 +681,13 @@ async function startCalibration(gid) {
         return;
       }
       stage.textContent = `done — NSE ${ev.baseline_nse} → ${ev.best_nse}`;
-      allowResim();          // the same selection may be re-run with the calibrated set
-      const doneCard = addMsg(`🎯 Calibration finished for <b>${gid}</b>: NSE <b>${ev.baseline_nse}</b> → <b>${ev.best_nse}</b>` +
+      addMsg(`🎯 Calibration finished for <b>${gid}</b>: NSE <b>${ev.baseline_nse}</b> → <b>${ev.best_nse}</b>` +
         (ev.saved ? " — saved as this basin's best parameter set (it will be used automatically from now on)."
                   : " — did not beat the stored parameters, keeping the previous set.") +
-        `<div class="btn-row"><button class="primary" data-act="rerun">▶ Re-run now with the ` +
-        `${ev.saved ? "new" : "stored"} parameters (2-D map included)</button></div>`, "bot");
-      doneCard.querySelector('[data-act="rerun"]').onclick = () => {
-        doneCard.querySelector(".btn-row").remove();
-        allowResim();
-        simulate();
-      };
+        ` Re-running the simulation now with the ${ev.saved ? "new" : "stored"} parameters ` +
+        `(2-D map included)…`, "bot");
+      allowResim();                   // release the same-selection hold, then re-run
+      simulate();
     }
   };
   es.onerror = () => es.close();

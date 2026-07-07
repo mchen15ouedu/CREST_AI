@@ -42,6 +42,7 @@ class SimJob:
         self.meta: dict[str, dict] = {}          # gid -> {id,name,area,lat,lon,model}
         self.params: dict[str, dict] = {}        # gid -> {wb,kw,model,source}
         self.done = threading.Event()
+        self.cancel = threading.Event()          # user stop / superseded by a new run
         self._q2d_err: set = set()               # gauges with a reported render error
         self._q2d_min: dict = {}                 # gid -> running per-cell min (live baseline)
 
@@ -66,7 +67,8 @@ class SimJob:
                     overrides=self.opts.get("overrides"),
                     snow=self.opts.get("snow", "auto"),
                     timestep=self.opts.get("timestep", "1h"),
-                    warmup_days=int(self.opts.get("warmup_days", 90))):
+                    warmup_days=int(self.opts.get("warmup_days", 90)),
+                    cancel=self.cancel):
                 if kind == "meta":
                     self.meta[gid] = payload
                 elif kind == "params":
@@ -91,6 +93,12 @@ class SimJob:
                                         "msg": f"⚠️ 2-D frame render failed: {e}"})
                 elif kind == "done":
                     rc = payload.get("returncode")
+                    if payload.get("cancelled"):
+                        # user stop / superseded — not an error, nothing to render
+                        self._emit({"kind": "gauge_done", "gauge_id": gid,
+                                    "returncode": -9,
+                                    "n": len(self.hydro.get(gid, []))})
+                        continue
                     if payload.get("error") or rc not in (0, None):
                         from hf_data import crashlog
                         crashlog.capture(f"ef5:{gid}", message=payload.get("error")
