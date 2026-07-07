@@ -518,6 +518,23 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             yield ("status", "(no usable USGS observations at the upstream gauges — "
                              "running without boundary conditions)")
 
+    # per-gauge calibrated parameters (AQUAH crest_run_cali behavior): each
+    # upstream gauge's sub-basin partition uses ITS own multipliers, not the
+    # outlet's. HP keeps the outlet's water balance (its 2 params aren't in
+    # the multiplier table); KW routing is per-gauge for every model.
+    per_gauge = {}
+    for cg in ctl_gauges[1:]:
+        try:
+            got = multipliers.to_control_params(cg.id, model=wb_model)
+        except Exception:
+            got = None
+        if got:
+            per_gauge[cg.id] = {"crest": got[0] if model != "hp" else None,
+                                "kw": got[1]}
+    if per_gauge:
+        yield ("status", f"🧩 per-gauge calibrated parameters applied at "
+                         f"{len(per_gauge)}/{len(ctl_gauges) - 1} upstream gauge(s)")
+
     grid_dir = speed["dir"] if speed else basic_dir   # dem/fdir/facc for EF5
     spec = ControlSpec(
         control_path=os.path.join(work, "control.txt"),
@@ -529,7 +546,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         param_grids=pgrids, output_grids=grids,
         state_dir=sdir, warmup_start=warmup_start,
         snow_on=snow_on, snow_scalars=snow_scalars, snow_grids=snow_grids, temp_dir=temp_dir,
-        da_file=da_file)
+        da_file=da_file, per_gauge=per_gauge or None)
     build_control(spec)
 
     if cancel is not None and cancel.is_set():

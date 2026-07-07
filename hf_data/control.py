@@ -69,17 +69,25 @@ class ControlSpec:
     temp_name: str = "temp_YYYYMMDDHH.pqf"
     # --- data assimilation (multi-gauge boundary conditions) ---
     da_file: str | None = None                       # DA_FILE= switches assimilation on
+    # per-gauge calibrated parameters (AQUAH generate_control_file_cali style):
+    # gid -> {"crest": {...} | None, "kw": {...} | None}; missing/None falls back
+    # to the spec-level (outlet) scalars. EF5 applies each gauge's block to its
+    # own sub-basin partition, so upstream areas keep their own calibration.
+    per_gauge: dict | None = None
 
 
-def _param_block(header: str, gauges, scalar_keys, scalars, grids: dict | None) -> str:
+def _param_block(header: str, gauges, scalar_keys, scalars, grids: dict | None,
+                 per_gauge: dict | None = None, which: str = "crest") -> str:
     lines = [f"[{header}]"]
     for g in gauges:
+        own = (per_gauge or {}).get(g.id, {}).get(which)   # gauge's own calibration
+        vals = own if own else scalars
         lines.append(f"gauge={g.id}")
         if grids:
             for gkey, path in grids.items():
                 lines.append(f"{gkey}={os.path.abspath(path)}")
-        for k in scalar_keys:
-            lines.append(f"{k}={scalars[k]}")
+        for k in (list(vals) if own else scalar_keys):
+            lines.append(f"{k}={vals[k]}")
     return "\n".join(lines) + "\n\n"
 
 
@@ -138,8 +146,10 @@ def build_control(spec: ControlSpec) -> str:
     if model_l == "hp":
         crest_grids = None                           # hp has no gridded params
     crest_sec = _param_block(f"{model_l}paramset CrestParam", spec.gauges,
-                             list(spec.crest), spec.crest, crest_grids or None)
-    kw_sec = _param_block("kwparamset KWParam", spec.gauges, list(spec.kw), spec.kw, kw_grids or None)
+                             list(spec.crest), spec.crest, crest_grids or None,
+                             per_gauge=spec.per_gauge, which="crest")
+    kw_sec = _param_block("kwparamset KWParam", spec.gauges, list(spec.kw), spec.kw,
+                          kw_grids or None, per_gauge=spec.per_gauge, which="kw")
     snow_sec = (_param_block("snow17paramset SnowParam", spec.gauges,
                              list(spec.snow_scalars or {}), spec.snow_scalars or {}, spec.snow_grids or None)
                 if spec.snow_on else "")
