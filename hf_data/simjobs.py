@@ -88,15 +88,23 @@ class SimJob:
                             self._emit({"kind": "status", "gauge_id": gid,
                                         "msg": f"⚠️ 2-D frame render failed: {e}"})
                 elif kind == "done":
+                    rc = payload.get("returncode")
+                    if payload.get("error") or rc not in (0, None):
+                        from hf_data import crashlog
+                        crashlog.capture(f"ef5:{gid}", message=payload.get("error")
+                                         or f"EF5 exited rc={rc}",
+                                         sim_id=self.id, returncode=rc)
                     if payload.get("cached"):
                         self._cached_timeline(gid)        # replay frames from disk
                     else:
                         self._build_timeline(gid)
                     self._emit({"kind": "gauge_done", "gauge_id": gid,
-                                "returncode": payload.get("returncode"),
+                                "returncode": rc,
                                 "n": len(self.hydro.get(gid, []))})
                     self._build_result(gid)
         except Exception as e:
+            from hf_data import crashlog
+            crashlog.capture(f"sim:{gid}", e, sim_id=self.id)
             self._emit({"kind": "status", "gauge_id": gid, "msg": f"⚠️ {e}"})
             self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -1})
 

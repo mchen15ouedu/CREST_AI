@@ -48,3 +48,4 @@ sse-starlette
 authlib                # HF OAuth (Sign in with Hugging Face)
 itsdangerous           # starlette SessionMiddleware
 httpx                  # authlib async client
+sentry-sdk             # error watchdog remote sink (Sentry/GlitchTip/Bugsink via SENTRY_DSN)

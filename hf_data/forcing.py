@@ -68,8 +68,10 @@ def _write_pqf(path: str, a: np.ndarray, xll: float, yll: float, cell: float, no
             b"xllcorner": repr(float(xll)).encode(), b"yllcorner": repr(float(yll)).encode(),
             b"cellsize": repr(float(cell)).encode(), b"nodata": repr(float(nodata)).encode()}
     schema = pa.schema([pa.field("v", pa.float32())]).with_metadata(meta)
+    tmp = path + ".tmp"                       # atomic: the shared store may have
     pq.write_table(pa.table({"v": a.reshape(-1).astype("float32")}, schema=schema),
-                   path, compression="zstd")
+                   tmp, compression="zstd")   # concurrent readers (EF5)
+    os.replace(tmp, path)
 
 
 def _clip(a, xll, yll, cell, nodata, bbox):
@@ -99,8 +101,20 @@ class ForcingResult:
     var: str
     out_dir: str
     written: list[str] = field(default_factory=list)
+    reused: int = 0                 # timesteps already in the store (merged, not redone)
     missing: list[str] = field(default_factory=list)
     control_block: str = ""
+
+
+def store_dir(var: str, bbox) -> str:
+    """Shared per-(variable, basin-bbox) forcing store. Runs over the same basin
+    reuse each other's clipped timesteps — overlapping windows are MERGED here
+    instead of re-downloaded and re-clipped into per-run temp dirs."""
+    from hf_data.statecache import CACHE_DIR
+    key = "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p")
+    d = os.path.join(CACHE_DIR, "forcing", var, key)
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir: str,
@@ -109,9 +123,13 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
     os.makedirs(out_dir, exist_ok=True)
     res = ForcingResult(var=var, out_dir=out_dir)
 
-    # group needed timesteps by source (year, month): one month-tar download each
+    # temporal merge: timesteps already present in out_dir are reused as-is;
+    # only the missing ones are fetched + clipped
     by_month: dict[tuple[int, int], list[datetime]] = {}
     for t in _timesteps(t_start, t_end, cfg.freq):
+        if os.path.exists(os.path.join(out_dir, t.strftime(cfg.out_fmt))):
+            res.reused += 1
+            continue
         by_month.setdefault((t.year, t.month), []).append(t)
 
     for (year, month), steps in sorted(by_month.items()):

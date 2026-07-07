@@ -47,6 +47,8 @@ class CalJob:
                 elif kind == "done":
                     self._emit({"kind": "cal_done", "gauge_id": self.gauge_id, **payload})
         except Exception as e:
+            from hf_data import crashlog
+            crashlog.capture(f"cal:{self.gauge_id}", e, cal_id=self.id)
             self._emit({"kind": "cal_done", "gauge_id": self.gauge_id, "error": str(e)})
         finally:
             self.done.set()

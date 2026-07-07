@@ -346,7 +346,11 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     yield ("status", ("❄️ SNOW17 enabled — " if snow_on else "☀️ no snow — ") + si["reason"])
     snow_scalars = _snow.snow_params(snow_ov) if snow_on else None
     snow_grids = _snow.clip_snow_grids(bbox, os.path.join(work, "snow")) if snow_on else None
-    temp_dir = os.path.join(work, "TEMP")
+    # shared per-basin forcing store: overlapping runs merge their timesteps
+    # instead of re-downloading into per-run temp dirs (data manager)
+    mrms_dir = forcing.store_dir("mrms", bbox)
+    pet_dir = forcing.store_dir("pet", bbox)
+    temp_dir = forcing.store_dir("temp", bbox)
 
     sdir = statecache.state_dir(g["id"], ef5_model)
     warmup_start = None
@@ -377,8 +381,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     spec = ControlSpec(
         control_path=os.path.join(work, "control.txt"),
         time_begin=run_start, time_end=run_end, timestep=timestep,
-        basic_dir=basic_dir, precip_dir=os.path.join(work, "MRMS"),
-        pet_dir=os.path.join(work, "PET"), output_dir=out_dir, usgs_dir=usgs_dir,
+        basic_dir=basic_dir, precip_dir=mrms_dir,
+        pet_dir=pet_dir, output_dir=out_dir, usgs_dir=usgs_dir,
         gauges=[Gauge(g["id"], g["lon"], g["lat"], g["area"])],
         crest=wb, kw=kw, model=ef5_model.upper(),
         param_grids=pgrids, output_grids=grids,
@@ -391,9 +395,12 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         n_days = max(1, int((run_end - f0).total_seconds() // 86400))
         yield ("status", f"⬇️ downloading rainfall (MRMS) forcing — "
                          f"{n_days} day(s) incl. warm-up…")
-        forcing.prepare_forcing("mrms", bbox, f0, run_end, os.path.join(work, "MRMS"))
+        fr = forcing.prepare_forcing("mrms", bbox, f0, run_end, mrms_dir)
+        if fr.reused:
+            yield ("status", f"♻️ forcing store: reused {fr.reused} MRMS timestep(s), "
+                             f"fetched {len(fr.written)} new")
         yield ("status", "⬇️ downloading PET forcing…")
-        forcing.prepare_forcing("pet", bbox, f0, run_end, os.path.join(work, "PET"))
+        forcing.prepare_forcing("pet", bbox, f0, run_end, pet_dir)
         if snow_on:
             yield ("status", "⬇️ downloading temperature forcing (snow module)…")
             forcing.prepare_forcing("temp", bbox, f0, run_end, temp_dir)

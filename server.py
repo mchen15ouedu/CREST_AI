@@ -30,9 +30,12 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-from hf_data import caljobs, gauges, simjobs
+from hf_data import caljobs, crashlog, datamgr, gauges, simjobs
 from hf_data.pipeline import parse_query
 from hf_data.statecache import CACHE_DIR
+
+crashlog.init()                    # optional SENTRY_DSN mirror (Sentry/GlitchTip/Bugsink)
+datamgr.start_janitor()            # hourly cache cleanup + result compaction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(HERE, "frontend")
@@ -73,6 +76,36 @@ def _load_profile(username: str) -> dict:
             return json.load(fh)
     except Exception:
         return {}
+
+
+@app.middleware("http")
+async def _error_recorder(request: Request, call_next):
+    """Error watchdog: every unhandled server error is recorded with context."""
+    try:
+        return await call_next(request)
+    except Exception as e:
+        crashlog.capture(f"http:{request.url.path}", e, method=request.method)
+        raise
+
+
+@app.get("/api/errors")
+def api_errors(n: int = 50):
+    """Recent recorded errors (the error-watchdog log)."""
+    return {"errors": crashlog.recent(min(n, 200)), **crashlog.stats()}
+
+
+@app.get("/api/datastats")
+def api_datastats():
+    """Data-manager view: per-category disk usage + caps."""
+    return datamgr.stats()
+
+
+@app.post("/api/datacleanup")
+def api_datacleanup():
+    """Run a janitor pass now (cleanup + result compaction)."""
+    rep = datamgr.cleanup()
+    rep["compact"] = datamgr.compact_results()
+    return rep
 
 
 @app.get("/")
@@ -203,6 +236,7 @@ def api_chat(req: ChatReq):
     try:
         d = chatagent.respond(req.message, req.history, req.context)
     except Exception as e:
+        crashlog.capture("chat", e, message_text=req.message[:200])
         return {"action": "fallback", "error": str(e)}
     return d if d else {"action": "fallback"}
 
