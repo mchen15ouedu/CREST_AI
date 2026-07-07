@@ -221,6 +221,32 @@ def api_query(q: Query):
     }
 
 
+class FeedbackReq(BaseModel):
+    text: str
+    contact: str | None = None
+
+
+@app.post("/api/feedback")
+def api_feedback(req: FeedbackReq, request: Request):
+    """Test-user improvement comments — recorded locally + persisted to the HF
+    dataset for the daily review job."""
+    text = (req.text or "").strip()
+    if not text:
+        return JSONResponse({"error": "empty comment"}, status_code=422)
+    from hf_data import feedback
+    u = request.session.get("user")
+    rec = feedback.record(text, user=u["username"] if u else None,
+                          contact=req.contact,
+                          context={"ua": request.headers.get("user-agent", "")[:120]})
+    return {"ok": True, "id": rec["id"]}
+
+
+@app.get("/api/feedback")
+def api_feedback_list(n: int = 100):
+    from hf_data import feedback
+    return {"feedback": feedback.recent(min(n, 500))}
+
+
 class ChatReq(BaseModel):
     message: str
     history: list = []

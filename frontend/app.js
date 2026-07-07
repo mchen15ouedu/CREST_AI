@@ -1062,6 +1062,38 @@ document.querySelectorAll("#left-panel input, #left-panel select").forEach((el) 
   el.addEventListener("change", allowResim);
 });
 
+// ---- test-user feedback ----------------------------------------------------
+document.getElementById("btn-feedback").onclick = () => {
+  document.getElementById("feedback-modal").classList.remove("hidden");
+  document.getElementById("fb-text").focus();
+};
+document.getElementById("fb-close").onclick = () =>
+  document.getElementById("feedback-modal").classList.add("hidden");
+document.getElementById("feedback-modal").addEventListener("click", (e) => {
+  if (e.target.id === "feedback-modal") e.target.classList.add("hidden");
+});
+document.getElementById("fb-send").onclick = async () => {
+  const text = document.getElementById("fb-text").value.trim();
+  const status = document.getElementById("fb-status");
+  if (!text) { status.textContent = "⚠ write a comment first"; return; }
+  status.textContent = "sending…";
+  try {
+    const r = await fetch("/api/feedback", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, contact: document.getElementById("fb-contact").value.trim() || null }),
+    });
+    if (!r.ok) throw new Error("failed");
+    status.textContent = "✓ thank you! recorded for the daily review";
+    document.getElementById("fb-text").value = "";
+    setTimeout(() => {
+      document.getElementById("feedback-modal").classList.add("hidden");
+      status.textContent = "";
+    }, 1800);
+  } catch (_) {
+    status.textContent = "⚠ could not send — please try again";
+  }
+};
+
 // ---- reattach: a run keeps going in the backend even if the app is closed --
 async function reattach(explicitId) {
   const simId = explicitId || localStorage.getItem("lastSimId");

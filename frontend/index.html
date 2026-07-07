@@ -104,6 +104,22 @@
       <input id="chat-text" placeholder="Describe a flood event, paste a news link, or give a date range…" autocomplete="off" />
       <button id="chat-send">Send</button>
       <button id="btn-sim" class="primary" disabled>▶ Simulate (0)</button>
+      <button id="btn-feedback" title="Suggest an improvement to this system">💡 Feedback</button>
+    </div>
+  </div>
+
+  <!-- test-user feedback modal -->
+  <div id="feedback-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head"><span>💡 Suggest an improvement</span><button id="fb-close">✕</button></div>
+      <div class="modal-body">
+        <p class="pm-sub">Tell us what to improve — layout, model behavior, missing features,
+          anything. Comments are reviewed daily and turned into improvements.</p>
+        <label>Your comment<textarea id="fb-text" rows="5" placeholder="What should we improve?"></textarea></label>
+        <label>Contact (optional)<input id="fb-contact" placeholder="email or HF username, if you'd like a reply" /></label>
+        <button id="fb-send" class="primary">Send feedback</button>
+        <span id="fb-status" class="pm-sub"></span>
+      </div>
     </div>
   </div>
 

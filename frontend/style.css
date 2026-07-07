@@ -60,6 +60,9 @@ input, select, textarea { width: 100%; padding: 6px 8px; background: #0d141c; co
 label.chk input { width: auto; }
 .hidden { display: none !important; }
 
+#btn-feedback { white-space: nowrap; }
+#feedback-modal textarea { resize: vertical; }
+
 /* simulation history (profile modal) */
 .hist-row { display: flex; align-items: center; gap: 10px; padding: 7px 0;
   border-bottom: 1px solid #1d2936; }
