@@ -12,7 +12,14 @@ come as calibrated 0.1° CONUS grids from CREST_data param/snow17/v1/ — the
 WY2010-2024; see the README in that folder). Scalars are ×1.0 multipliers on
 the grids (advanced-panel overrides scale them); if a grid can't be clipped
 (outside CONUS / network), that parameter falls back to an absolute physical
-default. The set also ships pxtemp, which EF5's SNOW17 does not accept — skipped.
+default. pxtemp is a real SNOW17 parameter since fork 5a26a86 (per-cell
+rain/snow partition temperature).
+
+Temperature extrapolation: the temp forcing is coarse (NLDAS 0.125-deg /
+NARR 32 km), so build_temp_dem() aggregates the basin DEM onto the clipped
+temp-grid geometry; the control file passes it as [TEMPForcing] DEM= and EF5
+lapses each model cell by -6.5 C/km relative to its temp pixel's mean elevation
+(TempReader.cpp tempDEM path).
 """
 from __future__ import annotations
 
@@ -94,6 +101,56 @@ def clip_snow_grids(bbox, out_dir: str, unsafe_ssl: bool | None = None) -> dict:
     return out
 
 
+def build_temp_dem(bbox, dem_path: str, out_path: str) -> str | None:
+    """DEM aggregated (mean) onto the basin-clipped temp-grid geometry, for
+    EF5's [TEMPForcing] DEM= temperature extrapolation. EF5 matches it to the
+    temp grid by shape and indexes it with the temp grid's own row/col
+    (TempReader.cpp), so the geometry must be cell-identical to the clipped
+    temp PQFs — guaranteed by sharing forcing.clip_window's arithmetic."""
+    from hf_data.forcing import temp_clip_geometry
+    geom = temp_clip_geometry(bbox)
+    if geom is None or not dem_path or not os.path.exists(dem_path):
+        return None
+    nxll, nyll, cell, tnr, tnc = geom
+    try:
+        import rasterio
+        from rasterio.transform import from_origin
+        with rasterio.open(dem_path) as ds:
+            dem = ds.read(1).astype("float64")
+            tr = ds.transform
+            nod = ds.nodata
+        # DEM pixel centers -> temp grid row/col bins
+        rr, cc = np.meshgrid(np.arange(dem.shape[0]), np.arange(dem.shape[1]), indexing="ij")
+        lon = tr.c + (cc + 0.5) * tr.a
+        lat = tr.f + (rr + 0.5) * tr.e
+        top = nyll + tnr * cell
+        ti = np.floor((top - lat) / cell).astype(int)
+        tj = np.floor((lon - nxll) / cell).astype(int)
+        ok = np.isfinite(dem) & (dem > -500) & (dem < 9000)
+        if nod is not None:
+            ok &= dem != nod
+        ok &= (ti >= 0) & (ti < tnr) & (tj >= 0) & (tj < tnc)
+        if not ok.any():
+            return None
+        flat = ti[ok] * tnc + tj[ok]
+        sums = np.bincount(flat, weights=dem[ok], minlength=tnr * tnc)
+        cnts = np.bincount(flat, minlength=tnr * tnc)
+        mean = np.divide(sums, cnts, out=np.zeros_like(sums), where=cnts > 0)
+        agg = mean.reshape(tnr, tnc).astype("float32")
+        agg[cnts.reshape(tnr, tnc) == 0] = float(dem[ok].mean())  # offshore/edge fill
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with rasterio.open(
+            out_path, "w", driver="GTiff", height=tnr, width=tnc, count=1,
+            dtype="float32", crs="EPSG:4326", nodata=-9999.0,
+            transform=from_origin(nxll, top, cell, cell),
+            tiled=False, blockysize=1, interleave="pixel",   # EF5 TifGrid-safe
+        ) as dst:
+            dst.write(agg, 1)
+        return out_path
+    except Exception:
+        return None
+
+
 def _mean_elev(dem_path):
     if not dem_path or not os.path.exists(dem_path):
         return None
@@ -139,6 +196,8 @@ def _basin_min_temp(bbox, t_start, t_end, sample_hours=6):
             names = set(tf.getnames())
             for s in group:
                 member = s.strftime(cfg.member_fmt)
+                if member not in names:                # NARR-derived members
+                    member = s.strftime(cfg.out_fmt)   # use the generic name
                 if member not in names:
                     continue
                 a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())

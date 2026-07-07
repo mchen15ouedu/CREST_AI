@@ -67,6 +67,8 @@ class ControlSpec:
     snow_grids: dict | None = None                   # {mfmax_grid: path, ...}
     temp_dir: str | None = None                      # TEMPForcing LOC
     temp_name: str = "temp_YYYYMMDDHH.pqf"
+    temp_dem: str | None = None                      # TEMPForcing DEM= -> EF5 lapses
+                                                     # T by -6.5 C/km vs this grid
     # --- data assimilation (multi-gauge boundary conditions) ---
     da_file: str | None = None                       # DA_FILE= switches assimilation on
     # per-gauge calibrated parameters (AQUAH generate_control_file_cali style):
@@ -113,7 +115,9 @@ def build_control(spec: ControlSpec) -> str:
     )
     temp_sec = (
         f"[TEMPForcing TEMP]\nTYPE=PQF\nUNIT=C\nFREQ=1h\n"
-        f"LOC={os.path.abspath(spec.temp_dir) if spec.temp_dir else ''}\nNAME={spec.temp_name}\n\n"
+        f"LOC={os.path.abspath(spec.temp_dir) if spec.temp_dir else ''}\nNAME={spec.temp_name}\n"
+        + (f"DEM={os.path.abspath(spec.temp_dem)}\n" if spec.temp_dem else "")
+        + "\n"
         if spec.snow_on else ""
     )
     def _gauge_sec(g: Gauge) -> str:

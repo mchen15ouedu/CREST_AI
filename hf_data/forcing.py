@@ -50,6 +50,37 @@ VARS = {
                    "h", "TEMPForcing TEMP", "temp_YYYYMMDDHH.pqf", "C", "1h"),
 }
 
+# Canonical temperature grid: the geometry of every full-domain temp PQF in the
+# store (NLDAS-heritage 0.125-deg CONUS). NARR-derived members (scripts/
+# update_temp_narr.py) are resampled onto this same grid so ALL temp timesteps
+# — and the temperature-extrapolation DEM built against them — share one
+# geometry. (xll, yll, cellsize, nrows, ncols, nodata)
+TEMP_GRID = (-124.9375, 25.0625, 0.12473060344827586, 224, 464, -9999.0)
+
+
+def clip_window(bbox, xll, yll, cell, nr, nc):
+    """Row/col window of bbox on a grid — the SAME arithmetic as _clip, so a
+    grid built from this geometry is cell-identical to the clipped forcing."""
+    W, S, E, N = bbox
+    top = yll + nr * cell
+    c0 = max(0, int(np.floor((W - xll) / cell)));  c1 = min(nc, int(np.ceil((E - xll) / cell)))
+    r0 = max(0, int(np.floor((top - N) / cell)));  r1 = min(nr, int(np.ceil((top - S) / cell)))
+    if c1 <= c0 or r1 <= r0:
+        return None
+    return r0, r1, c0, c1
+
+
+def temp_clip_geometry(bbox):
+    """Geometry of the basin-clipped temp grid: (xll, yll_top?, ...) ->
+    (nxll, nyll, cell, nrows, ncols) or None if bbox is outside the grid."""
+    xll, yll, cell, nr, nc = TEMP_GRID[:5]
+    win = clip_window(bbox, xll, yll, cell, nr, nc)
+    if win is None:
+        return None
+    r0, r1, c0, c1 = win
+    top = yll + nr * cell
+    return xll + c0 * cell, top - r1 * cell, cell, r1 - r0, c1 - c0
+
 
 def _read_pqf(data: bytes):
     """bytes -> (array[nr,nc] float32, xll, yll, cell, nodata)."""
@@ -76,13 +107,12 @@ def _write_pqf(path: str, a: np.ndarray, xll: float, yll: float, cell: float, no
 
 def _clip(a, xll, yll, cell, nodata, bbox):
     """Clip full-domain grid to bbox (W,S,E,N). Returns (sub, nxll, nyll) or None."""
-    W, S, E, N = bbox
     nr, nc = a.shape
-    top = yll + nr * cell
-    c0 = max(0, int(np.floor((W - xll) / cell)));  c1 = min(nc, int(np.ceil((E - xll) / cell)))
-    r0 = max(0, int(np.floor((top - N) / cell)));  r1 = min(nr, int(np.ceil((top - S) / cell)))
-    if c1 <= c0 or r1 <= r0:
+    win = clip_window(bbox, xll, yll, cell, nr, nc)
+    if win is None:
         return None
+    r0, r1, c0, c1 = win
+    top = yll + nr * cell
     return a[r0:r1, c0:c1], xll + c0 * cell, top - r1 * cell
 
 
@@ -144,6 +174,8 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
             names = set(tf.getnames())
             for t in steps:
                 member = t.strftime(cfg.member_fmt)
+                if member not in names:                # NARR-derived members use
+                    member = t.strftime(cfg.out_fmt)   # the generic name
                 if member not in names:
                     res.missing.append(member)
                     continue

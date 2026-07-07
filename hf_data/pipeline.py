@@ -448,6 +448,18 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     if snow_on:
         yield ("status", f"❄ SNOW17 v1 parameter grids: {len(snow_grids or {})}/9 clipped "
                          "(operational CONUS 0.1° calibrated set, incl. pxtemp)")
+    # DEM-based temperature extrapolation: the temp forcing is coarse (0.125°
+    # NLDAS / 32 km NARR), so give EF5 a DEM aggregated to the temp grid and it
+    # lapses each model cell by -6.5 °C/km relative to its temp pixel's mean
+    # elevation ([TEMPForcing] DEM=, TempReader.cpp)
+    temp_dem = (_snow.build_temp_dem(bbox, os.path.join(basic_dir, "dem_clip.tif"),
+                                     os.path.join(work, "snow", "temp_dem.tif"))
+                if snow_on else None)
+    if snow_on:
+        yield ("status", "⛰ DEM-based temperature extrapolation ON (−6.5 °C/km vs "
+                         "temp-pixel mean elevation)" if temp_dem else
+                         "⚠️ temperature extrapolation unavailable (temp-grid DEM "
+                         "could not be built) — using raw coarse temperatures")
     # shared per-basin forcing store: overlapping runs merge their timesteps
     # instead of re-downloading into per-run temp dirs (data manager)
     mrms_dir = forcing.store_dir("mrms", bbox)
@@ -550,7 +562,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         param_grids=pgrids, output_grids=grids,
         state_dir=sdir, warmup_start=warmup_start,
         snow_on=snow_on, snow_scalars=snow_scalars, snow_grids=snow_grids, temp_dir=temp_dir,
-        da_file=da_file, per_gauge=per_gauge or None)
+        temp_dem=temp_dem, da_file=da_file, per_gauge=per_gauge or None)
     build_control(spec)
 
     if cancel is not None and cancel.is_set():
