@@ -39,6 +39,7 @@ class SimJob:
         self.meta: dict[str, dict] = {}          # gid -> {id,name,area,lat,lon,model}
         self.params: dict[str, dict] = {}        # gid -> {wb,kw,model,source}
         self.done = threading.Event()
+        self._q2d_err: set = set()               # gauges with a reported render error
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -75,10 +76,16 @@ class SimJob:
                         frame = self.overlays.get(gid, (None, None, 0))[2] + 1
                         self.overlays[gid] = (png, bounds, frame)
                         self.q.put({"kind": "q2d", "gauge_id": gid, "bounds": bounds, "frame": frame})
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if gid not in self._q2d_err:      # report once, don't spam
+                            self._q2d_err.add(gid)
+                            self.q.put({"kind": "status", "gauge_id": gid,
+                                        "msg": f"⚠️ 2-D frame render failed: {e}"})
                 elif kind == "done":
-                    self._build_timeline(gid)
+                    if payload.get("cached"):
+                        self._cached_timeline(gid)        # replay frames from disk
+                    else:
+                        self._build_timeline(gid)
                     self.q.put({"kind": "gauge_done", "gauge_id": gid,
                                 "returncode": payload.get("returncode"),
                                 "n": len(self.hydro.get(gid, []))})
@@ -100,8 +107,32 @@ class SimJob:
                         "times": [f[2] for f in frames],
                         "bounds": frames[0][1] if frames else None,
                         "vmax": vmax})
-        except Exception:
-            pass
+            # persist for future cache-hit runs (only when the frames cover the
+            # whole requested window — a tail-only extension must not masquerade
+            # as the full animation)
+            model = (self.meta.get(gid) or {}).get("model", "crestphys")
+            expected = (self.t_end - self.t_start).total_seconds() / 3600 + 1
+            if len(frames) >= 0.9 * expected:
+                viz.save_frames_cache(gid, model, self.t_start, self.t_end, frames, vmax)
+        except Exception as e:
+            self.q.put({"kind": "status", "gauge_id": gid,
+                        "msg": f"⚠️ animation build failed: {e}"})
+
+    def _cached_timeline(self, gid):
+        """Cache-served run: replay the previously rendered frames from disk."""
+        model = (self.meta.get(gid) or {}).get("model", "crestphys")
+        got = viz.load_frames_cache(gid, model, self.t_start, self.t_end)
+        if not got:
+            return
+        frames, vmax = got
+        self.frames[gid] = frames
+        if frames:                                    # latest frame as live overlay
+            self.overlays[gid] = (frames[-1][0], frames[-1][1], len(frames))
+            self.q.put({"kind": "q2d", "gauge_id": gid,
+                        "bounds": frames[-1][1], "frame": len(frames)})
+        self.q.put({"kind": "timeline", "gauge_id": gid, "n": len(frames),
+                    "times": [f[2] for f in frames],
+                    "bounds": frames[0][1] if frames else None, "vmax": vmax})
 
     def _build_result(self, gid):
         """Compute skill metrics + the ARW report, emit as a 'result' event."""

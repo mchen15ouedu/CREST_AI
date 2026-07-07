@@ -219,19 +219,31 @@ class SimRequest(BaseModel):
     overrides: dict | None = None
 
 
+MAX_SIM_HOURS = int(os.environ.get("CREST_MAX_SIM_HOURS", "2160"))   # 90 days
+
+
 @app.post("/api/simulate")
 def api_simulate(req: SimRequest):
-    warning = None
+    warnings = []
     if len(req.gauge_ids) > MAX_SIMS:
-        warning = (f"This demo simulates at most {MAX_SIMS} gauges at once; "
-                   f"running the first {MAX_SIMS} of {len(req.gauge_ids)} selected.")
+        warnings.append(f"This demo simulates at most {MAX_SIMS} gauges at once; "
+                        f"running the first {MAX_SIMS} of {len(req.gauge_ids)} selected.")
     t0 = datetime.fromisoformat(req.t_start) if req.t_start else datetime(2025, 7, 3)
     t1 = datetime.fromisoformat(req.t_end) if req.t_end else t0 + timedelta(hours=req.hours)
+    if t1 <= t0:                                       # nonsensical window
+        t1 = t0 + timedelta(hours=req.hours)
+        warnings.append(f"End time was not after the start — using {req.hours} h instead.")
+    if (t1 - t0) > timedelta(hours=MAX_SIM_HOURS):     # demo-hardware sanity cap
+        t1 = t0 + timedelta(hours=MAX_SIM_HOURS)
+        warnings.append(f"Window capped at {MAX_SIM_HOURS // 24} days for this demo "
+                        f"(now ends {t1:%Y-%m-%d %H:%M}).")
     opts = {"model": req.model, "hours": req.hours, "snow": req.snow,
             "timestep": req.timestep, "warmup_days": req.warmup_days,
             "overrides": req.overrides}
     job = simjobs.start_job(req.gauge_ids, t0, t1, opts)
-    return {"sim_id": job.id, "gauge_ids": job.gauge_ids, "warning": warning,
+    return {"sim_id": job.id, "gauge_ids": job.gauge_ids,
+            "t_start": t0.isoformat(), "t_end": t1.isoformat(),
+            "warning": " ".join(warnings) or None,
             "max_concurrent": simjobs.MAX_CONCURRENT}
 
 

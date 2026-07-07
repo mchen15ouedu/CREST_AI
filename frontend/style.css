@@ -60,6 +60,15 @@ input, select, textarea { width: 100%; padding: 6px 8px; background: #0d141c; co
 label.chk input { width: auto; }
 .hidden { display: none !important; }
 
+/* manual time override (Set / Clear) */
+.k-time { border: 1px solid #223140; border-radius: 8px; padding: 8px; margin-bottom: 10px; }
+.k-time label:first-child { margin-top: 0; }
+.k-time-btns { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.k-time-btns button { width: auto; padding: 5px 14px; border: 1px solid #2a3a49; background: #142230;
+  color: #e8eef4; border-radius: 6px; cursor: pointer; font-size: 12.5px; }
+.k-time-btns button.primary { background: #3a6ea5; border-color: #3a6ea5; font-weight: 600; }
+#k-time-state { color: #ffd479; margin: 0; }
+
 /* advanced parameters accordion */
 .adv { margin-top: 14px; border-top: 1px solid #223; padding-top: 8px; }
 .adv-head { cursor: pointer; font-weight: 600; font-size: 13px; color: #7fd4b0; user-select: none; }

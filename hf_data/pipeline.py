@@ -18,6 +18,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -188,6 +189,21 @@ def analyze(query: str, use_mock: bool = True, hours: int = 48, model: str = "cr
 WEST_LON = -105.0          # west of the Rocky Mountain front -> CREST (task #8)
 WARMUP_DAYS = 90           # 3-month warm-up to build the initial model state (task #6)
 
+# one EF5 run per (gauge, model) at a time: concurrent runs of the SAME gauge
+# would race on the shared state dir + result-cache JSON. A second request
+# (double-click, or another user picking the same gauge) waits, then usually
+# gets served straight from the cache the first run just wrote.
+_RUN_LOCKS: dict[tuple, threading.Lock] = {}
+_RUN_LOCKS_GUARD = threading.Lock()
+
+
+def _run_lock(gauge_id: str, model: str) -> threading.Lock:
+    key = (str(gauge_id).zfill(8), model)
+    with _RUN_LOCKS_GUARD:
+        if key not in _RUN_LOCKS:
+            _RUN_LOCKS[key] = threading.Lock()
+        return _RUN_LOCKS[key]
+
 
 def gauge_info(gauge_id: str):
     df = gauges._catalog()
@@ -217,6 +233,22 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
     wb_model = "crest" if model in ("crest", "hp") else "crestphys"  # multiplier source
     yield ("meta", {**g, "model": model})        # for the report + right panel
 
+    lock = _run_lock(g["id"], ef5_model)
+    if not lock.acquire(blocking=False):
+        yield ("status", "⏳ another simulation of this gauge is already running — "
+                         "queued behind it (its results are shared via the cache)")
+        lock.acquire()
+    try:
+        yield from _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end,
+                                   use_mock, overrides, snow, timestep,
+                                   warmup_days, grids, no_cache, workdir)
+    finally:
+        lock.release()
+
+
+def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
+                    overrides, snow, timestep, warmup_days, grids, no_cache, workdir):
+    """The actual per-gauge run — called with the (gauge, model) lock held."""
     work = workdir or tempfile.mkdtemp(prefix=f"crest_{g['id']}_")
     basic_dir = os.path.join(work, "BasicData_Clip")
     param_dir = os.path.join(work, "param")
@@ -236,16 +268,32 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
         pl = {"cached_rows": [], "run_start": t_start, "run_end": t_end,
               "load_state_time": ex, "warmup_from": wfrom, "need_warmup": needw,
               "reason": "calibration run — row cache bypassed"}
+    if pl["run_start"] is None and grids:
+        # rows are cached, but the 2-D streamflow maps need rendered frames —
+        # if none are cached on disk, re-run the window (fast: warm-starts
+        # from the saved state) so the map animation always appears
+        from hf_data import viz as _viz
+        if not _viz.has_frames_cache(g["id"], ef5_model, t_start, t_end):
+            lt, wf, nw = statecache._state_choice(g["id"], ef5_model, t_start)
+            pl = {"cached_rows": [], "run_start": t_start, "run_end": t_end,
+                  "load_state_time": lt, "warmup_from": wf, "need_warmup": nw,
+                  "reason": "re-run to render the 2-D streamflow maps"}
+            yield ("status", "hydrograph is cached but the 2-D streamflow maps "
+                             "aren't — re-running the window to render them")
     if pl["cached_rows"]:
         yield ("status", f"♻️ reused {len(pl['cached_rows'])} cached step(s) "
                          f"({pl['cached_rows'][0]['time']}…{pl['cached_rows'][-1]['time']})")
         yield ("hydro", {"rows": pl["cached_rows"], "cached": True})
     if pl["run_start"] is None:                       # fully cached -> no simulation
         yield ("status", "✓ served entirely from cache")
-        yield ("done", {"returncode": 0, "cached": True})
+        yield ("done", {"returncode": 0, "cached": True,
+                        "window": [t_start.strftime(statecache.TS_FMT),
+                                   t_end.strftime(statecache.TS_FMT)]})
         return
     run_start, run_end = pl["run_start"], pl["run_end"]
     run_hours = max(1, int(round((run_end - run_start).total_seconds() / 3600)))
+    yield ("status", f"🕐 simulation window {run_start:%Y-%m-%d %H:%M} → "
+                     f"{run_end:%Y-%m-%d %H:%M} ({run_hours} h @ {timestep})")
 
     yield ("status", f"clip DEM/DDM/FAM · model {model.upper()}")
     clip = basic.clip_basic_data(bbox, basic_dir)
@@ -340,9 +388,14 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
 
     if not use_mock:                                  # real run: forcing over the full span
         f0 = warmup_start or run_start
+        n_days = max(1, int((run_end - f0).total_seconds() // 86400))
+        yield ("status", f"⬇️ downloading rainfall (MRMS) forcing — "
+                         f"{n_days} day(s) incl. warm-up…")
         forcing.prepare_forcing("mrms", bbox, f0, run_end, os.path.join(work, "MRMS"))
+        yield ("status", "⬇️ downloading PET forcing…")
         forcing.prepare_forcing("pet", bbox, f0, run_end, os.path.join(work, "PET"))
         if snow_on:
+            yield ("status", "⬇️ downloading temperature forcing (snow module)…")
             forcing.prepare_forcing("temp", bbox, f0, run_end, temp_dir)
 
     # warm-up: separate blocking ef5 process (own control); its state files at

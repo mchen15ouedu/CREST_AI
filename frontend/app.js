@@ -26,10 +26,15 @@ let eventLayer = L.layerGroup().addTo(map);
 let gaugeLayer = L.layerGroup().addTo(map);
 let MAX_SIMS = 10;
 
-let queryCtx = null;              // {t_start, t_end, bbox, label}
+let queryCtx = null;              // {t_start, t_end, bbox, label}  (AI-defined window)
+let chatTime = null;              // {start, end|null} — dates the user typed in chat
+let manualTime = null;            // {start|null, end|null} — Model options “Set” override
 let lastSim = null;               // {tStart, tEnd, hours, expectedSteps}
 let awaitingTime = false;         // waiting for the user to give a date range/link
 let pendingQuery = null;          // original query text while awaiting time
+let simRunning = false;           // a job is in flight
+let selKeyAtRun = "";             // selection snapshot when Simulate was clicked
+let currentES = null;             // the open SSE connection (only ever one)
 const simHydro = {};              // gid -> accumulated rows
 const gaugeResult = {};           // gid -> {meta, metrics, report}
 const gaugeState = {};            // gid -> "running" | "done"
@@ -101,7 +106,7 @@ function addGaugePins(pins) {
   });
 }
 
-async function runQuery(text) {
+async function runQuery(text, userDates) {
   addMsg(escapeHtml(text), "user");
   const s = addMsg("🧭 Analyzing…", "status");
   try {
@@ -116,15 +121,44 @@ async function runQuery(text) {
     s.textContent = `📍 ${d.label} — ${d.n_gauges} USGS gauges nearby. ` +
       `Pick a few gauges closest to the event — click the pins or draw a small box ` +
       `(up to ${MAX_SIMS}; fewer runs faster).`;
-    if (!d.time_known) {
+    if (!d.time_known && !userDates) {
       awaitingTime = true; pendingQuery = text;
       addMsg("🗓️ I found the <b>place</b> but couldn't pin down <b>when</b> this happened. " +
         "Reply with a date range like <code>2025-07-03 to 2025-07-06</code>, a single start date, " +
-        "or paste a news link about the event — or set the start date in ⚙️ Model options.", "bot");
+        "or paste a news link about the event — or set dates in ⚙️ Model options.", "bot");
+    } else if (userDates) {
+      confirmDates(userDates, d);
     }
   } catch (err) {
     s.textContent = "⚠️ " + err.message;
   }
+}
+
+// the user typed explicit dates AND the AI proposed a window — if they differ,
+// ask which one to use (chat wins only after the user confirms)
+function confirmDates(ud, d) {
+  const aiS = d.time_known && d.t_start ? d.t_start.slice(0, 10) : null;
+  const aiE = d.time_known && d.t_end ? d.t_end.slice(0, 10) : null;
+  const same = aiS === ud.start && (!ud.end || aiE === ud.end);
+  if (!aiS || same) {                     // no AI window, or they agree -> use typed dates
+    setChatTime(ud);
+    return;
+  }
+  const card = addMsg(
+    `🗓️ You wrote <b>${ud.start}${ud.end ? " → " + ud.end : ""}</b>, but the AI identified this ` +
+    `event as <b>${aiS}${aiE ? " → " + aiE : ""}</b>. Which window should I simulate?` +
+    `<div class="btn-row"><button class="primary" data-act="mine">Use my dates</button>` +
+    `<button data-act="ai">Use the AI's dates</button></div>`, "bot");
+  card.querySelector('[data-act="mine"]').onclick = () => {
+    card.querySelector(".btn-row").remove();
+    setChatTime(ud, "Using <b>your</b> dates.");
+  };
+  card.querySelector('[data-act="ai"]').onclick = () => {
+    card.querySelector(".btn-row").remove();
+    chatTime = null;                      // AI window (queryCtx) applies
+    addMsg(`🗓️ Using the AI-identified window <b>${aiS}${aiE ? " → " + aiE : ""}</b>.`, "bot");
+    allowResim();
+  };
 }
 
 function renderResult(d) {
@@ -150,13 +184,26 @@ function toggleGauge(id) {
   refreshSelection();
   if (simHydro[id]) focusGauge(id);        // has results -> show them
 }
+function selKey() { return [...selected].sort().join(","); }
+
 function refreshSelection() {
   Object.entries(gaugeMarkers).forEach(([id, m]) => m.setStyle(gaugeStyle(id)));
   const n = selected.size;
   document.getElementById("selinfo").textContent = n ? `${n} gauge${n > 1 ? "s" : ""} selected` : "";
   const b = document.getElementById("btn-sim");
-  b.textContent = `▶ Simulate (${n})`; b.disabled = n === 0;
+  // greyed out for the selection that was already simulated (or is running) —
+  // changing gauges, the time window, or any model option re-enables it
+  const held = selKeyAtRun !== "" && selKey() === selKeyAtRun;
+  b.textContent = (held && simRunning) ? "⏳ Simulating…" : `▶ Simulate (${n})`;
+  b.disabled = n === 0 || held;
   if (n > MAX_SIMS) document.getElementById("selinfo").textContent += `  ⚠ max ${MAX_SIMS}`;
+}
+
+// something that changes what a new run would compute (window/params) happened —
+// let the user hit Simulate again even with the same gauges
+function allowResim() {
+  selKeyAtRun = "";
+  refreshSelection();
 }
 
 function readOptions() {
@@ -172,31 +219,68 @@ function readOptions() {
   };
 }
 
+// ---- time-window resolution -------------------------------------------
+// precedence per field: Model-options “Set” override  >  chat-typed dates  >
+// AI-identified event window. A field left blank at a higher level falls
+// through to the next. No end anywhere -> start + Duration knob.
+function resolveWindow(hours) {
+  const pick = (k) =>
+    manualTime && manualTime[k] ? [manualTime[k], "manual"] :
+    chatTime && chatTime[k] ? [chatTime[k], "chat"] :
+    queryCtx && queryCtx["t_" + k] ? [queryCtx["t_" + k].slice(0, 10), "AI"] : [null, null];
+  const [s, srcS] = pick("start");
+  if (!s) return null;
+  const tStart = s.length > 10 ? s : `${s}T00:00:00`;
+  let [e, srcE] = pick("end");
+  let tEnd = e ? (e.length > 10 ? e : `${e}T00:00:00`) : null;
+  if (tEnd && tEnd <= tStart) { tEnd = null; srcE = null; }    // guard nonsense
+  if (!tEnd) {
+    tEnd = new Date(new Date(tStart + "Z").getTime() + hours * 3600e3)
+      .toISOString().slice(0, 19);
+    srcE = "duration knob";
+  }
+  return { tStart, tEnd, srcS, srcE };
+}
+
+function windowHours(t0, t1) {
+  return Math.max(1, Math.round((new Date(t1 + "Z") - new Date(t0 + "Z")) / 3600e3));
+}
+
 async function simulate() {
+  if (simRunning && selKey() === selKeyAtRun) return;   // double-click guard
   const ids = [...selected];
   const opt = readOptions();
-  // the start-date knob overrides the query's event window (end = start + hours)
-  const startOv = document.getElementById("k-start").value;
-  const tStart = startOv ? `${startOv}T00:00:00` : queryCtx?.t_start;
-  const tEnd = startOv ? null : queryCtx?.t_end;
-  if (!tStart) {                          // map-first flow with no time context
+  const win = resolveWindow(opt.hours);
+  if (!win) {                             // map-first flow with no time context
     addMsg("🗓️ I need a time period first — tell me the event (e.g. <i>“flood in Kerrville, July 2025”</i>), " +
-      "reply with a date range like <code>2025-07-03 to 2025-07-06</code>, or set the start date in ⚙️ Model options.", "bot");
+      "reply with a date range like <code>2025-07-03 to 2025-07-06</code>, or set dates in ⚙️ Model options.", "bot");
     awaitingTime = true;
     document.getElementById("left-panel").classList.remove("collapsed");
     return;
   }
-  addMsg(`▶ Simulating ${ids.length} gauge(s)…`, "status");
-  const r = await fetch("/api/simulate", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ gauge_ids: ids, t_start: tStart, t_end: tEnd, ...opt }),
-  });
-  const d = await r.json();
+  const H = windowHours(win.tStart, win.tEnd);
+  addMsg(`▶ Simulating ${ids.length} gauge(s) — <b>${win.tStart.slice(0, 16).replace("T", " ")}</b> → ` +
+    `<b>${win.tEnd.slice(0, 16).replace("T", " ")}</b> (${H} h · start from ${win.srcS}, end from ${win.srcE})`, "status");
+  simRunning = true; selKeyAtRun = selKey(); refreshSelection();
+  let d;
+  try {
+    const r = await fetch("/api/simulate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gauge_ids: ids, t_start: win.tStart, t_end: win.tEnd, ...opt }),
+    });
+    d = await r.json();
+    if (!r.ok || !d.sim_id) throw new Error(d.detail || "simulation could not start");
+  } catch (err) {
+    addMsg("⚠️ " + err.message, "status");
+    simRunning = false; refreshSelection();
+    return;
+  }
   if (d.warning) addMsg("⚠️ " + d.warning, "status");
   resetAnim();
   zoomedToOverlay = false;
-  const hours = opt.hours;
-  lastSim = { tStart, tEnd, hours, expectedSteps: hours + 1 };
+  const tS = d.t_start || win.tStart, tE = d.t_end || win.tEnd;   // server may clamp
+  const HH = windowHours(tS, tE);
+  lastSim = { tStart: tS, tEnd: tE, hours: HH, expectedSteps: HH + 1 };
   ids.forEach((id) => { simHydro[id] = []; gaugeState[id] = "running"; delete gaugeResult[id]; });
   renderTabs();
   if (ids.length && !panelGauge) focusGauge(ids[0]);
@@ -208,14 +292,18 @@ async function simulate() {
 }
 
 function openStream(simId) {
+  if (currentES) { currentES.close(); currentES = null; }   // never two streams
   currentSim = simId;
-  const es = new EventSource(`/api/stream/${simId}`);
+  const es = currentES = new EventSource(`/api/stream/${simId}`);
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     handleSimEvent(simId, ev);
     if (ev.kind === "all_done") es.close();
   };
-  es.onerror = () => es.close();
+  es.onerror = () => {
+    es.close();
+    if (currentES === es) { simRunning = false; refreshSelection(); }
+  };
 }
 
 function handleSimEvent(simId, ev) {
@@ -248,6 +336,8 @@ function handleSimEvent(simId, ev) {
     addMsg("✅ All simulations complete — use the time bar to replay the flood, and the tabs " +
       "in the results panel to switch between gauges.", "status");
     setFrame(animMax);
+    simRunning = false;                    // same selection stays greyed out until it changes
+    refreshSelection();
   }
 }
 
@@ -278,22 +368,30 @@ function setProgress(gid, pct, stage) {
   if (stage) p.stage.textContent = stage;
 }
 
-// map raw pipeline statuses to friendly stages + progress
+// map raw pipeline statuses to friendly stages + progress. The LABEL always
+// describes the step that is happening NOW (statuses are emitted just before
+// each long operation), so during e.g. the warm-up the bar says “warm-up”.
 const STAGES = [
-  [/clip DEM/i,          8,  "preparing terrain (DEM, flow direction, accumulation)…"],
-  [/clip @gauge/i,       10, null],
-  [/derived from the DEM/i, 12, "flow network rebuilt from the DEM (pysheds)"],
-  [/SNOW17 enabled/i,    14, "snow module ON (cold basin detected)"],
-  [/no snow/i,           14, "snow module off (warm basin)"],
-  [/stored best parameters/i, 16, "loading this basin's best-known parameters"],
-  [/reused .* cached/i,  18, "reusing cached results for the overlap"],
-  [/USGS observed/i,     20, "fetched observed discharge from USGS"],
-  [/warm start from exact/i, 45, "warm-starting from a saved model state"],
-  [/short warm-up/i,     30, "short warm-up bridging to the saved state…"],
-  [/-day warm-up from/i, 25, "downloading forcing + warming up the soil state…"],
-  [/warm-up disabled/i,  25, "cold start (no warm-up)"],
-  [/running warm-up/i,   35, "running the warm-up simulation…"],
-  [/warm-up done/i,      55, "warm-up finished — initial state saved"],
+  [/another simulation of this gauge/i, 3, "queued — waiting for another run of this gauge to finish…"],
+  [/re-running the window to render/i, 6, "re-running to render the 2-D streamflow maps…"],
+  [/reused .* cached/i,  8,  "reusing cached results for the overlap"],
+  [/simulation window/i, 10, null],
+  [/clip DEM/i,          12, "preparing terrain (DEM, flow direction, accumulation)…"],
+  [/clip @gauge/i,       14, null],
+  [/derived from the DEM/i, 15, "flow network rebuilt from the DEM (pysheds)"],
+  [/SNOW17 enabled/i,    17, "snow module ON (cold basin detected)"],
+  [/no snow/i,           17, "snow module off (warm basin)"],
+  [/stored best parameters/i, 18, "loading this basin's best-known parameters"],
+  [/-day warm-up from/i, 20, null],       // plan only — the run itself comes later
+  [/short warm-up/i,     20, null],
+  [/warm-up disabled/i,  20, "cold start (no warm-up)"],
+  [/warm start from exact/i, 22, "warm-starting from a saved model state"],
+  [/USGS observed/i,     24, "downloading observed discharge (USGS)…"],
+  [/downloading rainfall/i, 28, "downloading rainfall forcing (MRMS)…"],
+  [/downloading PET/i,   36, "downloading PET forcing…"],
+  [/downloading temperature/i, 38, "downloading temperature forcing (snow)…"],
+  [/running warm-up/i,   42, "running the warm-up simulation (builds the initial soil state)…"],
+  [/warm-up done/i,      58, "warm-up finished — initial state saved"],
   [/running CREST/i,     60, "CREST is running — hydrograph streaming live…"],
   [/served entirely from cache/i, 95, "results served from cache"],
 ];
@@ -552,8 +650,49 @@ function renderHydro(id) {
   }, { displayModeBar: false, responsive: true });
 }
 
-// ---- chat routing ---------------------------------------------------------
-const DATE_RANGE = /(\d{4}-\d{2}-\d{2})(?:\s*(?:to|through|–|—|-)\s*(\d{4}-\d{2}-\d{2}))?/;
+// ---- chat routing + flexible date parsing ---------------------------------
+// tokens: 2025-07-03 · 7/3/2025 · 07/03/25 · 3 July 2025 · July 3, 2025
+const DATE_TOKEN = /\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4}|(?:\d{1,2}\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}?,?\s*\d{4}|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s*\d{4}/gi;
+const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+
+function normDate(s) {
+  s = s.trim();
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);            // ISO
+  if (m) return isoDate(+m[1], +m[2], +m[3]);
+  m = s.match(/^(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})$/);      // US M/D/Y (D/M if M>12)
+  if (m) {
+    let a = +m[1], b = +m[2], y = +m[3];
+    if (y < 100) y += 2000;
+    let mo = a, d = b;
+    if (a > 12 && b <= 12) { mo = b; d = a; }
+    return isoDate(y, mo, d);
+  }
+  m = s.toLowerCase().match(/^(?:(\d{1,2})\s+)?([a-z]{3})[a-z]*\.?\s*(\d{1,2})?,?\s*(\d{4})$/);
+  if (m && MONTHS[m[2]]) {                                     // "July 3, 2025" / "3 July 2025"
+    const d = +(m[1] || m[3] || 1);
+    return isoDate(+m[4], MONTHS[m[2]], d);
+  }
+  return null;
+}
+function isoDate(y, mo, d) {
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  return `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+function parseUserDates(text) {
+  const toks = (text.match(DATE_TOKEN) || []).map(normDate).filter(Boolean);
+  if (!toks.length) return null;
+  let start = toks[0], end = toks[1] || null;
+  if (end && end < start) [start, end] = [end, start];         // tolerate swapped order
+  return { start, end };
+}
+
+function setChatTime(ud, note) {
+  chatTime = { start: ud.start, end: ud.end };
+  addMsg(`🗓️ Got it — simulation window starts <b>${ud.start}</b>` +
+    (ud.end ? ` and ends <b>${ud.end}</b>` : ` (end = start + the Duration knob)`) +
+    (note ? `. ${note}` : ". Select gauges and hit Simulate."), "bot");
+  allowResim();
+}
 
 function handleChat(text) {
   const t = text.trim();
@@ -565,27 +704,24 @@ function handleChat(text) {
       `picking just the few nearest the event is faster and clearer.`, "status");
     return;
   }
-  // reply to the "when did this happen?" prompt: a date range or single date
-  const dm = t.match(DATE_RANGE);
-  if (awaitingTime && dm) {
+  const ud = parseUserDates(t);
+  // dates-only message, or an answer to "when did this happen?" -> chat-defined window
+  const leftover = t.replace(DATE_TOKEN, " ")
+    .replace(/\b(from|to|through|until|between|and|simulate|run|please)\b/gi, " ")
+    .replace(/[-–—,.\s]+/g, " ").trim();
+  if (ud && (awaitingTime || leftover.length < 8)) {
     awaitingTime = false;
-    const start = dm[1], end = dm[2];
-    queryCtx = queryCtx || {};
-    queryCtx.t_start = `${start}T00:00:00`;
-    queryCtx.t_end = end ? `${end}T00:00:00` : null;
-    document.getElementById("k-start").value = start;
     addMsg(escapeHtml(t), "user");
-    addMsg(`🗓️ Got it — simulation window starts <b>${start}</b>${end ? ` and ends <b>${end}</b>` : ""}. ` +
-      `Select gauges and hit Simulate.`, "bot");
+    setChatTime(ud);
     return;
   }
-  // a pasted link (or anything else) while waiting for time -> re-parse with context
+  // a pasted link while waiting for time -> re-parse with the original context
   if (awaitingTime && /https?:\/\//.test(t)) {
     awaitingTime = false;
     runQuery(`${pendingQuery || ""} ${t}`.trim());
     return;
   }
-  runQuery(t);
+  runQuery(t, ud);      // free-form query; embedded dates are checked against the AI's
 }
 
 // ---- auth: HF OAuth + profile modal ---------------------------------------
@@ -711,6 +847,33 @@ document.getElementById("adv-toggle").onclick = () => {
 
 document.getElementById("anim-play").onclick = togglePlay;
 document.getElementById("anim-slider").oninput = (e) => { stopPlay(); setFrame(parseInt(e.target.value)); };
+
+// ---- manual time override (Set / Clear) ----------------------------------
+document.getElementById("k-time-set").onclick = () => {
+  const s = document.getElementById("k-start").value || null;
+  const e = document.getElementById("k-end").value || null;
+  if (!s && !e) { addMsg("⚠ Enter a start and/or end date before hitting Set.", "status"); return; }
+  if (s && e && e <= s) { addMsg("⚠ The end date must be after the start date.", "status"); return; }
+  manualTime = { start: s, end: e };
+  document.getElementById("k-time-state").textContent = "🔒 override active";
+  addMsg(`🔒 Manual time override <b>active</b>: <b>${s || "(AI/chat start)"}</b> → <b>${e || "(AI/chat end)"}</b>. ` +
+    `It overrides the AI- and chat-defined windows until you hit <b>Clear</b>. ` +
+    `Fields left blank fall back to the AI/chat value.`, "bot");
+  allowResim();
+};
+document.getElementById("k-time-clear").onclick = () => {
+  manualTime = null;
+  document.getElementById("k-start").value = "";
+  document.getElementById("k-end").value = "";
+  document.getElementById("k-time-state").textContent = "";
+  addMsg("🔓 Manual time override cleared — the AI/chat-defined window is used again.", "bot");
+  allowResim();
+};
+
+// changing any model option means a new run would differ — re-enable Simulate
+document.querySelectorAll("#left-panel input, #left-panel select").forEach((el) => {
+  el.addEventListener("change", allowResim);
+});
 
 // ---- boot ----------------------------------------------------------------
 initAuth();

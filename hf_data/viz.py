@@ -132,6 +132,65 @@ def q2d_frames(tif_paths: list[str], vmin: float = 1.0):
     return frames, vmax
 
 
+# --------------------------------------------------------------------------- #
+# frame disk cache — lets a cache-served run still show the 2-D animation
+# (frames rendered once per (gauge, model, window); invalidated on param change)
+# --------------------------------------------------------------------------- #
+_WIN_FMT = "%Y-%m-%d %H:%M"
+
+
+def frames_cache_dir(gauge: str, model: str) -> str:
+    from hf_data.statecache import CACHE_DIR
+    return os.path.join(CACHE_DIR, "frames", f"{str(gauge).zfill(8)}_{model.lower()}")
+
+
+def save_frames_cache(gauge: str, model: str, t0: datetime, t1: datetime,
+                      frames: list, vmax: float):
+    """Persist rendered animation frames so a later cache-hit run can replay
+    the 2-D streamflow without re-running EF5."""
+    import json
+    import shutil
+    d = frames_cache_dir(gauge, model)
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, exist_ok=True)
+    for i, (png, _b, _t) in enumerate(frames):
+        with open(os.path.join(d, f"frame_{i:04d}.png"), "wb") as fh:
+            fh.write(png)
+    idx = {"window": [t0.strftime(_WIN_FMT), t1.strftime(_WIN_FMT)],
+           "times": [f[2] for f in frames], "bounds": frames[0][1] if frames else None,
+           "vmax": vmax, "n": len(frames)}
+    with open(os.path.join(d, "index.json"), "w") as fh:
+        json.dump(idx, fh)
+
+
+def load_frames_cache(gauge: str, model: str, t0: datetime, t1: datetime):
+    """(frames, vmax) for an exact-window match, else None. Frames are
+    (png_bytes, bounds, time_label) like q2d_frames returns."""
+    import json
+    d = frames_cache_dir(gauge, model)
+    try:
+        with open(os.path.join(d, "index.json")) as fh:
+            idx = json.load(fh)
+        if idx.get("window") != [t0.strftime(_WIN_FMT), t1.strftime(_WIN_FMT)]:
+            return None
+        frames = []
+        for i, label in enumerate(idx["times"]):
+            with open(os.path.join(d, f"frame_{i:04d}.png"), "rb") as fh:
+                frames.append((fh.read(), idx["bounds"], label))
+        return frames, idx.get("vmax", 10.0)
+    except Exception:
+        return None
+
+
+def has_frames_cache(gauge: str, model: str, t0: datetime, t1: datetime) -> bool:
+    import json
+    try:
+        with open(os.path.join(frames_cache_dir(gauge, model), "index.json")) as fh:
+            return json.load(fh).get("window") == [t0.strftime(_WIN_FMT), t1.strftime(_WIN_FMT)]
+    except Exception:
+        return False
+
+
 def empty_fig(msg: str = "waiting…") -> go.Figure:
     fig = go.Figure()
     fig.add_annotation(text=msg, showarrow=False, font=dict(size=14, color="#8a98a5"))
