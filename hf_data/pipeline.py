@@ -442,8 +442,12 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                            force=(None if snow == "auto" else snow), use_temp=not use_mock)
     snow_on = si["snow"]
     yield ("status", ("❄️ SNOW17 enabled — " if snow_on else "☀️ no snow — ") + si["reason"])
-    snow_scalars = _snow.snow_params(snow_ov) if snow_on else None
     snow_grids = _snow.clip_snow_grids(bbox, os.path.join(work, "snow")) if snow_on else None
+    snow_scalars = (_snow.snow_params(snow_ov, gridded=snow_grids or {})
+                    if snow_on else None)
+    if snow_on:
+        yield ("status", f"❄ SNOW17 v1 parameter grids: {len(snow_grids or {})}/8 clipped "
+                         "(operational CONUS 0.1° calibrated set)")
     # shared per-basin forcing store: overlapping runs merge their timesteps
     # instead of re-downloading into per-run temp dirs (data manager)
     mrms_dir = forcing.store_dir("mrms", bbox)

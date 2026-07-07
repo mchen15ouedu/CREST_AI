@@ -6,10 +6,13 @@ Snow decision (user-chosen: data-driven temp with LLM/user override):
     download); otherwise confirm from HF temperature forcing — enable SNOW17 if
     the basin drops below ~freezing during the window.
 
-SNOW17 params: the 4 spatial grids (mfmax/mfmin/nmf/tipm) come from
-CREST_data param/snow17/ (grid x scalar-multiplier, default 1.0); the other 4
-(uadj/mbase/plwhc/scf) are scalars from hydro_cali_snow17.py defaults, overridable
-on the left panel.
+SNOW17 params: ALL 8 EF5 parameters (uadj/mbase/mfmax/mfmin/tipm/nmf/plwhc/scf)
+come as calibrated 0.1° CONUS grids from CREST_data param/snow17/v1/ — the
+"snow17_conus_operational_v1" set (differentiable Snow-17 vs SNODAS SWE,
+WY2010-2024; see the README in that folder). Scalars are ×1.0 multipliers on
+the grids (advanced-panel overrides scale them); if a grid can't be clipped
+(outside CONUS / network), that parameter falls back to an absolute physical
+default. The set also ships pxtemp, which EF5's SNOW17 does not accept — skipped.
 """
 from __future__ import annotations
 
@@ -20,27 +23,38 @@ import numpy as np
 
 SNOW_THRESHOLD_C = float(os.environ.get("CREST_SNOW_TEMP_C", "1.0"))
 
-# scalar defaults (gridded ones are multipliers=1.0; others are absolute values)
-SNOW_DEFAULTS = {"uadj": 10.0, "mbase": -0.8, "mfmax": 1.0, "mfmin": 1.0,
-                 "tipm": 1.0, "nmf": 1.0, "plwhc": 0.10, "scf": 1.0}
+# all 8 params gridded -> scalars are ×1.0 multipliers on the grids
+SNOW_DEFAULTS = {"uadj": 1.0, "mbase": 1.0, "mfmax": 1.0, "mfmin": 1.0,
+                 "tipm": 1.0, "nmf": 1.0, "plwhc": 1.0, "scf": 1.0}
+# absolute fallbacks (mid-range of the calibrated set) for params whose grid
+# could not be clipped — a bare multiplier of 1.0 would be nonsense then
+SNOW_ABS_FALLBACK = {"uadj": 0.10, "mbase": 0.3, "mfmax": 1.2, "mfmin": 0.2,
+                     "tipm": 0.3, "nmf": 0.15, "plwhc": 0.10, "scf": 1.0}
+_V1 = "param/snow17/v1"
 SNOW_GRID_COGS = {
-    "mfmax_grid": "param/snow17/mfmax_usa.tif",
-    "mfmin_grid": "param/snow17/mfmin_usa.tif",
-    "nmf_grid": "param/snow17/nmf_usa.tif",
-    "tipm_grid": "param/snow17/tipm_usa.tif",
+    f"{p}_grid": f"{_V1}/{p}_conus_0p1deg.tif"
+    for p in ("uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "scf")
 }
 _RESOLVE = "https://huggingface.co/datasets/vincewin/CREST_data/resolve/main"
 
 
-def snow_params(overrides: dict | None = None) -> dict:
+def snow_params(overrides: dict | None = None, gridded=None) -> dict:
+    """Scalars for the control file. `gridded` = the grid keys that actually
+    clipped (from clip_snow_grids) — params without a grid get the absolute
+    fallback instead of a bare 1.0 multiplier."""
     p = dict(SNOW_DEFAULTS)
+    if gridded is not None:
+        have = {k[:-5] for k in gridded}              # "uadj_grid" -> "uadj"
+        for k in p:
+            if k not in have:
+                p[k] = SNOW_ABS_FALLBACK[k]
     if overrides:
         p.update({k: float(v) for k, v in overrides.items() if k in p})
     return p
 
 
 def clip_snow_grids(bbox, out_dir: str, unsafe_ssl: bool | None = None) -> dict:
-    """Clip the 4 SNOW17 COGs to the basin. Returns {control_key: local_path}."""
+    """Clip the 8 SNOW17 v1 grids to the basin. Returns {control_key: local_path}."""
     import rasterio
     from rasterio.windows import from_bounds
     if unsafe_ssl is None:
