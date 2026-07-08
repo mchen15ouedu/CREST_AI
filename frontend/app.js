@@ -974,7 +974,39 @@ async function initAuth() {
     const pic = d.user.picture ? `<img src="${d.user.picture}" alt="">` : "👤";
     el.innerHTML = `<button class="tb-btn" id="auth-btn">${pic} ${escapeHtml(d.user.name || d.user.username)}</button>`;
     document.getElementById("auth-btn").onclick = () => openProfile(d);
+    zoomToUserLocation();             // registered-user benefit: open at home
   } catch (_) {}
+}
+
+// ---- registered-user benefit: auto-zoom to the user's location ------------
+// On open, signed-in users land on their own area with the nearby USGS gauge
+// pins already visible — no HUC8 clicking needed. Falls back silently to the
+// HUC8 guide flow when the browser denies/lacks geolocation (also the case
+// inside HF's Space iframe unless it grants the geolocation permission —
+// the direct *.hf.space URL always prompts normally).
+const HOME_VIEW = { lat: 39, lon: -98, zoom: 5 };   // the initial setView above
+function mapUntouched() {
+  const c = map.getCenter();
+  return map.getZoom() === HOME_VIEW.zoom &&
+         Math.abs(c.lat - HOME_VIEW.lat) < 0.01 && Math.abs(c.lng - HOME_VIEW.lon) < 0.01;
+}
+function zoomToUserLocation() {
+  if (!("geolocation" in navigator)) return;
+  navigator.geolocation.getCurrentPosition((pos) => {
+    const lat = pos.coords.latitude, lon = pos.coords.longitude;
+    // don't fight a restored/running simulation or a map the user already moved
+    if (currentSim || simRunning || !mapUntouched()) return;
+    if (lat < 24 || lat > 50 || lon < -125 || lon > -66) return;  // outside CONUS
+    // no animation: at app open a direct jump beats a cross-country fly-in
+    // (and animated zooms can stall in throttled/background tabs)
+    map.setView([lat, lon], PIN_ZOOM + 1, { animate: false });  // >= PIN_ZOOM -> pins load
+    L.circleMarker([lat, lon], { radius: 7, color: "#ffd23f", weight: 2,
+                                 fillColor: "#ffd23f", fillOpacity: 0.45, pane: "markerPane" })
+      .bindTooltip("📍 you are here").addTo(map);
+    addMsg("📍 Welcome back — zoomed to your area, with the USGS gauges around you " +
+           "on the map. Click a pin to select it, or just describe a flood event.", "status");
+  }, () => { /* denied / unavailable -> normal HUC8 guide flow */ },
+  { maximumAge: 600000, timeout: 8000 });
 }
 
 function openProfile(d) {
