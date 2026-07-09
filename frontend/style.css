@@ -109,6 +109,23 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 #right-panel .stat .k { font-size: 11px; color: #8fa3b3; }
 #right-panel .stat .v { font-size: 15px; font-weight: 600; }
 #right-panel .plot { height: 260px; }
+/* expand-to-modal affordance on the small hydrograph */
+.plot-wrap { position: relative; }
+.plot-expand { position: absolute; top: 2px; right: 2px; z-index: 8;
+  background: rgba(13,20,28,.85); border: 1px solid #2a3a49; border-radius: 6px;
+  color: #9fc3dd; font-size: 14px; line-height: 1; padding: 4px 7px; cursor: pointer; }
+.plot-expand:hover { color: #fff; border-color: #4cc9a0; }
+/* clicked-timestep readout (small panel + modal share the style) */
+.readout { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+.readout .ro { background: #0d141c; border: 1px solid #223; border-radius: 6px;
+  padding: 4px 8px; font-size: 11px; color: #8fa3b3; }
+.readout .ro b { display: block; font-size: 13px; color: #e8eef4; font-weight: 600; }
+.readout .ro.t { border-color: #4cc9a0; color: #7fd4b0; }
+/* enlarged hydrograph modal */
+.hydro-card { width: min(940px, 94vw); }
+#hm-plot { height: min(58vh, 520px); padding: 6px 10px 0; }
+#hm-readout { padding: 0 16px; }
+.hm-hint { padding: 6px 16px 12px; margin: 0; }
 #right-panel .report { margin-top: 10px; font-size: 13px; line-height: 1.5; color: #cfe0ee; }
 #right-panel .rp-h { font-size: 12px; font-weight: 600; color: #7fd4b0; margin-bottom: 4px; }
 #right-panel .muted { color: #8fa3b3; font-size: 12px; padding: 20px 4px; text-align: center; }

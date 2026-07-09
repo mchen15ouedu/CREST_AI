@@ -418,6 +418,8 @@ async function simulate() {
   ids.forEach((id) => { simHydro[id] = []; gaugeState[id] = "running"; delete gaugeResult[id]; });
   renderTabs();
   if (ids.length && !panelGauge) focusGauge(ids[0]);
+  else if (ids.includes(panelGauge)) renderHydro(panelGauge);  // honest "run in
+  // progress" placeholder instead of silently keeping the previous run's plot
   if (aiInfo) {
     initProgress(ids);
     fetchEventInfo();
@@ -707,6 +709,7 @@ function resetAnim() {
   Object.values(overlays).forEach((o) => q2dGroup.removeLayer(o));
   Object.keys(overlays).forEach((k) => delete overlays[k]);
   document.getElementById("q-legend").classList.add("hidden");
+  clearTimestep();                  // stale readout/marker from the previous run
 }
 
 function showAnim() {
@@ -715,16 +718,35 @@ function showAnim() {
   document.getElementById("anim-slider").max = String(animMax);
 }
 
-function setFrame(idx) {
+// scrubber label: the frame's real datetime; falls back to a time computed
+// from the run window, and only then to a bare step number
+function simTimeAt(i) {
+  if (!lastSim || !lastSim.tStart) return null;
+  const steps = Math.max(1, (lastSim.expectedSteps || 1) - 1);
+  const ms = new Date(lastSim.tStart + "Z").getTime() + i * (lastSim.hours * 3600e3) / steps;
+  return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+}
+function frameLabel(i) {
+  return animTimes[i] || simTimeAt(i) || `#${i + 1}`;
+}
+
+function setFrame(idx, opts) {
   animIdx = Math.max(0, Math.min(animMax, idx | 0));
   document.getElementById("anim-slider").value = String(animIdx);
-  document.getElementById("anim-time").textContent = animTimes[animIdx] || `#${animIdx + 1}`;
+  const label = frameLabel(animIdx);
+  document.getElementById("anim-time").textContent = label;
   Object.entries(gaugeFrames).forEach(([gid, info]) => {
     const i = Math.min(animIdx, info.n - 1);
     const url = `/api/frame/${currentSim}/${gid}/${i}.png`;
     if (overlays[gid]) { overlays[gid].setUrl(url); if (info.bounds) overlays[gid].setBounds(info.bounds); }
     else if (info.bounds) addOverlay(gid, url, info.bounds);
   });
+  // the hydrograph mirrors the map: scrubbing moves the marker + readout too
+  if (!(opts && opts.keepMarker) && label[0] !== "#" && panelGauge) {
+    hydroSelTime = label;
+    updateHydroMarker(label);
+    renderReadout(panelGauge, label);
+  }
 }
 
 function stepFrame() { setFrame(animIdx >= animMax ? 0 : animIdx + 1); }
@@ -772,6 +794,7 @@ function renderTabs() {
 }
 
 function focusGauge(id) {
+  if (panelGauge !== id) clearTimestep();      // readout/marker belong to the old gauge
   panelGauge = id;
   const g = gaugeData[id];
   document.getElementById("right-panel").classList.remove("hidden");
@@ -813,29 +836,178 @@ function renderReport(id) {
   }
 }
 
-function renderHydro(id) {
-  const rows = simHydro[id] || [];
-  const el = document.getElementById("rp-hydro");
-  if (!rows.length) { el.innerHTML = '<div class="muted">Select a gauge and run a simulation to see its hydrograph.</div>'; return; }
-  if (el.querySelector(".muted")) el.innerHTML = "";     // drop placeholder before plotting
+let hydroSelTime = null;            // clicked timestep (marker + readout + 2-D sync)
+
+function _hydroMarker(t) {
+  return { type: "line", x0: t, x1: t, y0: 0, y1: 1, yref: "paper",
+           line: { color: "#ffd23f", width: 1.4, dash: "dot" } };
+}
+
+function _hydroFig(rows, big) {
   const x = rows.map((r) => r.time), sim = rows.map((r) => r.sim_q),
     obs = rows.map((r) => r.obs_q), pr = rows.map((r) => r.precip || 0);
   const maxp = Math.max(0.1, ...pr);
-  Plotly.react(el, [
+  const traces = [
     { x, y: pr, name: "Precip", type: "bar", marker: { color: "#5b9bd5" }, yaxis: "y2", opacity: 0.7 },
     { x, y: obs, name: "Obs Q", mode: "lines",
-      line: { color: "#f4f4f4", width: 1.3, shape: "spline", smoothing: 0.8 } },
+      line: { color: "#f4f4f4", width: big ? 1.6 : 1.3, shape: "spline", smoothing: 0.8 } },
     { x, y: sim, name: "Sim Q", mode: "lines",
-      line: { color: "#4cc9a0", width: 1.8, shape: "spline", smoothing: 0.8 } },
-  ], {
-    height: 250, margin: { l: 46, r: 46, t: 12, b: 30 }, bargap: 0,
-    showlegend: true, legend: { orientation: "h", y: 1.18, font: { size: 9 } },
-    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)", font: { color: "#cdd9e2", size: 10 },
+      line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } },
+  ];
+  const layout = {
+    margin: big ? { l: 56, r: 56, t: 18, b: 40 } : { l: 46, r: 46, t: 12, b: 30 },
+    bargap: 0, showlegend: true,
+    legend: { orientation: "h", y: big ? 1.08 : 1.18, font: { size: big ? 11 : 9 } },
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+    font: { color: "#cdd9e2", size: big ? 12 : 10 },
     xaxis: { gridcolor: "rgba(255,255,255,.06)" },
     yaxis: { title: "Q m³/s", rangemode: "tozero", gridcolor: "rgba(255,255,255,.06)" },
     yaxis2: { overlaying: "y", side: "right", range: [maxp * 3.4, 0], showgrid: false },
-  }, { displayModeBar: false, responsive: true });
+    shapes: hydroSelTime ? [_hydroMarker(hydroSelTime)] : [],
+    hovermode: "x",
+  };
+  if (!big) layout.height = 250;
+  return { traces, layout };
 }
+
+function _bindHydroClick(el, id) {
+  if (!el.on) return;                            // Plotly attaches .on after first plot
+  if (el.removeAllListeners) el.removeAllListeners("plotly_click");
+  el.on("plotly_click", (ev) => {
+    const p = ev.points && ev.points[0];
+    if (p) selectTimestep(id, String(p.x));
+  });
+}
+
+function renderHydro(id) {
+  const rows = simHydro[id] || [];
+  const el = document.getElementById("rp-hydro");
+  const xp = document.getElementById("rp-expand");
+  if (!rows.length) {
+    if (el.data) { try { Plotly.purge(el); } catch (_) {} }   // don't gut a live plot
+    el.innerHTML = gaugeState[id] === "running"
+      ? '<div class="muted">⏳ new run in progress — the hydrograph streams in live once ' +
+        'the model starts producing output (the warm-up runs first).</div>'
+      : '<div class="muted">Select a gauge and run a simulation to see its hydrograph.</div>';
+    xp.classList.add("hidden");
+    return;
+  }
+  if (el.querySelector(".muted")) el.innerHTML = "";     // drop placeholder before plotting
+  const { traces, layout } = _hydroFig(rows, false);
+  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
+  _bindHydroClick(el, id);
+  xp.classList.remove("hidden");
+  if (hydroModalOpen) renderHydroBig();                  // keep the big view live
+}
+
+// ---- clicked-timestep readout + hydrograph <-> 2-D map sync ---------------
+const READOUT_FIELDS = [        // row key -> label, unit, decimals
+  ["sim_q", "Sim Q", "m³/s", 1], ["obs_q", "Obs Q", "m³/s", 1],
+  ["precip", "Precip", "mm/h", 2], ["pet", "PET", "mm", 2],
+  ["sm", "Soil moisture", "%", 1], ["gw", "Groundwater", "mm", 1],
+  ["temp", "Air temp", "°C", 1], ["swe", "SWE", "mm", 1],
+  ["fast", "Fast flow", "", 3], ["slow", "Slow flow", "", 3], ["base", "Base flow", "", 3],
+];
+
+function _rowAt(id, t) {
+  const rows = simHydro[id] || [];
+  if (!rows.length) return null;
+  const tgt = Date.parse(String(t).replace(" ", "T") + "Z");
+  let best = null, bd = Infinity;
+  for (const r of rows) {
+    const d = Math.abs(Date.parse(String(r.time).replace(" ", "T") + "Z") - tgt);
+    if (d < bd) { bd = d; best = r; }
+  }
+  return best;
+}
+
+function renderReadout(id, t) {
+  const row = _rowAt(id, t);
+  ["rp-readout", "hm-readout"].forEach((eid) => {
+    const el = document.getElementById(eid);
+    if (!row) { el.classList.add("hidden"); return; }
+    const cells = [`<span class="ro t">at<b>${row.time}</b></span>`];
+    READOUT_FIELDS.forEach(([k, label, unit, dec]) => {
+      const v = row[k];
+      if (v == null || !isFinite(v)) return;
+      cells.push(`<span class="ro">${label}<b>${(+v).toFixed(dec)}${unit ? " " + unit : ""}</b></span>`);
+    });
+    el.innerHTML = cells.join("");
+    el.classList.remove("hidden");
+  });
+}
+
+function updateHydroMarker(t) {
+  const shapes = t ? [_hydroMarker(t)] : [];
+  ["rp-hydro", "hm-plot"].forEach((eid) => {
+    const el = document.getElementById(eid);
+    if (el && el.data) { try { Plotly.relayout(el, { shapes }); } catch (_) {} }
+  });
+}
+
+function selectTimestep(id, t) {
+  hydroSelTime = t;
+  renderReadout(id, t);
+  updateHydroMarker(t);
+  jumpAnimTo(t);                    // 2-D map + scrubber follow the click
+}
+
+function jumpAnimTo(t) {
+  if (animMax <= 0) return;
+  const tgt = Date.parse(String(t).replace(" ", "T") + "Z");
+  if (!isFinite(tgt)) return;
+  let best = -1, bd = Infinity;
+  for (let i = 0; i <= animMax; i++) {
+    const lbl = frameLabel(i);
+    if (!lbl || lbl[0] === "#") continue;
+    const d = Math.abs(Date.parse(lbl.replace(" ", "T") + "Z") - tgt);
+    if (d < bd) { bd = d; best = i; }
+  }
+  if (best >= 0) { stopPlay(); setFrame(best, { keepMarker: true }); }
+}
+
+function clearTimestep() {
+  hydroSelTime = null;
+  ["rp-readout", "hm-readout"].forEach((eid) => document.getElementById(eid).classList.add("hidden"));
+  updateHydroMarker(null);
+}
+
+// ---- enlarged hydrograph modal --------------------------------------------
+let hydroModalOpen = false;
+
+function renderHydroBig() {
+  const rows = simHydro[panelGauge] || [];
+  if (!rows.length) return;
+  const el = document.getElementById("hm-plot");
+  const { traces, layout } = _hydroFig(rows, true);
+  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
+  _bindHydroClick(el, panelGauge);
+  if (hydroSelTime) renderReadout(panelGauge, hydroSelTime);
+}
+
+function openHydroModal() {
+  if (!panelGauge || !(simHydro[panelGauge] || []).length) return;
+  hydroModalOpen = true;
+  const g = gaugeData[panelGauge];
+  document.getElementById("hm-title").textContent =
+    `📈 ${panelGauge}${g ? " · " + g.name : ""}`;
+  document.getElementById("hydro-modal").classList.remove("hidden");
+  renderHydroBig();
+}
+
+function closeHydroModal() {
+  hydroModalOpen = false;
+  document.getElementById("hydro-modal").classList.add("hidden");
+}
+
+document.getElementById("rp-expand").onclick = openHydroModal;
+document.getElementById("hm-close").onclick = closeHydroModal;
+document.getElementById("hydro-modal").addEventListener("click", (e) => {
+  if (e.target.id === "hydro-modal") closeHydroModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && hydroModalOpen) closeHydroModal();
+});
 
 // ---- chat routing + flexible date parsing ---------------------------------
 // tokens: 2025-07-03 · 7/3/2025 · 07/03/25 · 3 July 2025 · July 3, 2025

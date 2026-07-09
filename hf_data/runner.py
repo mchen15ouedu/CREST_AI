@@ -30,7 +30,24 @@ STALL_TIMEOUT_S = float(os.environ.get("CREST_STALL_TIMEOUT_S", str(45 * 60)))  
 # --------------------------------------------------------------------------- #
 # output readers
 # --------------------------------------------------------------------------- #
-def _parse_ts_line(header: list[str], line: str) -> dict | None:
+# extra ts.csv columns streamed for the click-a-timestep readout (header token
+# -> row key); real EF5 appends Temp/SWE when SNOW17 is on
+_EXTRA_COLS = (("pet", "pet"), ("sm", "sm"), ("groundwater", "gw"),
+               ("fast flow", "fast"), ("slow flow", "slow"), ("base flow", "base"),
+               ("temp", "temp"), ("swe", "swe"))
+
+
+def _col_map(header: list[str]) -> dict[str, int]:
+    m: dict[str, int] = {}
+    for i, h in enumerate(header):
+        hl = h.strip().lower()
+        for tok, key in _EXTRA_COLS:
+            if hl.startswith(tok) and key not in m:
+                m[key] = i
+    return m
+
+
+def _parse_ts_line(header: list[str], line: str, colmap: dict | None = None) -> dict | None:
     parts = line.rstrip("\n").split(",")
     if len(parts) < 4 or parts[0] == "Time":
         return None
@@ -39,7 +56,13 @@ def _parse_ts_line(header: list[str], line: str) -> dict | None:
             return float(x)
         except ValueError:
             return None
-    return {"time": parts[0], "sim_q": f(parts[1]), "obs_q": f(parts[2]), "precip": f(parts[3])}
+    row = {"time": parts[0], "sim_q": f(parts[1]), "obs_q": f(parts[2]), "precip": f(parts[3])}
+    for key, i in (colmap or {}).items():
+        if i < len(parts):
+            v = f(parts[i])
+            if v is not None:
+                row[key] = v
+    return row
 
 
 class _TsTail:
@@ -47,6 +70,7 @@ class _TsTail:
     def __init__(self, path: str):
         self.path = path
         self.header: list[str] | None = None
+        self.colmap: dict[str, int] = {}
         self.pos = 0
 
     def read_new(self) -> list[dict]:
@@ -63,8 +87,9 @@ class _TsTail:
         for raw in data[:nl + 1].decode("utf-8", "replace").splitlines():
             if self.header is None and raw.startswith("Time"):
                 self.header = raw.split(",")
+                self.colmap = _col_map(self.header)
                 continue
-            r = _parse_ts_line(self.header or [], raw)
+            r = _parse_ts_line(self.header or [], raw, self.colmap)
             if r:
                 rows.append(r)
         return rows
@@ -209,8 +234,10 @@ class MockEF5:
                     q = 5 + 60 * math.exp(-((k - self.n_steps * 0.4) ** 2) / (2 * (self.n_steps * 0.12) ** 2))
                     obs = q * (0.9 + 0.05 * math.sin(k / 3.0))
                     p = max(0.0, 8 * math.exp(-((k - self.n_steps * 0.3) ** 2) / (2 * 3.0 ** 2)))
+                    sm = 55 + 30 * (q - 5) / 60.0            # wets up with the pulse
+                    gw = 7.0 + 0.02 * k
                     ts.write(f"{t:%Y-%m-%d %H:%M},{q:.2f},{obs:.2f},{p:.2f},0.10,"
-                             f"75.00,7.49,0.0000,0.0000,0.6960\n")
+                             f"{sm:.2f},{gw:.2f},0.0000,0.0000,0.6960\n")
                     ts.flush()
                     if self.write_grids:
                         self._grid(t, q, np)

@@ -43,10 +43,12 @@ def hydrograph_fig(rows: list[dict], title: str = "Live hydrograph") -> go.Figur
 
 
 def _q_time_from_name(path: str) -> str:
-    m = re.search(r"q\.(\d{8,12})\.", os.path.basename(path))
+    # real EF5 names grids q.YYYYMMDD_HHUU.<model>.tif (DatedName underscore);
+    # the mock writes q.YYYYMMDDHHMM.<model>.tif — accept both
+    m = re.search(r"q\.(\d{8})_?(\d{2,4})?\.", os.path.basename(path))
     if not m:
         return ""
-    s = m.group(1)
+    s = m.group(1) + (m.group(2) or "")
     fmt = "%Y%m%d%H%M" if len(s) == 12 else ("%Y%m%d%H" if len(s) == 10 else "%Y%m%d")
     try:
         return datetime.strptime(s, fmt).strftime("%Y-%m-%d %H:%M")

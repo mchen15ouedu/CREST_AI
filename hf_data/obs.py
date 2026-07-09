@@ -9,7 +9,7 @@ EF5 populates the 'Observed' column of ts.csv, giving meaningful NSCE/CC/bias.
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import truststore
 truststore.inject_into_ssl()
@@ -21,8 +21,12 @@ _IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
 
 def fetch_usgs_discharge(site: str, t_start: datetime, t_end: datetime) -> list[tuple[datetime, float]]:
     """Observed discharge (m³/s) time series, or [] if unavailable."""
+    from datetime import timedelta
+    # pad a day each side: startDT/endDT are LOCAL dates at the gauge, but the
+    # window is UTC — the first UTC hours live on the previous local day
     params = {"sites": str(site).zfill(8), "parameterCd": "00060", "format": "json",
-              "startDT": t_start.strftime("%Y-%m-%d"), "endDT": t_end.strftime("%Y-%m-%d"),
+              "startDT": (t_start - timedelta(days=1)).strftime("%Y-%m-%d"),
+              "endDT": (t_end + timedelta(days=1)).strftime("%Y-%m-%d"),
               "siteStatus": "all"}
     r = requests.get(_IV_URL, params=params, timeout=30)
     r.raise_for_status()
@@ -37,7 +41,11 @@ def fetch_usgs_discharge(site: str, t_start: datetime, t_end: datetime) -> list[
             continue
         if cfs < 0:                                  # USGS missing sentinel (-999999)
             continue
-        dt = datetime.fromisoformat(v["dateTime"].replace("Z", "+00:00")).replace(tzinfo=None)
+        # USGS IV timestamps carry the gauge's LOCAL utc-offset (e.g.
+        # "...T01:15:00.000-05:00") — convert to UTC before dropping the tz,
+        # or the obs are shifted 4-10 h against the UTC forcing + simulation
+        dt = (datetime.fromisoformat(v["dateTime"].replace("Z", "+00:00"))
+              .astimezone(timezone.utc).replace(tzinfo=None))
         out.append((dt, cfs * CFS_TO_CMS))
     return out
 
