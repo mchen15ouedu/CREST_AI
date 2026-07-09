@@ -165,11 +165,20 @@
   <!-- enlarged hydrograph modal (click the small plot's ⤢ to open) -->
   <div id="hydro-modal" class="modal hidden">
     <div class="modal-card hydro-card">
-      <div class="modal-head"><span id="hm-title">Hydrograph</span><button id="hm-close">✕</button></div>
-      <div id="hm-plot"></div>
+      <div class="modal-head">
+        <span id="hm-title">Hydrograph</span>
+        <span class="hm-zoom">
+          <button id="hm-zout" title="Zoom out">−</button>
+          <span id="hm-zlvl">100%</span>
+          <button id="hm-zin" title="Zoom in — the plot grows and scroll bars appear">+</button>
+        </span>
+        <button id="hm-close">✕</button>
+      </div>
+      <div id="hm-scroll"><div id="hm-plot"></div></div>
       <div id="hm-readout" class="readout hidden"></div>
       <p class="pm-sub hm-hint">Click anywhere on the curves to inspect that time step —
-        the values below and the 2-D streamflow map follow your click.</p>
+        the values below and the 2-D streamflow map follow your click. Use −/+ to magnify;
+        scroll to pan when zoomed in.</p>
     </div>
   </div>
 

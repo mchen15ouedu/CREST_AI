@@ -987,20 +987,47 @@ function clearTimestep() {
 
 // ---- enlarged hydrograph modal --------------------------------------------
 let hydroModalOpen = false;
+let hmZoom = 1;                     // canvas magnification (1x..5x)
+let hmBaseW = 0;                    // scroll-container width at 1x (scrollbar-free)
+const HM_ZMIN = 1, HM_ZMAX = 5, HM_ZSTEP = 0.5;
+
+function _hmBaseH() { return Math.min(Math.round(window.innerHeight * 0.56), 520); }
+
+function applyHmZoom() {
+  const el = document.getElementById("hm-plot");
+  if (!el.data) return;
+  el.style.width = Math.round(hmBaseW * hmZoom) + "px";
+  el.style.height = Math.round(_hmBaseH() * Math.max(1, (hmZoom + 1) / 2)) + "px";
+  try { Plotly.Plots.resize(el); } catch (_) {}   // grow the canvas -> #hm-scroll
+  document.getElementById("hm-zlvl").textContent = Math.round(hmZoom * 100) + "%";
+  document.getElementById("hm-zout").disabled = hmZoom <= HM_ZMIN;
+  document.getElementById("hm-zin").disabled = hmZoom >= HM_ZMAX;
+}
+
+function hmZoomBy(delta) {
+  hmZoom = Math.min(HM_ZMAX, Math.max(HM_ZMIN, Math.round((hmZoom + delta) * 2) / 2));
+  applyHmZoom();
+}
 
 function renderHydroBig() {
   const rows = simHydro[panelGauge] || [];
   if (!rows.length) return;
   const el = document.getElementById("hm-plot");
+  if (!hmBaseW) hmBaseW = document.getElementById("hm-scroll").clientWidth - 2;
+  el.style.width = Math.round(hmBaseW * hmZoom) + "px";
+  el.style.height = Math.round(_hmBaseH() * Math.max(1, (hmZoom + 1) / 2)) + "px";
   const { traces, layout } = _hydroFig(rows, true);
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
   _bindHydroClick(el, panelGauge);
+  applyHmZoom();
   if (hydroSelTime) renderReadout(panelGauge, hydroSelTime);
 }
 
 function openHydroModal() {
   if (!panelGauge || !(simHydro[panelGauge] || []).length) return;
   hydroModalOpen = true;
+  hmZoom = 1;                                   // start at 100% each time
+  hmBaseW = 0;                                  // re-measure (window may have resized)
   const g = gaugeData[panelGauge];
   document.getElementById("hm-title").textContent =
     `📈 ${panelGauge}${g ? " · " + g.name : ""}`;
@@ -1014,6 +1041,8 @@ function closeHydroModal() {
 }
 
 document.getElementById("rp-expand").onclick = openHydroModal;
+document.getElementById("hm-zin").onclick = () => hmZoomBy(+HM_ZSTEP);
+document.getElementById("hm-zout").onclick = () => hmZoomBy(-HM_ZSTEP);
 document.getElementById("hm-close").onclick = closeHydroModal;
 document.getElementById("hydro-modal").addEventListener("click", (e) => {
   if (e.target.id === "hydro-modal") closeHydroModal();
