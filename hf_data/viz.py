@@ -89,6 +89,9 @@ def q2d_fig(tif_path: str, title: str | None = None) -> go.Figure:
 # to the USGS observed baseflow at the outlet cell when observations exist.
 # --------------------------------------------------------------------------- #
 NET_MIN = float(os.environ.get("CREST_Q2D_MIN", "0.1"))   # m³/s — a cell that ever exceeds this is drawn
+SHOW_MIN = float(os.environ.get("CREST_Q2D_SHOW_MIN", "0.001"))  # m³/s — but in frames
+# where its CURRENT flow is below this it stays transparent (otherwise every
+# hillslope cell that got wet once paints the whole basin grey between events)
 _BASE_FLOOR = NET_MIN / 5.0                               # avoid absurd ratios on trickle cells
 _R_LO, _R_HI = -0.5, 1.7                                  # color scale spans log10(q/baseflow)
 _RAMP = [(0.00, "#59626c"), (0.14, "#7e8a95"),            # r≈0.3–0.6  dry — grey
@@ -124,7 +127,7 @@ def _render_ratio(a, base, mask) -> bytes:
     r = a / np.maximum(base, _BASE_FLOOR)
     with np.errstate(invalid="ignore", divide="ignore"):
         x = (np.log10(np.clip(r, 10 ** _R_LO, 10 ** _R_HI)) - _R_LO) / (_R_HI - _R_LO)
-    draw = mask & np.isfinite(x)
+    draw = mask & np.isfinite(x) & (np.nan_to_num(a, nan=0.0) >= SHOW_MIN)
     rgba = _q_cmap()(np.where(draw, x, 0.0))
     rgba[..., 3] = np.where(draw, 0.9, 0.0)
     img = Image.fromarray((rgba * 255).astype("uint8"), "RGBA")
@@ -208,7 +211,7 @@ def q2d_frames(tif_paths: list[str], baseflow_cms: float | None = None):
 # (frames rendered once per (gauge, model, window); invalidated on param change)
 # --------------------------------------------------------------------------- #
 _WIN_FMT = "%Y-%m-%d %H:%M"
-_FRAMES_VER = 2                    # bump when the render style changes — stale
+_FRAMES_VER = 3                    # bump when the render style changes — stale
                                    # caches are rejected and re-rendered
 
 
