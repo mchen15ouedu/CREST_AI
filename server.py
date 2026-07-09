@@ -356,7 +356,9 @@ def _save_history(username: str, entry: dict):
         json.dump(prof, fh, indent=1)
 
 
-MAX_SIM_HOURS = int(os.environ.get("CREST_MAX_SIM_HOURS", "2160"))   # 90 days
+# generous ceiling: a full water year fits; only guards the shared demo CPU
+# against extreme multi-year requests (0 disables the cap entirely)
+MAX_SIM_HOURS = int(os.environ.get("CREST_MAX_SIM_HOURS", "8784"))   # 366 days
 
 
 @app.post("/api/simulate")
@@ -370,9 +372,9 @@ def api_simulate(req: SimRequest, request: Request):
     if t1 <= t0:                                       # nonsensical window
         t1 = t0 + timedelta(hours=req.hours)
         warnings.append(f"End time was not after the start — using {req.hours} h instead.")
-    if (t1 - t0) > timedelta(hours=MAX_SIM_HOURS):     # demo-hardware sanity cap
-        t1 = t0 + timedelta(hours=MAX_SIM_HOURS)
-        warnings.append(f"Window capped at {MAX_SIM_HOURS // 24} days for this demo "
+    if MAX_SIM_HOURS > 0 and (t1 - t0) > timedelta(hours=MAX_SIM_HOURS):
+        t1 = t0 + timedelta(hours=MAX_SIM_HOURS)       # shared-CPU sanity ceiling
+        warnings.append(f"Simulation window capped at {MAX_SIM_HOURS // 24} days "
                         f"(now ends {t1:%Y-%m-%d %H:%M}).")
     # supersede the caller's previous run: a stale in-flight job would otherwise
     # hold the per-gauge lock and the new run would queue behind it indefinitely
