@@ -505,7 +505,20 @@ function initProgress(ids) {
   const btn = stopRow.querySelector("button");
   btn.onclick = async () => {
     btn.disabled = true; btn.textContent = "⏹ stopping…";
-    try { await fetch(`/api/cancel/${currentSim}`, { method: "POST" }); } catch (_) {}
+    // immediate, honest feedback on every unfinished gauge — the workers stop
+    // at the next checkpoint (each one flips to "stopped ⏹" as it exits)
+    Object.entries(progressEls).forEach(([g2, p]) => {
+      if (gaugeState[g2] === "running") p.stage.textContent = "⏹ stopping — finishing the current step…";
+    });
+    addMsg("⏹ Stop requested — each gauge halts at its next checkpoint (a few seconds; " +
+           "up to ~a minute if one is mid-download). You can start a new simulation " +
+           "right away — it takes over automatically.", "status");
+    try {
+      await fetch(`/api/cancel/${currentSim}`, { method: "POST" });
+    } catch (_) {
+      btn.disabled = false; btn.textContent = "⏹ Stop";   // cancel didn't reach the server
+      addMsg("⚠️ Stop request failed to reach the server — try again.", "status");
+    }
   };
   progressBox.appendChild(stopRow);
   log.scrollTop = log.scrollHeight;

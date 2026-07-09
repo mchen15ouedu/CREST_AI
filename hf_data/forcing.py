@@ -148,7 +148,10 @@ def store_dir(var: str, bbox) -> str:
 
 
 def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir: str,
-                    repo: str = HF_REPO, cache_dir: str | None = None) -> ForcingResult:
+                    repo: str = HF_REPO, cache_dir: str | None = None,
+                    cancel=None) -> ForcingResult:
+    """`cancel` (threading.Event) aborts between tar downloads / member clips —
+    a Stop must not sit behind a year of forcing downloads."""
     cfg = VARS[var]
     os.makedirs(out_dir, exist_ok=True)
     res = ForcingResult(var=var, out_dir=out_dir)
@@ -163,6 +166,8 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
         by_month.setdefault((t.year, t.month), []).append(t)
 
     for (year, month), steps in sorted(by_month.items()):
+        if cancel is not None and cancel.is_set():
+            return res                           # partial store stays valid (merge)
         ref = steps[0]
         try:                                    # prefer the small month-tar
             local_tar = hf_hub_download(repo, ref.strftime(cfg.month_fmt),
@@ -173,6 +178,8 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
         with tarfile.open(local_tar) as tf:
             names = set(tf.getnames())
             for t in steps:
+                if cancel is not None and cancel.is_set():
+                    return res
                 member = t.strftime(cfg.member_fmt)
                 if member not in names:                # NARR-derived members use
                     member = t.strftime(cfg.out_fmt)   # the generic name

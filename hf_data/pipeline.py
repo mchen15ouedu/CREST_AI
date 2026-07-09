@@ -276,6 +276,14 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     basic_dir = basic.store_dir(bbox)
     param_dir = os.path.join(basic_dir, "param")
 
+    def _stopped():                 # user hit Stop / superseded — checked at every
+        return cancel is not None and cancel.is_set()   # long stage boundary
+
+    if _stopped():                                       # stopped while queued
+        yield ("status", "⏹ stopped")
+        yield ("done", {"returncode": -9, "cancelled": True})
+        return
+
     # --- terrain first: the upstream-gauge scan below needs the clipped grids ---
     yield ("status", f"clip DEM/DDM/FAM · model {model.upper()}")
     clip = basic.clip_basic_data(bbox, basic_dir)
@@ -293,6 +301,11 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                          f"fdir={vals['fdir']:.0f} facc={vals['facc']:.0f}")
     except Exception as e:
         yield ("status", f"(clip sample failed: {e})")
+
+    if _stopped():
+        yield ("status", "⏹ stopped")
+        yield ("done", {"returncode": -9, "cancelled": True})
+        return
 
     # --- upstream/interior gauges -> boundary conditions (data assimilation) ---
     bc_gauges = []
@@ -575,15 +588,23 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         n_days = max(1, int((run_end - f0).total_seconds() // 86400))
         yield ("status", f"🌧 preparing rainfall (MRMS) forcing from the archive — "
                          f"{n_days} day(s) incl. warm-up…")
-        fr = forcing.prepare_forcing("mrms", bbox, f0, run_end, mrms_dir)
+        fr = forcing.prepare_forcing("mrms", bbox, f0, run_end, mrms_dir, cancel=cancel)
         if fr.reused:
             yield ("status", f"♻️ forcing store: reused {fr.reused} MRMS timestep(s), "
                              f"prepared {len(fr.written)} new")
+        if _stopped():
+            yield ("status", "⏹ stopped")
+            yield ("done", {"returncode": -9, "cancelled": True})
+            return
         yield ("status", "🌡 preparing PET forcing…")
-        forcing.prepare_forcing("pet", bbox, f0, run_end, pet_dir)
-        if snow_on:
+        forcing.prepare_forcing("pet", bbox, f0, run_end, pet_dir, cancel=cancel)
+        if snow_on and not _stopped():
             yield ("status", "❄ preparing temperature forcing (snow module)…")
-            forcing.prepare_forcing("temp", bbox, f0, run_end, temp_dir)
+            forcing.prepare_forcing("temp", bbox, f0, run_end, temp_dir, cancel=cancel)
+        if _stopped():
+            yield ("status", "⏹ stopped")
+            yield ("done", {"returncode": -9, "cancelled": True})
+            return
 
     # warm-up: separate blocking ef5 process (own control); its state files at
     # run_start feed the Simu run below (two tasks in one process segfault)

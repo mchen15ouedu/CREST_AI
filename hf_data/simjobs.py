@@ -59,6 +59,10 @@ class SimJob:
         self.done.set()
 
     def _run_one(self, gid):
+        if self.cancel.is_set():                 # stopped while still queued
+            self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -9,
+                        "n": len(self.hydro.get(gid, []))})
+            return
         try:
             for kind, payload in run_gauge(
                     gid, self.t_start, self.t_end,
