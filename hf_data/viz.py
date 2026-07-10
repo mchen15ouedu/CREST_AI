@@ -176,11 +176,15 @@ def obs_baseflow(rows: list[dict]) -> float | None:
     return float(obs[int(0.25 * (len(obs) - 1))])
 
 
-def q2d_frames(tif_paths: list[str], baseflow_cms: float | None = None):
+def q2d_frames(tif_paths: list[str], baseflow_cms: float | None = None,
+               pace_s: float = 0.0):
     """Render a whole time series of q.*.tif with ONE fixed baseline (stable
     colors while scrubbing). Per-cell baseline = window minimum, scaled so the
     outlet cell's baseline matches the USGS observed baseflow when given.
+    `pace_s` sleeps between frames — on the shared 2-vCPU Space this render
+    burst would otherwise starve gauges that are still simulating.
     Returns (frames, peak_q) with frames = [(png_bytes, bounds, time_label), ...]."""
+    import time as _time
     cellmin = cellmax = None
     for p in tif_paths:                              # pass 1: per-cell min/max
         a, _ = _read_q(p)
@@ -189,6 +193,8 @@ def q2d_frames(tif_paths: list[str], baseflow_cms: float | None = None):
         else:
             cellmin = np.fmin(cellmin, a)
             cellmax = np.fmax(cellmax, a)
+        if pace_s:
+            _time.sleep(pace_s / 2)
     if cellmin is None:
         return [], 0.0
     mask = np.isfinite(cellmax) & (cellmax >= NET_MIN)
@@ -205,6 +211,8 @@ def q2d_frames(tif_paths: list[str], baseflow_cms: float | None = None):
         a, bounds = _read_q(p)
         png = _render_ratio(a, base, mask & np.isfinite(a))
         frames.append((png, bounds, _q_time_from_name(p)))
+        if pace_s:
+            _time.sleep(pace_s)
     return frames, peak
 
 

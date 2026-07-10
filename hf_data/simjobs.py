@@ -21,6 +21,11 @@ from hf_data.pipeline import run_gauge
 MAX_CONCURRENT = int(os.environ.get("CREST_MAX_CONCURRENT", "4"))
 MAX_SIMS = int(os.environ.get("CREST_MAX_SIMS", "10"))
 USE_MOCK = os.environ.get("CREST_DEMO_MOCK", "1") == "1"
+# rendering shares 2 vCPUs with the EF5 processes — keep it off their backs:
+# live overlays render at most once per LIVE_RENDER_MIN_S per gauge, and the
+# end-of-run animation build paces itself while other gauges still simulate
+LIVE_RENDER_MIN_S = float(os.environ.get("CREST_LIVE_RENDER_S", "2.0"))
+FRAME_PACE_S = float(os.environ.get("CREST_FRAME_PACE_S", "0.01"))
 
 _JOBS: dict[str, "SimJob"] = {}
 
@@ -45,6 +50,8 @@ class SimJob:
         self.cancel = threading.Event()          # user stop / superseded by a new run
         self._q2d_err: set = set()               # gauges with a reported render error
         self._q2d_min: dict = {}                 # gid -> running per-cell min (live baseline)
+        self._q2d_last: dict = {}                # gid -> last live-overlay render time
+        self._finished: set = set()              # gauges whose run has ended
 
     def _emit(self, ev: dict):
         self.events.append(ev)               # append-only; readers poll by index
@@ -60,6 +67,7 @@ class SimJob:
 
     def _run_one(self, gid):
         if self.cancel.is_set():                 # stopped while still queued
+            self._finished.add(gid)
             self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -9,
                         "n": len(self.hydro.get(gid, []))})
             return
@@ -85,6 +93,13 @@ class SimJob:
                     self._emit({"kind": "hydro", "gauge_id": gid, "rows": payload["rows"]})
                 elif kind == "q2d":
                     self.q_paths.setdefault(gid, []).append(payload["path"])
+                    # throttle: rendering EVERY timestep starves the EF5
+                    # processes on the shared CPU; all frames are still in
+                    # q_paths for the full end-of-run animation
+                    now = time.time()
+                    if now - self._q2d_last.get(gid, 0.0) < LIVE_RENDER_MIN_S:
+                        continue
+                    self._q2d_last[gid] = now
                     try:
                         png, bounds, self._q2d_min[gid] = viz.q2d_live(
                             payload["path"], self._q2d_min.get(gid))
@@ -98,6 +113,7 @@ class SimJob:
                                         "msg": f"⚠️ 2-D frame render failed: {e}"})
                 elif kind == "done":
                     rc = payload.get("returncode")
+                    self._finished.add(gid)      # frees the timeline pacing check
                     if payload.get("cancelled"):
                         # user stop / superseded — not an error, nothing to render
                         self._emit({"kind": "gauge_done", "gauge_id": gid,
@@ -120,6 +136,7 @@ class SimJob:
         except Exception as e:
             from hf_data import crashlog
             crashlog.capture(f"sim:{gid}", e, sim_id=self.id)
+            self._finished.add(gid)
             self._emit({"kind": "status", "gauge_id": gid, "msg": f"⚠️ {e}"})
             self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -1})
 
@@ -132,7 +149,12 @@ class SimJob:
         try:
             # anchor the color scale to the gauge's real (USGS-observed) baseflow
             baseflow = viz.obs_baseflow(self.hydro.get(gid, []))
-            frames, vmax = viz.q2d_frames(paths, baseflow_cms=baseflow)
+            # pace the render burst while sibling gauges are still simulating —
+            # on 2 vCPUs an unpaced 1000-frame build freezes their hydrographs
+            others_running = any(g != gid and g not in self._finished
+                                 for g in self.gauge_ids)
+            frames, vmax = viz.q2d_frames(paths, baseflow_cms=baseflow,
+                                          pace_s=FRAME_PACE_S if others_running else 0.0)
             self.frames[gid] = frames
             self._emit({"kind": "timeline", "gauge_id": gid, "n": len(frames),
                         "times": [f[2] for f in frames],
