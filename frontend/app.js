@@ -846,9 +846,47 @@ function renderReport(id) {
   el.innerHTML = "";
   const res = gaugeResult[id];
   if (res && res.report) {
-    const h = document.createElement("div"); h.className = "rp-h"; h.textContent = "📄 Report";
+    const h = document.createElement("div"); h.className = "rp-h";
+    h.textContent = "📄 Report";
+    // full report: the AQUAH report-writer agent builds a publication-style
+    // PDF (figures + interpretation) on the server; first click takes ~1 min
+    const dl = document.createElement("button");
+    dl.className = "rp-dl";
+    dl.textContent = "⬇ PDF report";
+    dl.title = "Generate + download the full report (AI-written, with figures). " +
+               "The first request takes about a minute.";
+    dl.onclick = () => downloadReport(id, dl);
+    h.appendChild(dl);
     const p = document.createElement("div"); p.textContent = res.report;
     el.append(h, p);
+  }
+}
+
+async function downloadReport(gid, btn) {
+  if (!currentSim) return;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "⏳ writing report…";
+  try {
+    const r = await fetch(`/api/report/${currentSim}/${gid}`);
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.error || r.statusText);
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get("Content-Disposition") || "";
+    const m = /filename="?([^";]+)"?/.exec(cd);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : `CREST_report_${gid}.pdf`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    btn.textContent = "✓ downloaded";
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 4000);
+  } catch (e) {
+    btn.textContent = orig;
+    btn.disabled = false;
+    addMsg(`⚠️ Report for <b>${gid}</b>: ${escapeHtml(e.message)}`, "status");
   }
 }
 

@@ -111,6 +111,30 @@ def api_datacleanup():
     return rep
 
 
+@app.get("/api/report/{sim_id}/{gauge_id}")
+def api_report(sim_id: str, gauge_id: str):
+    """Downloadable simulation report (AQUAH report-writer agent -> PDF).
+    Generated on first request (LLM + pandoc, ~30-90 s), then cached."""
+    job = simjobs.get_job(sim_id)
+    if job is None:
+        return JSONResponse({"error": "simulation not found (it may have been "
+                                      "restarted away) — re-run it, then download "
+                                      "the report"}, status_code=404)
+    if not (job.hydro.get(gauge_id) or []):
+        return JSONResponse({"error": "no results for this gauge yet"}, status_code=409)
+    from hf_data import report
+    try:
+        path = report.generate(job, gauge_id)
+    except Exception as e:
+        crashlog.capture("report", e, sim_id=sim_id, gauge=gauge_id)
+        return JSONResponse({"error": f"report generation failed: {e}"}, status_code=500)
+    ext = os.path.splitext(path)[1]
+    return FileResponse(
+        path,
+        media_type="application/pdf" if ext == ".pdf" else "text/markdown",
+        filename=f"CREST_report_{gauge_id}_{job.t_start:%Y%m%d}{ext}")
+
+
 @app.get("/api/persist")
 def api_persist_status():
     """Durable-cache sync status (private-dataset mirror)."""

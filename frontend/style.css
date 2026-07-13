@@ -76,6 +76,12 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 .k-step-row input { width: 64px; }
 #feedback-modal textarea { resize: vertical; }
 
+/* PDF report download (right panel report header) */
+.rp-dl { float: right; padding: 3px 10px; border: 1px solid #2a3a49; background: #142230;
+  color: #e8eef4; border-radius: 6px; cursor: pointer; font-size: 11.5px; }
+.rp-dl:hover:not(:disabled) { background: #1b3040; }
+.rp-dl:disabled { opacity: 0.6; cursor: wait; }
+
 /* focused basins (favorites): gold star map pins + panel/profile controls */
 .fav-pin { color: #ffd23f; font-size: 19px; line-height: 22px; text-align: center;
   text-shadow: 0 0 3px #000, 0 1px 2px rgba(0,0,0,.9); cursor: pointer; }
