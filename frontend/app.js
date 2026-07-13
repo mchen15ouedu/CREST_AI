@@ -1104,6 +1104,11 @@ function chatContext() {
   return {
     event: queryCtx ? { label: queryCtx.label, t_start: queryCtx.t_start, t_end: queryCtx.t_end } : null,
     selected: [...selected],
+    // map-first signals: a zoomed-in map with pins IS a location choice — the
+    // agent must not keep asking "where" (signed-in users open pre-zoomed)
+    gauges_on_map: Object.keys(gaugeMarkers).length,
+    map_zoomed_in: map.getZoom() >= PIN_ZOOM,
+    signed_in: userSignedIn,
     sim_running: simRunning,
     last_window: lastSim ? { start: lastSim.tStart, end: lastSim.tEnd } : null,
     results: Object.entries(gaugeResult).map(([id, r]) => ({
