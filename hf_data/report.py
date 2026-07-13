@@ -27,9 +27,74 @@ from datetime import datetime
 
 from hf_data.statecache import CACHE_DIR
 
-REPORT_DIR = os.path.join(CACHE_DIR, "reports")
+REPORT_DIR = os.path.join(CACHE_DIR, "reports")          # ephemeral working cache
+SAVED_DIR = os.path.join(CACHE_DIR, "reports_saved")     # registered users only —
+                                                         # persisted to the private
+                                                         # dataset, survives restarts
+MAX_SAVED_PER_USER = int(os.environ.get("CREST_MAX_SAVED_REPORTS", "20"))
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
+
+
+def _safe(name: str) -> str:
+    return "".join(c for c in name if c.isalnum() or c in "-_.")
+
+
+# ---- registered-user report library ------------------------------------------
+def save_for_user(username: str, gid: str, job, path: str) -> str:
+    """Copy a generated report into the user's persistent library (cap enforced,
+    oldest evicted). Anonymous users never reach this — their reports stay in
+    the ephemeral cache and are discarded when they close the app."""
+    d = os.path.join(SAVED_DIR, _safe(username))
+    os.makedirs(d, exist_ok=True)
+    ext = os.path.splitext(path)[1]
+    dest = os.path.join(d, f"CREST_report_{gid}_{job.t_start:%Y%m%d}_{job.id}{ext}")
+    if not os.path.exists(dest):
+        shutil.copy2(path, dest)
+    kept = sorted((os.path.join(d, f) for f in os.listdir(d)),
+                  key=os.path.getmtime, reverse=True)
+    for old in kept[MAX_SAVED_PER_USER:]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return dest
+
+
+def list_saved(username: str) -> list[dict]:
+    d = os.path.join(SAVED_DIR, _safe(username))
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for f in os.listdir(d):
+        p = os.path.join(d, f)
+        if os.path.isfile(p):
+            st = os.stat(p)
+            out.append({"name": f, "kb": round(st.st_size / 1024),
+                        "when": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")})
+    return sorted(out, key=lambda r: r["when"], reverse=True)
+
+
+def saved_path(username: str, name: str) -> str | None:
+    p = os.path.join(SAVED_DIR, _safe(username), _safe(name))
+    return p if os.path.isfile(p) else None
+
+
+def discard_sim(sim_id: str) -> int:
+    """Drop the EPHEMERAL reports of one simulation (anonymous app close).
+    Registered users' saved copies live in SAVED_DIR and are untouched."""
+    import glob as _glob
+    n = 0
+    for p in _glob.glob(os.path.join(REPORT_DIR, _safe(sim_id) + "_*")):
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.remove(p)
+            n += 1
+        except OSError:
+            pass
+    return n
 
 
 def _config() -> dict:

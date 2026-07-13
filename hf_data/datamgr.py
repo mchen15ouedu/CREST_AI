@@ -32,6 +32,8 @@ FRAMES_CAP_GB = float(os.environ.get("CREST_FRAMES_CACHE_GB", "1"))
 STATES_CAP_GB = float(os.environ.get("CREST_STATES_CACHE_GB", "4"))
 HF_CACHE_CAP_GB = float(os.environ.get("CREST_HF_CACHE_GB", "25"))
 WORKDIR_TTL_H = float(os.environ.get("CREST_WORKDIR_TTL_H", "6"))
+REPORTS_TTL_H = float(os.environ.get("CREST_REPORTS_TTL_H", "6"))  # ephemeral
+# (anonymous) reports; registered users' copies live in reports_saved/ forever
 JANITOR_EVERY_S = float(os.environ.get("CREST_JANITOR_EVERY_S", str(3600)))
 
 
@@ -86,6 +88,19 @@ def cleanup() -> dict:
         except OSError:
             pass
     rep["workdirs"] = {"removed": n, "mb": round(freed / 1e6, 1)}
+
+    # 1b. ephemeral (anonymous) reports past their TTL — the close-of-app beacon
+    # catches most; this catches beacon-less closes. reports_saved/ never ages.
+    cutoff_r = time.time() - REPORTS_TTL_H * 3600
+    n = 0
+    for p in glob.glob(os.path.join(CACHE_DIR, "reports", "*")):
+        try:
+            if os.path.getmtime(p) < cutoff_r:
+                shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
+                n += 1
+        except OSError:
+            pass
+    rep["reports"] = {"removed": n}
 
     # 2. size-capped LRU stores
     for name, cap in (("forcing", FORCING_CAP_GB), ("frames", FRAMES_CAP_GB),

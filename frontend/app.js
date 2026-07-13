@@ -881,6 +881,14 @@ async function downloadReport(gid, btn) {
     a.download = m ? m[1] : `CREST_report_${gid}.pdf`;
     a.click();
     URL.revokeObjectURL(a.href);
+    if (r.headers.get("X-Report-Saved") === "1") {
+      addMsg(`📄 Report for <b>${gid}</b> saved to your account — find it any time ` +
+             `under 👤 → <b>My reports</b>.`, "status");
+    } else if (!userSignedIn) {
+      addMsg(`📄 Report downloaded. <a href='/login'>Sign in</a> to keep reports in ` +
+             `your account — as a guest, generated reports are discarded when you ` +
+             `close the app.`, "status");
+    }
     btn.textContent = "✓ downloaded";
     setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 4000);
   } catch (e) {
@@ -1406,6 +1414,7 @@ function openProfile(d) {
     document.getElementById("pf-" + k).value = p[k] || "";
   });
   renderFavList();
+  loadMyReports();
   loadHistory();
 }
 
@@ -1470,6 +1479,45 @@ document.getElementById("pf-save").onclick = async () => {
   document.getElementById("pf-saved").textContent = r.ok ? "✓ saved" : "⚠ failed";
   setTimeout(() => { document.getElementById("pf-saved").textContent = ""; }, 2500);
 };
+
+// ---- registered-user benefit: persistent report library --------------------
+async function loadMyReports() {
+  const el = document.getElementById("pf-reports");
+  try {
+    const r = await fetch("/api/myreports");
+    if (!r.ok) { el.innerHTML = '<i class="pm-sub">sign in to keep reports</i>'; return; }
+    const reps = (await r.json()).reports || [];
+    if (!reps.length) {
+      el.innerHTML = '<i class="pm-sub">none yet — run a simulation and hit ⬇ PDF report</i>';
+      return;
+    }
+    el.innerHTML = "";
+    reps.forEach((rep) => {
+      const row = document.createElement("div");
+      row.className = "hist-row";
+      row.innerHTML =
+        `<div class="hist-info"><b>📄 ${escapeHtml(rep.name)}</b><br>` +
+        `<span class="pm-sub">${rep.when} · ${rep.kb} KB</span></div>` +
+        `<a class="hist-load" href="/api/myreports/${encodeURIComponent(rep.name)}" ` +
+        `download>Download</a>` +
+        `<button class="hist-load fav-del" title="Delete this report">✕</button>`;
+      row.querySelector(".fav-del").onclick = async () => {
+        await fetch(`/api/myreports/${encodeURIComponent(rep.name)}`, { method: "DELETE" });
+        loadMyReports();
+      };
+      el.appendChild(row);
+    });
+  } catch (_) {
+    el.innerHTML = '<i class="pm-sub">reports unavailable</i>';
+  }
+}
+
+// guests: generated reports are ephemeral — tell the server to drop them when
+// the app closes (registered users' saved copies are kept server-side)
+window.addEventListener("pagehide", () => {
+  if (!userSignedIn && currentSim && navigator.sendBeacon)
+    navigator.sendBeacon(`/api/report_discard/${currentSim}`);
+});
 
 // ---- display font size (everything except the top bar) ---------------------
 const FONT_MODES = [["", "🔠 A", "normal"], ["font-lg", "🔠 A+", "bigger"],

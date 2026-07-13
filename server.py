@@ -112,9 +112,11 @@ def api_datacleanup():
 
 
 @app.get("/api/report/{sim_id}/{gauge_id}")
-def api_report(sim_id: str, gauge_id: str):
+def api_report(sim_id: str, gauge_id: str, request: Request):
     """Downloadable simulation report (AQUAH report-writer agent -> PDF).
-    Generated on first request (LLM + pandoc, ~30-90 s), then cached."""
+    Generated on first request (LLM + pandoc, ~30-90 s), then cached. Signed-in
+    users get a persistent copy in their report library; anonymous reports stay
+    in the ephemeral cache and are discarded when they close the app."""
     job = simjobs.get_job(sim_id)
     if job is None:
         return JSONResponse({"error": "simulation not found (it may have been "
@@ -128,11 +130,66 @@ def api_report(sim_id: str, gauge_id: str):
     except Exception as e:
         crashlog.capture("report", e, sim_id=sim_id, gauge=gauge_id)
         return JSONResponse({"error": f"report generation failed: {e}"}, status_code=500)
+    saved = False
+    u = request.session.get("user")
+    if u:                              # registered-user benefit: keep the report
+        try:
+            report.save_for_user(u["username"], gauge_id, job, path)
+            persist.poke()
+            saved = True
+        except Exception as e:
+            crashlog.capture("report:save", e, user=u.get("username"))
     ext = os.path.splitext(path)[1]
     return FileResponse(
         path,
         media_type="application/pdf" if ext == ".pdf" else "text/markdown",
-        filename=f"CREST_report_{gauge_id}_{job.t_start:%Y%m%d}{ext}")
+        filename=f"CREST_report_{gauge_id}_{job.t_start:%Y%m%d}{ext}",
+        headers={"X-Report-Saved": "1" if saved else "0"})
+
+
+@app.get("/api/myreports")
+def api_myreports(request: Request):
+    """Signed-in user's saved report library."""
+    u = request.session.get("user")
+    if not u:
+        return JSONResponse({"error": "not signed in"}, status_code=401)
+    from hf_data import report
+    return {"reports": report.list_saved(u["username"]),
+            "max": report.MAX_SAVED_PER_USER}
+
+
+@app.get("/api/myreports/{name}")
+def api_myreports_get(name: str, request: Request):
+    u = request.session.get("user")
+    if not u:
+        return JSONResponse({"error": "not signed in"}, status_code=401)
+    from hf_data import report
+    p = report.saved_path(u["username"], name)
+    if not p:
+        return JSONResponse({"error": "report not found"}, status_code=404)
+    return FileResponse(p, media_type="application/pdf" if p.endswith(".pdf")
+                        else "text/markdown", filename=os.path.basename(p))
+
+
+@app.delete("/api/myreports/{name}")
+def api_myreports_delete(name: str, request: Request):
+    u = request.session.get("user")
+    if not u:
+        return JSONResponse({"error": "not signed in"}, status_code=401)
+    from hf_data import report
+    p = report.saved_path(u["username"], name)
+    if p:
+        os.remove(p)
+        persist.poke()                 # mirror the deletion to the private dataset
+    return {"ok": True, "reports": report.list_saved(u["username"])}
+
+
+@app.post("/api/report_discard/{sim_id}")
+def api_report_discard(sim_id: str):
+    """App-close beacon from anonymous users: drop their ephemeral reports.
+    Saved (registered) copies are untouched; everything here is regenerable."""
+    from hf_data import report
+    return {"ok": True, "removed": report.discard_sim(sim_id)}
 
 
 @app.get("/api/persist")
