@@ -573,7 +573,10 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         gauges=ctl_gauges,
         crest=wb, kw=kw, model=ef5_model.upper(),
         param_grids=pgrids, output_grids=grids,
-        state_dir=sdir, warmup_start=warmup_start,
+        # calibration candidates (no_cache) warm-START from saved states but must
+        # never SAVE: trial-parameter states would overwrite the legitimate
+        # end-of-window state grids in the shared cache
+        state_dir=sdir, warmup_start=warmup_start, save_state_end=not no_cache,
         snow_on=snow_on, snow_scalars=snow_scalars, snow_grids=snow_grids, temp_dir=temp_dir,
         temp_dem=temp_dem, da_file=da_file, per_gauge=per_gauge or None)
     build_control(spec)

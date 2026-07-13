@@ -538,8 +538,12 @@ class CalRequest(BaseModel):
     t_end: str
     model: str = "auto"
     snow: str = "auto"
-    rounds: int = 4
-    k: int = 3
+    # budget = rounds*k candidate runs + 1 baseline (defaults: 4*3+1 = 13 EF5
+    # runs). Raise via Space variables CREST_CAL_ROUNDS / CREST_CAL_K — no
+    # redeploy needed (candidates warm-start from the saved state, so each
+    # extra run costs seconds-to-minutes, not a full warm-up).
+    rounds: int = int(os.environ.get("CREST_CAL_ROUNDS", "4"))
+    k: int = int(os.environ.get("CREST_CAL_K", "3"))
 
 
 @app.post("/api/calibrate")

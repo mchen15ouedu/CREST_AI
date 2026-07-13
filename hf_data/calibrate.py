@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import random
+import shutil
+import tempfile
 from datetime import datetime
 
 from hf_data import analysis, llm, paramstore
@@ -175,14 +177,21 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
     base = clamp(base)
 
     def run_candidate(params: dict):
-        """Run EF5 with the candidate params, 1-D only; return (nse, metrics, rows)."""
+        """Run EF5 with the candidate params, 1-D only; return (nse, metrics, rows).
+        Each run gets its own workdir, deleted the moment the run ends — a
+        calibration leaves no intermediary data behind (the 1-D rows and the
+        winning parameter set are all that survive)."""
         rows = []
-        for kind, payload in run_gauge(
-                g["id"], t_start, t_end, model=model, use_mock=use_mock,
-                overrides=params, snow=snow, timestep=timestep,
-                grids=False, no_cache=True):
-            if kind == "hydro":
-                rows += payload["rows"]
+        work = tempfile.mkdtemp(prefix=f"crest_cal_{g['id']}_")
+        try:
+            for kind, payload in run_gauge(
+                    g["id"], t_start, t_end, model=model, use_mock=use_mock,
+                    overrides=params, snow=snow, timestep=timestep,
+                    grids=False, no_cache=True, workdir=work):
+                if kind == "hydro":
+                    rows += payload["rows"]
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
         m = analysis.compute_metrics(rows)
         nse = _mock_nse(params) if use_mock else m.get("nsce")
         return nse, m, rows
