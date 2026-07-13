@@ -332,17 +332,33 @@ def generate(job, gid: str) -> str:
         md_path = os.path.join(work, "Hydro_Report.md")
         with open(md_path, "w", encoding="utf-8") as fh:
             fh.write(md)
+        # PDF attempts, most- to least-specific: named mainfont needs the font
+        # installed; bare xelatex uses Latin Modern (lmodern pkg); pdflatex last
+        attempts = [
+            ["--pdf-engine=xelatex", "--variable", "mainfont=Latin Modern Roman"],
+            ["--pdf-engine=xelatex"],
+            ["--pdf-engine=pdflatex"],
+        ]
+        pandoc_errs = []
         try:
             import pypandoc
-            pypandoc.convert_file(
-                md_path, "pdf", outputfile=pdf,
-                extra_args=["--pdf-engine=xelatex",
-                            "--variable", "mainfont=Latin Modern Roman",
-                            "--variable", "geometry:margin=2.2cm",
-                            "--resource-path", work])
-            shutil.rmtree(work, ignore_errors=True)
-            return pdf
-        except Exception:
+            for extra in attempts:
+                try:
+                    pypandoc.convert_file(
+                        md_path, "pdf", outputfile=pdf,
+                        extra_args=extra + ["--variable", "geometry:margin=2.2cm",
+                                            "--resource-path", work])
+                    shutil.rmtree(work, ignore_errors=True)
+                    return pdf
+                except Exception as e:
+                    pandoc_errs.append(f"{extra[0]}: {str(e)[:300]}")
+            raise RuntimeError(" | ".join(pandoc_errs))
+        except Exception as e:
+            try:                       # PDF failures must be visible in /api/errors
+                from hf_data import crashlog
+                crashlog.capture("report:pandoc", e, sim_id=job.id, gauge=gid)
+            except Exception:
+                pass
             # local dev / missing pandoc: hand back the Markdown (figures inlined
             # as data URIs so the single file is still self-contained)
             def _inline(match):
