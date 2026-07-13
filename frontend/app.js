@@ -684,6 +684,8 @@ async function startCalibration(gid) {
     const ev = JSON.parse(e.data);
     if (ev.kind === "cal_status") {
       stage.textContent = ev.msg.slice(0, 90);
+      if (ev.msg.startsWith("📉"))       // extended-search kick-in: full note in chat
+        addMsg(`<b>${gid}</b> · ${escapeHtml(ev.msg)}`, "status");
     } else if (ev.kind === "cal_round") {
       const last = (ev.tried || [])[ev.tried.length - 1];
       const p = last && last.progress ? last.progress * 100 : undefined;

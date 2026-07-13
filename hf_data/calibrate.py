@@ -13,6 +13,7 @@ approximation: initial states reflect the pre-calibration parameters.
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 import tempfile
@@ -34,6 +35,12 @@ PARAM_BOUNDS = {
     "plwhc": (0.02, 0.3), "scf": (0.7, 1.2),
 }
 FROZEN = {"th", "iwu", "isu"}
+
+# extended search: if the standard rounds*k budget still ends below EXT_NSE,
+# one extra stage of EXT_ROUNDS*EXT_K candidates is appended automatically
+EXT_ROUNDS = int(os.environ.get("CREST_CAL_EXT_ROUNDS", "5"))
+EXT_K = int(os.environ.get("CREST_CAL_EXT_K", "4"))
+EXT_NSE = float(os.environ.get("CREST_CAL_EXT_NSE", "0.3"))
 
 # AI_cali hydrocalib/agents/physics_info.py PHYSICS_PARAMETER_GUIDE (verbatim core)
 PHYSICS_GUIDE = (
@@ -147,11 +154,15 @@ def _mock_nse(params: dict) -> float:
 
 def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                     model: str = "auto", snow: str = "auto", use_mock: bool = True,
-                    rounds: int = 4, k: int = 3, timestep: str = "1h"):
+                    rounds: int = 4, k: int = 3, timestep: str = "1h",
+                    ext_rounds: int = EXT_ROUNDS, ext_k: int = EXT_K,
+                    ext_nse: float = EXT_NSE):
     """Generator of calibration events for the SSE stream.
 
+    Two-stage budget: rounds*k candidates, then — only if the best NSE is
+    still below ext_nse — one extended stage of ext_rounds*ext_k more.
     Yields ("status", str) | ("round", dict) | ("hydro", {rows}) |
-    ("done", {best_nse, baseline_nse, best_params, saved, improved}).
+    ("done", {best_nse, baseline_nse, best_params, saved, improved, extended}).
     """
     from hf_data import multipliers
     from hf_data.pipeline import gauge_info, run_gauge
@@ -208,26 +219,45 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
 
     total = rounds * k
     done_runs = 0
-    for r in range(1, rounds + 1):
-        cands = propose(best_params, base_metrics, history, k, r, rnd)
-        tried = []
-        for c in cands:
-            params = clamp({**best_params, **c["updates"]})
-            yield ("status", f"round {r}: testing “{c['goal'] or c['id']}”")
-            try:
-                nse, m, rows = run_candidate(params)
-            except Exception as e:
-                nse, m, rows = None, {}, []
-                yield ("status", f"round {r}: candidate {c['id']} failed ({e})")
-            done_runs += 1
-            tried.append({"id": c["id"], "goal": c["goal"], "nse": nse,
-                          "progress": round(done_runs / total, 3)})
-            history.append({"id": c["id"], "updates": c["updates"], "nse": nse})
-            if nse is not None and (best_nse is None or nse > best_nse):
-                best_nse, best_params, best_rows = nse, params, rows
-                yield ("hydro", {"rows": rows})
-        yield ("round", {"round": r, "tried": tried, "best_nse": best_nse,
-                         "best_params": best_params})
+    stages = [(rounds, k)]          # extended stage appended below if warranted
+    extended = False
+    r = 0                           # global round counter across stages
+    si = 0
+    while si < len(stages):
+        n_rounds, kk = stages[si]
+        for _ in range(n_rounds):
+            r += 1
+            cands = propose(best_params, base_metrics, history, kk, r, rnd)
+            tried = []
+            for c in cands:
+                params = clamp({**best_params, **c["updates"]})
+                yield ("status", f"round {r}: testing “{c['goal'] or c['id']}”")
+                try:
+                    nse, m, rows = run_candidate(params)
+                except Exception as e:
+                    nse, m, rows = None, {}, []
+                    yield ("status", f"round {r}: candidate {c['id']} failed ({e})")
+                done_runs += 1
+                tried.append({"id": c["id"], "goal": c["goal"], "nse": nse,
+                              "progress": round(done_runs / total, 3)})
+                history.append({"id": c["id"], "updates": c["updates"], "nse": nse})
+                if nse is not None and (best_nse is None or nse > best_nse):
+                    best_nse, best_params, best_rows = nse, params, rows
+                    yield ("hydro", {"rows": rows})
+            yield ("round", {"round": r, "tried": tried, "best_nse": best_nse,
+                             "best_params": best_params, "extended": extended})
+        si += 1
+        # still a poor fit after the standard budget -> widen the search once
+        if si == 1 and not extended and ext_rounds > 0 and ext_k > 0 \
+                and (best_nse is None or best_nse < ext_nse):
+            extended = True
+            stages.append((ext_rounds, ext_k))
+            total += ext_rounds * ext_k
+            shown = "n/a" if best_nse is None else f"{best_nse:.3f}"
+            yield ("status", f"📉 best NSE {shown} still below {ext_nse:g} after "
+                             f"{done_runs} trials — extended search: "
+                             f"+{ext_rounds} rounds × {ext_k} candidates "
+                             f"({ext_rounds * ext_k} more runs)")
 
     improved = (base_nse is None) or (best_nse is not None and best_nse > base_nse)
     saved = False
@@ -238,4 +268,5 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
             g["id"], ef5_model, wb_best, kw_best, best_nse, source="ai-cali",
             window=[t_start.strftime("%Y-%m-%d %H:%M"), t_end.strftime("%Y-%m-%d %H:%M")])
     yield ("done", {"best_nse": best_nse, "baseline_nse": base_nse,
-                    "best_params": best_params, "saved": saved, "improved": improved})
+                    "best_params": best_params, "saved": saved, "improved": improved,
+                    "extended": extended})

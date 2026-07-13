@@ -539,8 +539,11 @@ class CalRequest(BaseModel):
     model: str = "auto"
     snow: str = "auto"
     # budget = rounds*k candidate runs + 1 baseline (defaults: 4*3+1 = 13 EF5
-    # runs). Raise via Space variables CREST_CAL_ROUNDS / CREST_CAL_K — no
-    # redeploy needed (candidates warm-start from the saved state, so each
+    # runs). If the best NSE is still < 0.3 afterwards, calibrate.py appends
+    # one extended stage of 5 rounds x 4 candidates (+20 runs) automatically.
+    # Space variables: CREST_CAL_ROUNDS / CREST_CAL_K (standard stage) and
+    # CREST_CAL_EXT_ROUNDS / CREST_CAL_EXT_K / CREST_CAL_EXT_NSE (extension) —
+    # no redeploy needed (candidates warm-start from the saved state, so each
     # extra run costs seconds-to-minutes, not a full warm-up).
     rounds: int = int(os.environ.get("CREST_CAL_ROUNDS", "4"))
     k: int = int(os.environ.get("CREST_CAL_K", "3"))
