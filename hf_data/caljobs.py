@@ -46,6 +46,11 @@ class CalJob:
                                 "rows": payload["rows"]})
                 elif kind == "done":
                     self._emit({"kind": "cal_done", "gauge_id": self.gauge_id, **payload})
+                    try:                     # winning params -> sync soon
+                        from hf_data import persist
+                        persist.poke()
+                    except Exception:
+                        pass
         except Exception as e:
             from hf_data import crashlog
             crashlog.capture(f"cal:{self.gauge_id}", e, cal_id=self.id)

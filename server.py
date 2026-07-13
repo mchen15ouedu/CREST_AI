@@ -31,12 +31,14 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-from hf_data import caljobs, crashlog, datamgr, gauges, simjobs
+from hf_data import caljobs, crashlog, datamgr, gauges, persist, simjobs
 from hf_data.pipeline import parse_query
 from hf_data.statecache import CACHE_DIR
 
 crashlog.init()                    # optional SENTRY_DSN mirror (Sentry/GlitchTip/Bugsink)
 datamgr.start_janitor()            # hourly cache cleanup + result compaction
+persist.start()                    # restore states/results/params/users from the
+                                   # private dataset, then keep them synced
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(HERE, "frontend")
@@ -107,6 +109,21 @@ def api_datacleanup():
     rep = datamgr.cleanup()
     rep["compact"] = datamgr.compact_results()
     return rep
+
+
+@app.get("/api/persist")
+def api_persist_status():
+    """Durable-cache sync status (private-dataset mirror)."""
+    return persist.status()
+
+
+@app.post("/api/persist")
+def api_persist_now():
+    """Push a sync pass right now (normally every 10 min / after each run)."""
+    try:
+        return {"ok": True, **persist.backup()}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 APP_VERSION = str(int(time.time()))    # changes every deploy/restart
@@ -181,6 +198,7 @@ def api_profile(request: Request, p: ProfileUpdate):
     prof.update({k: v for k, v in p.model_dump().items() if v is not None})
     with open(_profile_path(u["username"]), "w", encoding="utf-8") as fh:
         json.dump(prof, fh, indent=1)
+    persist.poke()
     return {"ok": True, "profile": prof}
 
 
@@ -243,6 +261,7 @@ def api_favorites_post(request: Request, f: FavoriteReq):
     prof["favorites"] = favs
     with open(_profile_path(u["username"]), "w", encoding="utf-8") as fh:
         json.dump(prof, fh, indent=1)
+    persist.poke()                 # favorites are account data — sync soon
     return {"ok": True, "favorites": _fav_pins(favs), "max": MAX_FAVORITES}
 
 

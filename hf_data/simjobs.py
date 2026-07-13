@@ -133,6 +133,11 @@ class SimJob:
                                 "returncode": rc,
                                 "n": len(self.hydro.get(gid, []))})
                     self._build_result(gid)
+                    try:                     # fresh states/results — sync soon
+                        from hf_data import persist
+                        persist.poke()
+                    except Exception:
+                        pass
         except Exception as e:
             from hf_data import crashlog
             crashlog.capture(f"sim:{gid}", e, sim_id=self.id)
