@@ -813,6 +813,7 @@ function focusGauge(id) {
   document.getElementById("right-panel").classList.remove("hidden");
   document.getElementById("rp-title").textContent = `${id} · ${g ? g.name : ""}`;
   renderTabs();
+  renderFavBtn();
   renderStats(id);
   renderHydro(id);
   renderReport(id);
@@ -1188,9 +1189,134 @@ async function initAuth() {
     const pic = d.user.picture ? `<img src="${d.user.picture}" alt="">` : "👤";
     el.innerHTML = `<button class="tb-btn" id="auth-btn">${pic} ${escapeHtml(d.user.name || d.user.username)}</button>`;
     document.getElementById("auth-btn").onclick = () => openProfile(d);
+    userSignedIn = true;
+    loadFavorites();                  // registered-user benefit: focused basins
     zoomToUserLocation();             // registered-user benefit: open at home
   } catch (_) {}
 }
+
+// ---- registered-user benefit: focused basins (up to 5 favorite gauges) -----
+// Favorites live in the account profile and show up as gold ★ pins at every
+// zoom level — one click zooms in and selects the gauge, no HUC8 digging.
+let userSignedIn = false;
+let userFavs = [];                 // [{id,name,lat,lon,area_km2}]
+let favMax = 5;
+let favLayer = null;
+
+async function loadFavorites() {
+  try {
+    const r = await fetch("/api/favorites");
+    if (!r.ok) return;
+    const d = await r.json();
+    userFavs = d.favorites || [];
+    favMax = d.max || 5;
+    renderFavorites();
+  } catch (_) {}
+}
+
+async function setFavorite(gid, add) {
+  const r = await fetch("/api/favorites", { method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ gauge_id: gid, action: add ? "add" : "remove" }) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || r.statusText);
+  userFavs = d.favorites || [];
+  renderFavorites();
+}
+
+function isFav(id) { return userFavs.some((g) => g.id === id); }
+
+function renderFavorites() {          // pins + panel star + profile list together
+  if (!favLayer) favLayer = L.layerGroup().addTo(map);
+  favLayer.clearLayers();
+  userFavs.forEach((g) => {
+    gaugeData[g.id] = gaugeData[g.id] || g;   // selectable before viewport pins load
+    L.marker([g.lat, g.lon], {
+      icon: L.divIcon({ className: "fav-pin", html: "★", iconSize: [22, 22], iconAnchor: [11, 11] }),
+    }).bindTooltip(`⭐ ${g.id} · ${g.name}<br>${Math.round(g.area_km2).toLocaleString()} km²`,
+                   { direction: "top" })
+      .on("click", () => {
+        if (map.getZoom() < PIN_ZOOM)         // zoom in enough for the pin layer
+          map.setView([g.lat, g.lon], PIN_ZOOM + 1, { animate: false });
+        toggleGauge(g.id);
+      })
+      .addTo(favLayer);
+  });
+  renderFavBtn();
+  renderFavList();
+}
+
+function renderFavBtn() {
+  const b = document.getElementById("rp-fav");
+  if (!panelGauge) { b.classList.add("hidden"); return; }
+  b.classList.remove("hidden");
+  const on = isFav(panelGauge);
+  b.textContent = on ? "★" : "☆";
+  b.classList.toggle("on", on);
+  b.title = on ? "Remove from your focused basins"
+    : userSignedIn ? `Add to your focused basins (${userFavs.length}/${favMax})`
+    : "Sign in to save favorite gauges";
+}
+
+document.getElementById("rp-fav").onclick = async () => {
+  if (!panelGauge) return;
+  if (!userSignedIn) {
+    addMsg("⭐ <a href='/login'>Sign in</a> to save favorite gauges — your focused " +
+           "basins appear as gold stars on the map every time you open the app.", "status");
+    return;
+  }
+  const add = !isFav(panelGauge);
+  try {
+    await setFavorite(panelGauge, add);
+    addMsg(add
+      ? `⭐ Added <b>${panelGauge}</b> to your focused basins (${userFavs.length}/${favMax}) — ` +
+        `it'll be starred on your map whenever you sign in.`
+      : `☆ Removed <b>${panelGauge}</b> from your focused basins.`, "status");
+  } catch (e) { addMsg("⚠️ " + e.message, "status"); }
+};
+
+function renderFavList() {            // profile modal: list + remove + show-on-map
+  const el = document.getElementById("pf-favs");
+  if (!userFavs.length) {
+    el.innerHTML = '<i class="pm-sub">none yet — run a simulation and hit ☆, or add one below</i>';
+    return;
+  }
+  el.innerHTML = "";
+  userFavs.forEach((g) => {
+    const row = document.createElement("div");
+    row.className = "hist-row";
+    row.innerHTML =
+      `<div class="hist-info"><b>★ ${g.id}</b> · ${escapeHtml(g.name)}<br>` +
+      `<span class="pm-sub">${Math.round(g.area_km2).toLocaleString()} km²</span></div>` +
+      `<button class="hist-load fav-go">Show</button>` +
+      `<button class="hist-load fav-del" title="Remove from focused basins">✕</button>`;
+    row.querySelector(".fav-go").onclick = () => {
+      document.getElementById("profile-modal").classList.add("hidden");
+      map.setView([g.lat, g.lon], PIN_ZOOM + 1, { animate: false });
+    };
+    row.querySelector(".fav-del").onclick = async () => {
+      try { await setFavorite(g.id, false); } catch (_) {}
+    };
+    el.appendChild(row);
+  });
+}
+
+document.getElementById("pf-fav-add").onclick = async () => {
+  const inp = document.getElementById("pf-fav-input");
+  const st = document.getElementById("pf-fav-status");
+  const v = inp.value.trim();
+  if (!v) return;
+  st.textContent = "…";
+  try {
+    await setFavorite(v, true);
+    inp.value = "";
+    st.textContent = "✓ added";
+  } catch (e) { st.textContent = "⚠ " + e.message; }
+  setTimeout(() => { st.textContent = ""; }, 5000);
+};
+document.getElementById("pf-fav-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("pf-fav-add").click();
+});
 
 // ---- registered-user benefit: auto-zoom to the user's location ------------
 // On open, signed-in users land on their own area with the nearby USGS gauge
@@ -1234,6 +1360,7 @@ function openProfile(d) {
   ["display_name", "affiliation", "email", "bio"].forEach((k) => {
     document.getElementById("pf-" + k).value = p[k] || "";
   });
+  renderFavList();
   loadHistory();
 }
 

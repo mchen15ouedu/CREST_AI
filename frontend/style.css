@@ -76,6 +76,20 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 .k-step-row input { width: 64px; }
 #feedback-modal textarea { resize: vertical; }
 
+/* focused basins (favorites): gold star map pins + panel/profile controls */
+.fav-pin { color: #ffd23f; font-size: 19px; line-height: 22px; text-align: center;
+  text-shadow: 0 0 3px #000, 0 1px 2px rgba(0,0,0,.9); cursor: pointer; }
+.fav-btn { background: none; border: none; color: #8fa3b3; cursor: pointer;
+  font-size: 17px; line-height: 1; padding: 0 2px; margin-left: auto; }
+.fav-btn.on { color: #ffd23f; }
+.fav-btn.hidden { display: none; }
+.fav-add { display: flex; gap: 6px; margin-top: 8px; }
+.fav-add input { flex: 1; }
+.fav-add button { padding: 5px 14px; border: 1px solid #2a3a49; background: #142230;
+  color: #e8eef4; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.fav-add button:hover { background: #1b3040; }
+.fav-del { padding: 5px 8px; }
+
 /* simulation history (profile modal) */
 .hist-row { display: flex; align-items: center; gap: 10px; padding: 7px 0;
   border-bottom: 1px solid #1d2936; }

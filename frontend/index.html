@@ -79,7 +79,9 @@
 
   <!-- RIGHT: results / hydrograph / report, one tab per simulated gauge -->
   <div id="right-panel" class="panel hidden">
-    <div class="panel-head"><span id="rp-title">Gauge</span> <button class="close" data-target="right-panel">✕</button></div>
+    <div class="panel-head"><span id="rp-title">Gauge</span>
+      <button id="rp-fav" class="fav-btn hidden" title="Add this gauge to your focused basins">☆</button>
+      <button class="close" data-target="right-panel">✕</button></div>
     <div id="rp-tabs"></div>
     <div class="panel-body">
       <div id="rp-stats" class="stats"></div>
@@ -197,6 +199,16 @@
         <label>Bio<textarea id="pf-bio" rows="3"></textarea></label>
         <button id="pf-save" class="primary">Save profile</button>
         <span id="pf-saved" class="pm-sub"></span>
+        <h4>⭐ Focused basins</h4>
+        <p class="pm-sub">Save up to 5 favorite gauges — they appear as gold stars on your
+          map every time you open the app. Add one with the ☆ button on a simulation
+          result, or type a USGS gauge number here.</p>
+        <div id="pf-favs"><i class="pm-sub">loading…</i></div>
+        <div class="fav-add">
+          <input id="pf-fav-input" placeholder="USGS gauge number, e.g. 08167000" />
+          <button id="pf-fav-add">Add</button>
+        </div>
+        <span id="pf-fav-status" class="pm-sub"></span>
         <h4>Simulation history</h4>
         <p class="pm-sub">Your simulations are saved to your account — reopen them any time,
           even after closing the app mid-run.</p>

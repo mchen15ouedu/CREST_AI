@@ -8,6 +8,7 @@ Serves the Leaflet frontend + JSON/SSE APIs, reusing the hf_data layer + agents.
   POST /api/eventinfo  LLM event brief (damage/fatalities/links) for the AI info feed
   POST /api/calibrate  AI calibration job (NSE<0.3 flow);  GET /api/calstream SSE
   /login /auth/callback /logout /api/me /api/profile   HF OAuth + profile store
+  GET/POST /api/favorites   registered-user focused basins (up to 5 gauges)
 Run: python server.py   (uvicorn on :7860, Docker Space entrypoint)
 """
 from __future__ import annotations
@@ -181,6 +182,68 @@ def api_profile(request: Request, p: ProfileUpdate):
     with open(_profile_path(u["username"]), "w", encoding="utf-8") as fh:
         json.dump(prof, fh, indent=1)
     return {"ok": True, "profile": prof}
+
+
+# ---- registered-user benefit: focused basins (favorite gauges) -------------
+MAX_FAVORITES = 5
+
+
+def _fav_pins(ids: list) -> list:
+    """Favorite gauge ids -> map pins with catalog metadata (unknown ids skipped)."""
+    cat = gauges.load_catalog()
+    out = []
+    for gid in ids:
+        row = cat.loc[cat.STAID == gid]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        out.append({"id": gid, "name": str(r.STANAME), "lat": float(r.LAT_GAGE),
+                    "lon": float(r.LNG_GAGE), "area_km2": float(r.DRAIN_SQKM)})
+    return out
+
+
+@app.get("/api/favorites")
+def api_favorites(request: Request):
+    u = request.session.get("user")
+    if not u:
+        return JSONResponse({"error": "not signed in"}, status_code=401)
+    ids = _load_profile(u["username"]).get("favorites", [])
+    return {"favorites": _fav_pins(ids), "max": MAX_FAVORITES}
+
+
+class FavoriteReq(BaseModel):
+    gauge_id: str
+    action: str = "add"           # add | remove
+
+
+@app.post("/api/favorites")
+def api_favorites_post(request: Request, f: FavoriteReq):
+    u = request.session.get("user")
+    if not u:
+        return JSONResponse({"error": "Sign in to save favorite gauges."}, status_code=401)
+    digits = "".join(c for c in f.gauge_id if c.isdigit())
+    if not digits:
+        return JSONResponse({"error": "Enter a USGS gauge number, e.g. 08167000."},
+                            status_code=422)
+    gid = digits.zfill(8)          # catalog STAIDs are zero-padded to >= 8 digits
+    prof = _load_profile(u["username"])
+    favs = [g for g in prof.get("favorites", []) if g]
+    if f.action == "remove":
+        favs = [g for g in favs if g != gid]
+    elif gid not in favs:
+        if gauges.get_gauge_coordinates(gid) is None:
+            return JSONResponse(
+                {"error": f"Gauge {gid} isn't in the GAGES-II catalog — "
+                          "double-check the USGS station number."}, status_code=404)
+        if len(favs) >= MAX_FAVORITES:
+            return JSONResponse(
+                {"error": f"You already have {MAX_FAVORITES} focused basins — "
+                          "remove one first."}, status_code=409)
+        favs.append(gid)
+    prof["favorites"] = favs
+    with open(_profile_path(u["username"]), "w", encoding="utf-8") as fh:
+        json.dump(prof, fh, indent=1)
+    return {"ok": True, "favorites": _fav_pins(favs), "max": MAX_FAVORITES}
 
 
 # ---- map-first gauge pins ---------------------------------------------------
