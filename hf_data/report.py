@@ -306,7 +306,7 @@ def generate(job, gid: str) -> str:
 
         work = os.path.join(REPORT_DIR, key + "_work")
         os.makedirs(work, exist_ok=True)
-        figp = work.replace(os.sep, "/")
+        figp = "."     # image refs get normalized to bare names before pandoc
         fig_names = []
         _fig_results(rows, meta, metrics, os.path.join(work, "results.png"))
         fig_names.append("results.png")
@@ -328,6 +328,14 @@ def generate(job, gid: str) -> str:
             md = _agent_markdown(cfg, summary, figures_md, basin, figp, fig_names)
         else:
             md = _fallback_markdown(summary, meta, metrics, figp, fig_names)
+
+        # the LLM freely rewrites path prefixes (absolute -> './...') and pandoc
+        # then can't fetch the figures — normalize EVERY image reference to the
+        # bare filename and let --resource-path do the resolving
+        def _bare(match):
+            name = os.path.basename(match.group(1).split("?")[0])
+            return f"![]({name})" if name in fig_names else match.group(0)
+        md = re.sub(r"!\[[^\]]*\]\(([^)]+)\)", _bare, md)
 
         md_path = os.path.join(work, "Hydro_Report.md")
         with open(md_path, "w", encoding="utf-8") as fh:
@@ -351,7 +359,9 @@ def generate(job, gid: str) -> str:
                     shutil.rmtree(work, ignore_errors=True)
                     return pdf
                 except Exception as e:
-                    pandoc_errs.append(f"{extra[0]}: {str(e)[:300]}")
+                    # the FATAL LaTeX message is at the END of pandoc's output —
+                    # keep the tail, not the leading resource warnings
+                    pandoc_errs.append(f"{extra[0]}: …{str(e)[-350:]}")
             raise RuntimeError(" | ".join(pandoc_errs))
         except Exception as e:
             try:                       # PDF failures must be visible in /api/errors
