@@ -593,6 +593,17 @@ def api_simulate(req: SimRequest, request: Request):
             "max_concurrent": simjobs.MAX_CONCURRENT}
 
 
+@app.get("/api/nowcast/{sim_id}/{gauge_id}")
+def api_nowcast(sim_id: str, gauge_id: str):
+    """AI nowcast tail (+6 h) from the CREST_nowcast Space for a finished
+    gauge. Always answers; {"ok": false} just means no tail is shown."""
+    job = simjobs.get_job(sim_id)
+    if not job:
+        return JSONResponse({"ok": False, "reason": "unknown job"}, status_code=404)
+    from hf_data import nowcast as _nc
+    return _nc.for_job(job, gauge_id)
+
+
 @app.post("/api/cancel/{sim_id}")
 def api_cancel(sim_id: str):
     """Stop a running simulation job: the EF5 processes are killed and the

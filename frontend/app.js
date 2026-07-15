@@ -491,8 +491,10 @@ function handleSimEvent(simId, ev) {
     } else if (aiInfo) setProgress(ev.gauge_id, 100, "complete ✓");
     else addMsg(`✅ <b>${ev.gauge_id}</b> complete (${ev.n} steps)`, "status");
     if (ev.gauge_id === panelGauge) renderHydro(ev.gauge_id);
+    if (ev.returncode === 0) fetchNowcast(ev.gauge_id);
   } else if (ev.kind === "result") {
-    gaugeResult[ev.gauge_id] = { meta: ev.meta, metrics: ev.metrics, report: ev.report };
+    gaugeResult[ev.gauge_id] = { ...(gaugeResult[ev.gauge_id] || {}),
+      meta: ev.meta, metrics: ev.metrics, report: ev.report };
     renderTabs();
     if (ev.gauge_id === panelGauge) { renderStats(ev.gauge_id); renderReport(ev.gauge_id); }
     maybeOfferCalibration(ev.gauge_id, ev.metrics);
@@ -931,7 +933,7 @@ function _hydroMarker(t) {
            line: { color: "#ffd23f", width: 1.4, dash: "dot" } };
 }
 
-function _hydroFig(rows, big) {
+function _hydroFig(rows, big, nc) {
   const x = rows.map((r) => r.time), sim = rows.map((r) => r.sim_q),
     obs = rows.map((r) => r.obs_q), pr = rows.map((r) => r.precip || 0);
   const maxp = Math.max(0.1, ...pr);
@@ -942,6 +944,12 @@ function _hydroFig(rows, big) {
     { x, y: sim, name: "Sim Q", mode: "lines",
       line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } },
   ];
+  if (nc && nc.ok && nc.times && nc.times.length) {
+    const last = rows[rows.length - 1];             // anchor for a continuous tail
+    traces.push({ x: [last.time, ...nc.times], y: [last.sim_q, ...nc.q],
+      name: "🔮 AI nowcast", mode: "lines",
+      line: { color: "#ff9f43", width: big ? 2.2 : 1.8, dash: "dot" } });
+  }
   const layout = {
     margin: big ? { l: 56, r: 56, t: 18, b: 40 } : { l: 46, r: 46, t: 12, b: 30 },
     bargap: 0, showlegend: true,
@@ -967,6 +975,22 @@ function _bindHydroClick(el, id) {
   });
 }
 
+// ---- AI nowcast tail (CREST_nowcast Space) --------------------------------
+async function fetchNowcast(gid) {
+  if (!currentSim) return;
+  try {
+    const d = await (await fetch(`/api/nowcast/${currentSim}/${gid}`)).json();
+    if (!d.ok) return;                       // not trained / Space asleep — no tail
+    (gaugeResult[gid] = gaugeResult[gid] || {}).nowcast = d;
+    if (gid === panelGauge) renderHydro(gid);
+    const m = d.model || {};
+    addMsg(`🔮 <b>${gid}</b>: AI nowcast added to the hydrograph — next ` +
+      `${d.q.length} h from the DI-LSTM (experimental${m.val_nse != null
+        ? `, val NSE ${m.val_nse}` : ""}). It fuses the latest USGS ` +
+      `observation with MRMS rainfall.`, "status");
+  } catch (_) { /* no tail — never break the results panel */ }
+}
+
 function renderHydro(id) {
   const rows = simHydro[id] || [];
   const el = document.getElementById("rp-hydro");
@@ -981,7 +1005,8 @@ function renderHydro(id) {
     return;
   }
   if (el.querySelector(".muted")) el.innerHTML = "";     // drop placeholder before plotting
-  const { traces, layout } = _hydroFig(rows, false);
+  const { traces, layout } = _hydroFig(rows, false,
+    gaugeResult[id] && gaugeResult[id].nowcast);
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
   _bindHydroClick(el, id);
   xp.classList.remove("hidden");
@@ -1091,7 +1116,8 @@ function renderHydroBig() {
   if (!hmBaseW) hmBaseW = document.getElementById("hm-scroll").clientWidth - 2;
   el.style.width = Math.round(hmBaseW * hmZoom) + "px";
   el.style.height = Math.round(_hmBaseH() * Math.max(1, (hmZoom + 1) / 2)) + "px";
-  const { traces, layout } = _hydroFig(rows, true);
+  const { traces, layout } = _hydroFig(rows, true,
+    gaugeResult[panelGauge] && gaugeResult[panelGauge].nowcast);
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
   _bindHydroClick(el, panelGauge);
   applyHmZoom();
