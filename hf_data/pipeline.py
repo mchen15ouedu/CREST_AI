@@ -337,7 +337,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                 f0_est = t_start - timedelta(days=warmup_days)
                 for b_ in bc_gauges:
                     try:
-                        s = obs.fetch_usgs_discharge(b_["id"], f0_est, t_end)
+                        s = obs.get_series(b_["id"], f0_est, t_end)
                     except Exception:
                         s = []
                     cov = _obs_coverage(s, f0_est, t_end) if s else 0.0
@@ -499,9 +499,12 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     if not use_mock:                                  # real run: USGS observed discharge -> OBS=
         usgs_dir = os.path.join(work, "USGS")
         try:
-            series = obs.fetch_usgs_discharge(g["id"], run_start, run_end)
+            oinf: dict = {}
+            series = obs.get_series(g["id"], run_start, run_end, info=oinf)
             if obs.write_ef5_obs(g["id"], series, usgs_dir):
-                yield ("status", f"USGS observed discharge: {len(series)} points")
+                src = ("🗄 from saved storage" if oinf.get("cached")
+                       else f"fetched {oinf.get('fetched_windows', 0)} missing window(s)")
+                yield ("status", f"USGS observed discharge: {len(series)} points ({src})")
         except Exception:
             usgs_dir = ""
 
@@ -530,7 +533,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             bc_dir = os.path.join(work, "USGS_bc")
             for b_ in bc_gauges:
                 try:
-                    s = obs.fetch_usgs_discharge(b_["id"], f0, run_end)
+                    s = obs.get_series(b_["id"], f0, run_end)
                 except Exception:
                     s = []
                 p = obs.write_ef5_obs(b_["id"], s, bc_dir) if s else None

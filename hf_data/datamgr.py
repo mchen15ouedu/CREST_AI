@@ -158,7 +158,7 @@ def compact_results() -> dict:
 def stats() -> dict:
     """Disk usage per data category (feeds /api/datastats)."""
     out = {}
-    for name in ("forcing", "results", "states", "frames", "params", "users", "errors"):
+    for name in ("forcing", "results", "states", "frames", "params", "users", "obs", "errors"):
         p = os.path.join(CACHE_DIR, name)
         out[name] = {"mb": round(_dir_size(p) / 1e6, 1)} if os.path.isdir(p) else {"mb": 0}
         if name == "forcing" and os.path.isdir(p):

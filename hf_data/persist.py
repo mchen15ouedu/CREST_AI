@@ -13,6 +13,8 @@ to a PRIVATE HF dataset (CREST_STATE_REPO, default vincewin/CREST_state):
   users/    account profiles (favorites, simulation history)
   reports_saved/  registered users' report libraries (PDFs; anonymous users'
             reports stay in the ephemeral reports/ cache and are NOT synced)
+  obs/      per-gauge USGS observed-discharge parquet stores (obs.get_series)
+            — repeat runs and calibration read these instead of hitting NWIS
 
 Deliberately NOT persisted: frames/ (re-renderable from states in seconds),
 forcing/ (re-derivable from the public CREST_data dataset), errors/ + local
@@ -47,7 +49,7 @@ def _cache_dir() -> str:
 
 REPO = os.environ.get("CREST_STATE_REPO", "vincewin/CREST_state")
 EVERY_S = float(os.environ.get("CREST_PERSIST_EVERY_S", "600"))
-SYNC_DIRS = ("states", "results", "params", "users", "reports_saved")
+SYNC_DIRS = ("states", "results", "params", "users", "reports_saved", "obs")
 
 _wake = threading.Event()
 _started = False
