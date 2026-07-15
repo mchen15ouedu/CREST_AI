@@ -130,7 +130,14 @@ def train_burst(dataset, ck: dict | None, seconds: float = 200.0,
             pv = model(torch.from_numpy(Xva).to(dev)).cpu().numpy()
         val_nse = round(nse(itq(pv).ravel(), itq(Yva).ravel()), 3)
         log(f"  val NSE (pooled, {len(Xva)} windows): {val_nse}")
+    # EVERYTHING returned must be CPU tensors: ZeroGPU pickles the result back
+    # into a parent process where CUDA is emulated (rebuild_cuda_tensor crashes)
+    opt_sd = opt.state_dict()
+    for st in opt_sd.get("state", {}).values():
+        for k2, v2 in list(st.items()):
+            if torch.is_tensor(v2):
+                st[k2] = v2.cpu()
     return {"state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
-            "opt": opt.state_dict(), "epoch": epoch, "stats": stats,
+            "opt": opt_sd, "epoch": epoch, "stats": stats,
             "val_nse": val_nse, "n_train": int(n), "horizon": H, "lookback": L,
             "feat_version": 1, "when": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}

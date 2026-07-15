@@ -125,34 +125,52 @@ def nowcast(payload: str) -> str:
         return json.dumps({"ok": False, "reason": f"{type(e).__name__}: {e}"})
 
 
-# ---- data prep (CPU, month-at-a-time, resumable) ------------------------------
-def prep(gauge_ids: str, months_spec: str, progress=gr.Progress()):
-    logs = []
+# ---- data prep (background thread on the Space; survives closed clients) ------
+_prep_log: list[str] = []
+_prep_thread: threading.Thread | None = None
 
-    def log(m):
-        logs.append(str(m))
 
+def _prep_worker(gauges, months):
+    _prep_log.append(f"prep started: {len(gauges)} gauges × {len(months)} months")
+    for ym in months:
+        y, m = map(int, ym.split("_"))
+        try:
+            rep = D.prep_month(gauges, y, m, log=_prep_log.append)
+            _prep_log.append(f"{ym}: +{rep['obs_added']} obs, +{rep['mrms_added']} mrms "
+                             f"({rep['skipped']} already present)")
+        except Exception as e:
+            _prep_log.append(f"{ym}: FAILED {type(e).__name__}: {e}")
+    _prep_log.append("prep DONE")
+
+
+def prep_start(gauge_ids: str, months_spec: str):
+    """Kick the resumable background prep (idempotent while running)."""
+    global _prep_thread
+    if not os.environ.get("HF_TOKEN"):
+        return "❌ HF_TOKEN secret not set yet — add it in Space settings first"
+    if _prep_thread is not None and _prep_thread.is_alive():
+        return "already running:\n" + "\n".join(_prep_log[-5:])
     gauges = [g for g in (_gauge_meta(s.strip()) for s in gauge_ids.split(",") if s.strip()) if g]
     if not gauges:
         return "no valid gauge ids (must be in the GAGES-II catalog)"
     months = _months_range(months_spec)
-    log(f"{len(gauges)} gauges × {len(months)} months")
-    for i, ym in enumerate(months):
-        progress((i, len(months)), desc=ym)
-        y, m = map(int, ym.split("_"))
-        try:
-            rep = D.prep_month(gauges, y, m, log=log)
-            log(f"{ym}: +{rep['obs_added']} obs, +{rep['mrms_added']} mrms "
-                f"({rep['skipped']} already present)")
-        except Exception as e:
-            log(f"{ym}: FAILED {type(e).__name__}: {e}")
-    return "\n".join(logs[-60:])
+    _prep_log.clear()
+    _prep_thread = threading.Thread(target=_prep_worker, args=(gauges, months), daemon=True)
+    _prep_thread.start()
+    return f"started: {[g['id'] for g in gauges]} × {len(months)} months (watch the log)"
+
+
+def prep_log():
+    running = _prep_thread is not None and _prep_thread.is_alive()
+    return f"[{'RUNNING' if running else 'idle'}]\n" + "\n".join(_prep_log[-40:])
 
 
 # ---- training (ZeroGPU bursts) -------------------------------------------------
-@GPU(duration=240)
-def _gpu_train(dataset, ck, seconds, log):
-    return T.train_burst(dataset, ck, seconds=seconds, device="cuda", log=log)
+@GPU(duration=110)                    # account max is lower than 240+queue margin
+def _gpu_train(dataset, ck, seconds):
+    # ZeroGPU pickles args into a worker process — closures can't cross, so
+    # the burst logs to stdout (visible in the Space logs) only
+    return T.train_burst(dataset, ck, seconds=seconds, device="cuda", log=print)
 
 
 def do_train(gauge_ids: str, months_spec: str, seconds: float):
@@ -162,23 +180,27 @@ def do_train(gauge_ids: str, months_spec: str, seconds: float):
     def log(m):
         logs.append(str(m))
 
-    gauges = [g for g in (_gauge_meta(s.strip()) for s in gauge_ids.split(",") if s.strip()) if g]
-    months = _months_range(months_spec)
-    if _dataset is None:
-        log("building dataset from prepared months…")
-        _dataset = T.build_dataset(gauges, months, VAL_MONTHS, log=log)
-    if _dataset is None:
-        return "no training data — run Data prep first.\n" + "\n".join(logs)
-    log(f"train windows: {len(_dataset[0])}, val windows: {len(_dataset[2])}")
-    ck = T.load_ckpt()
-    ck = _gpu_train(_dataset, ck, float(seconds), log)
-    T.save_ckpt(ck)
-    with _lock:
-        _ck, _model = ck, DILSTM()
-        _model.load_state_dict(ck["state_dict"])
-        _model.eval()
-    log(f"checkpoint saved: epoch {ck['epoch']}, val NSE {ck.get('val_nse')}")
-    return "\n".join(logs[-60:])
+    try:
+        gauges = [g for g in (_gauge_meta(s.strip()) for s in gauge_ids.split(",") if s.strip()) if g]
+        months = _months_range(months_spec)
+        if _dataset is None:
+            log("building dataset from prepared months…")
+            _dataset = T.build_dataset(gauges, months, VAL_MONTHS, log=log)
+        if _dataset is None:
+            return "no training data — run Data prep first.\n" + "\n".join(logs)
+        log(f"train windows: {len(_dataset[0])}, val windows: {len(_dataset[2])}")
+        ck = T.load_ckpt()
+        ck = _gpu_train(_dataset, ck, min(float(seconds), 90.0))
+        T.save_ckpt(ck)
+        with _lock:
+            _ck, _model = ck, DILSTM()
+            _model.load_state_dict(ck["state_dict"])
+            _model.eval()
+        log(f"checkpoint saved: epoch {ck['epoch']}, val NSE {ck.get('val_nse')}")
+        return "\n".join(logs[-60:])
+    except Exception:
+        import traceback
+        return "TRAIN FAILED\n" + "\n".join(logs) + "\n" + traceback.format_exc()[-1200:]
 
 
 @GPU(duration=30)
@@ -212,15 +234,16 @@ with gr.Blocks(title="CREST_nowcast") as demo:
         gids = gr.Textbox(label="gauge ids (GAGES-II)", value=DEFAULT_GAUGES)
         mons = gr.Textbox(label="months (YYYY_MM-YYYY_MM)", value=DEFAULT_MONTHS)
         prep_out = gr.Textbox(label="log", lines=16)
-        gr.Button("Prepare training data", variant="primary").click(
-            prep, inputs=[gids, mons], outputs=prep_out)
+        gr.Button("Start background prep", variant="primary").click(
+            prep_start, inputs=[gids, mons], outputs=prep_out, api_name="prep_start")
+        gr.Button("Refresh log").click(prep_log, outputs=prep_out, api_name="prep_log")
     with gr.Tab("Train"):
         gids2 = gr.Textbox(label="gauge ids", value=DEFAULT_GAUGES)
         mons2 = gr.Textbox(label="train months", value=DEFAULT_MONTHS)
-        secs = gr.Slider(30, 220, value=180, label="GPU seconds this burst")
+        secs = gr.Slider(30, 90, value=90, label="GPU seconds this burst")
         train_out = gr.Textbox(label="log", lines=16)
         gr.Button("Train burst (ZeroGPU)", variant="primary").click(
-            do_train, inputs=[gids2, mons2, secs], outputs=train_out)
+            do_train, inputs=[gids2, mons2, secs], outputs=train_out, api_name="train")
     with gr.Tab("API"):
         inp = gr.Textbox(label="payload JSON", lines=8)
         out = gr.Textbox(label="response", lines=8)
