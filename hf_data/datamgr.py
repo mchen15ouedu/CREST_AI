@@ -150,8 +150,9 @@ def compact_results() -> dict:
             with open(p, "w") as fh:
                 json.dump(rec, fh)
             n_rec += 1
-        except Exception:
-            pass
+        except Exception as e:                    # corrupt record skipped forever
+            from hf_data import crashlog
+            crashlog.capture("compact", e, file=os.path.basename(p))
     return {"records": n_rec, "duplicate_rows_dropped": n_rows_dropped}
 
 

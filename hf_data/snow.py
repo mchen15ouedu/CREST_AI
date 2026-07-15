@@ -96,8 +96,9 @@ def clip_snow_grids(bbox, out_dir: str, unsafe_ssl: bool | None = None) -> dict:
             with rasterio.open(path, "w", **profile) as dst:
                 dst.write(data, 1)
             out[key] = path
-        except Exception:
-            pass
+        except Exception as e:                    # run proceeds without this grid
+            from hf_data import crashlog
+            crashlog.capture("snow:clip", e, grid=key)
     return out
 
 
@@ -147,7 +148,9 @@ def build_temp_dem(bbox, dem_path: str, out_path: str) -> str | None:
         ) as dst:
             dst.write(agg, 1)
         return out_path
-    except Exception:
+    except Exception as e:                        # temp runs without DEM extrapolation
+        from hf_data import crashlog
+        crashlog.capture("snow:temp-dem", e)
         return None
 
 

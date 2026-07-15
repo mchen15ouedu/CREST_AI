@@ -36,6 +36,7 @@ from hf_data.pipeline import parse_query
 from hf_data.statecache import CACHE_DIR
 
 crashlog.init()                    # optional SENTRY_DSN mirror (Sentry/GlitchTip/Bugsink)
+crashlog.install_thread_hook()     # record any thread that dies unwrapped
 datamgr.start_janitor()            # hourly cache cleanup + result compaction
 persist.start()                    # restore states/results/params/users from the
                                    # private dataset, then keep them synced
@@ -95,6 +96,30 @@ async def _error_recorder(request: Request, call_next):
 def api_errors(n: int = 50):
     """Recent recorded errors (the error-watchdog log)."""
     return {"errors": crashlog.recent(min(n, 200)), **crashlog.stats()}
+
+
+class ClientError(BaseModel):
+    message: str = ""
+    source: str | None = None
+    line: int | None = None
+    stack: str | None = None
+
+
+_client_err_ts: list[float] = []   # flood guard for the browser error beacon
+
+
+@app.post("/api/clienterror")
+def api_clienterror(err: ClientError):
+    """Browser-side error beacon (app.js window.onerror/unhandledrejection) —
+    frontend crashes land in the same watchdog log as server errors."""
+    now = time.time()
+    _client_err_ts[:] = [t for t in _client_err_ts if now - t < 60]
+    if len(_client_err_ts) >= 30:                    # global: max 30/min
+        return {"ok": False, "throttled": True}
+    _client_err_ts.append(now)
+    crashlog.capture("client:js", message=(err.message or "")[:400],
+                     source=err.source, line=err.line, stack=err.stack)
+    return {"ok": True}
 
 
 @app.get("/api/datastats")
@@ -244,8 +269,8 @@ async def auth_callback(request: Request):
             "name": info.get("name") or info.get("preferred_username", "user"),
             "picture": info.get("picture"),
         }
-    except Exception:
-        pass
+    except Exception as e:
+        crashlog.capture("auth:callback", e)   # user lands signed-out; know why
     return RedirectResponse("/")
 
 
@@ -560,8 +585,8 @@ def api_simulate(req: SimRequest, request: Request):
                 "t_start": t0.isoformat(), "t_end": t1.isoformat(),
                 "label": req.label, "model": req.model, "snow": req.snow,
                 "when": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")})
-        except Exception:
-            pass
+        except Exception as e:
+            crashlog.capture("history:save", e, user=u.get("username"))
     return {"sim_id": job.id, "gauge_ids": job.gauge_ids,
             "t_start": t0.isoformat(), "t_end": t1.isoformat(),
             "warning": " ".join(warnings) or None,
@@ -598,17 +623,22 @@ def api_history(request: Request):
 async def _drain(job, cursor: int = 0):
     """Replay the job's event log from `cursor`, then follow it live. Multiple
     clients (or a reopened browser) can each attach with their own cursor."""
-    while True:
-        if cursor < len(job.events):
-            ev = job.events[cursor]
-            cursor += 1
-            yield {"data": json.dumps(ev)}
-            if ev.get("kind") in ("all_done", "cal_done"):
+    try:
+        while True:
+            if cursor < len(job.events):
+                ev = job.events[cursor]
+                cursor += 1
+                yield {"data": json.dumps(ev)}
+                if ev.get("kind") in ("all_done", "cal_done"):
+                    break
+            elif job.done.is_set():
                 break
-        elif job.done.is_set():
-            break
-        else:
-            await asyncio.sleep(0.15)
+            else:
+                await asyncio.sleep(0.15)
+    except asyncio.CancelledError:     # client closed the tab — not an error
+        raise
+    except Exception as e:             # SSE runs outside the HTTP middleware
+        crashlog.capture("sse:drain", e, job=getattr(job, "id", "?"), cursor=cursor)
 
 
 @app.get("/api/stream/{sim_id}")

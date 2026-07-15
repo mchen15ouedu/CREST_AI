@@ -1,5 +1,31 @@
 "use strict";
 
+// ---- error watchdog beacon: browser errors -> server crashlog -----------
+let errBeaconCount = 0;
+function reportClientError(message, source, line, stack) {
+  if (errBeaconCount >= 10) return;             // per-page-load cap
+  errBeaconCount++;
+  try {
+    fetch("/api/clienterror", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: String(message || "").slice(0, 400),
+        source: String(source || "").slice(0, 200),
+        line: Number(line) || 0,
+        stack: String(stack || "").slice(0, 1200),
+      }),
+    }).catch(() => {});
+  } catch (e) { /* the beacon itself must never throw */ }
+}
+window.addEventListener("error", (e) => {
+  if (e.message) reportClientError(e.message, e.filename, e.lineno,
+                                   e.error && e.error.stack);
+});
+window.addEventListener("unhandledrejection", (e) =>
+  reportClientError("unhandledrejection: " +
+      ((e.reason && (e.reason.message || e.reason)) || "?"),
+    "", 0, e.reason && e.reason.stack));
+
 // ---- map ---------------------------------------------------------------
 const esriImg = L.tileLayer(
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",

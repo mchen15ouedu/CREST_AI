@@ -139,8 +139,9 @@ def propose(base: dict, metrics: dict, history: list[dict], k: int,
                                 "goal": str(c.get("goal", ""))[:120], "updates": ups})
             if out:
                 return out
-        except Exception:
-            pass
+        except Exception as e:                    # heuristic fallback degrades
+            from hf_data import crashlog          # calibration quality — record it
+            crashlog.capture("cal:llm-propose", e, round=rnd)
     return _heuristic_candidates(base, k, rnd)
 
 

@@ -45,6 +45,22 @@ def init():
     return _sentry_on
 
 
+def install_thread_hook():
+    """Backstop: a thread that dies OUTSIDE its own try/capture still gets
+    recorded (all current workers are wrapped — this catches future ones)."""
+    orig = threading.excepthook
+
+    def hook(args):
+        try:
+            capture(f"thread:{args.thread.name if args.thread else '?'}",
+                    args.exc_value)
+        except Exception:
+            pass
+        orig(args)
+
+    threading.excepthook = hook
+
+
 def _path() -> str:
     d = os.path.join(CACHE_DIR, "errors")
     os.makedirs(d, exist_ok=True)

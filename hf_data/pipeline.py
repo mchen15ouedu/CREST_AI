@@ -68,8 +68,9 @@ def parse_query(query: str, hours: int = 48, llm_model: str | None = None) -> Ev
     if _llm.available():
         try:
             return _parse_with_llm(q, hours)
-        except Exception:
-            pass
+        except Exception as e:                    # gazetteer fallback still runs,
+            from hf_data import crashlog          # but an LLM outage is worth a trace
+            crashlog.capture("acp:llm-parse", e, query=q[:200])
     # offline gazetteer fallback
     ql = q.lower()
     for key, c in _GAZETTEER.items():
@@ -338,7 +339,9 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                 for b_ in bc_gauges:
                     try:
                         s = obs.get_series(b_["id"], f0_est, t_end)
-                    except Exception:
+                    except Exception as e:        # gauge silently loses its BC role
+                        from hf_data import crashlog
+                        crashlog.capture("obs:bc", e, gauge=b_["id"])
                         s = []
                     cov = _obs_coverage(s, f0_est, t_end) if s else 0.0
                     p = obs.write_ef5_obs(b_["id"], s, bc_dir) if s else None
@@ -534,7 +537,9 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             for b_ in bc_gauges:
                 try:
                     s = obs.get_series(b_["id"], f0, run_end)
-                except Exception:
+                except Exception as e:            # gauge drops out of DA silently
+                    from hf_data import crashlog
+                    crashlog.capture("obs:bc", e, gauge=b_["id"])
                     s = []
                 p = obs.write_ef5_obs(b_["id"], s, bc_dir) if s else None
                 if p:
@@ -676,8 +681,9 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         try:
             statecache.save_record(g["id"], cache_model, pl["cached_rows"] + new_rows, st,
                                    variant=variant)
-        except Exception:
-            pass
+        except Exception as e:                    # caching silently stops working
+            from hf_data import crashlog
+            crashlog.capture("statecache:save", e, gauge=g["id"], model=cache_model)
 
 
 if __name__ == "__main__":
