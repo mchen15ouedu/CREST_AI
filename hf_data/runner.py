@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import glob
+import math
 import time
 import subprocess
 import threading
@@ -53,9 +54,10 @@ def _parse_ts_line(header: list[str], line: str, colmap: dict | None = None) -> 
         return None
     def f(x):
         try:
-            return float(x)
+            v = float(x)
         except ValueError:
             return None
+        return None if (math.isnan(v) or math.isinf(v)) else v
     row = {"time": parts[0], "sim_q": f(parts[1]), "obs_q": f(parts[2]), "precip": f(parts[3])}
     for key, i in (colmap or {}).items():
         if i < len(parts):

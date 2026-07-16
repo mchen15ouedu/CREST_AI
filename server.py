@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import asyncio
 import json
+import math
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -631,6 +632,21 @@ def api_history(request: Request):
     return {"history": hist}
 
 
+def _sse_json(ev) -> str:
+    """json.dumps emits bare NaN/Infinity, which JSON.parse rejects — one such
+    value breaks the whole event stream in the browser. Missing values travel as
+    null, matching the convention the rest of the pipeline already uses."""
+    def clean(v):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        if isinstance(v, dict):
+            return {k: clean(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [clean(x) for x in v]
+        return v
+    return json.dumps(clean(ev), allow_nan=False)
+
+
 async def _drain(job, cursor: int = 0):
     """Replay the job's event log from `cursor`, then follow it live. Multiple
     clients (or a reopened browser) can each attach with their own cursor."""
@@ -639,7 +655,7 @@ async def _drain(job, cursor: int = 0):
             if cursor < len(job.events):
                 ev = job.events[cursor]
                 cursor += 1
-                yield {"data": json.dumps(ev)}
+                yield {"data": _sse_json(ev)}
                 if ev.get("kind") in ("all_done", "cal_done"):
                     break
             elif job.done.is_set():
