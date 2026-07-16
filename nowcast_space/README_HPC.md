@@ -1,16 +1,15 @@
-# Migrating the DI-LSTM nowcaster pipeline to an HPC (SLURM)
+# Migrating the DI-LSTM nowcaster pipeline to an HPC / GPU server
 
-The sbatch files are cluster-agnostic — three lines to adapt on any SLURM
-system (partition, module load, scratch path). Discover your cluster's values:
+Two launch styles, same Python scripts:
 
-```bash
-sinfo -o "%P %G %l"        # partitions, their GPUs (gres), walltime limits
-module avail 2>&1 | grep -iE "mamba|conda"
-echo $SCRATCH; df -h /scratch 2>/dev/null   # where the big filesystem lives
-```
-
-(For reference, OU OSCER Sooner used `sooner_test` / `sooner_gpu_test` and
-`module load Mamba`.)
+- **No scheduler (plain GPU server)** — use `./run_prep.sh` / `./run_train.sh`
+  (nohup wrappers: survive SSH disconnects, log to prep.log / train.log).
+  Current target machine: token at `~/huggingface.txt`, scratch at
+  `/media/scratch/$USER` — both already baked into the scripts.
+- **SLURM cluster** — use `sbatch slurm_prep.sbatch` / `slurm_train.sbatch`
+  after editing three header lines (partition, module load, scratch);
+  discover values with `sinfo -o "%P %G %l"` and
+  `module avail 2>&1 | grep -iE "mamba|conda"`.
 
 What moves where:
 
@@ -86,8 +85,9 @@ The 4 starter gauges × 2023_01–2025_06 are already prepped. For new gauges or
 periods:
 
 ```bash
-sbatch slurm_prep.sbatch                 # edit --gauges/--months inside first
-# or interactively:
+./run_prep.sh --gauges "07331600, 07316000" --months 2023_01-2025_06   # no scheduler
+sbatch slurm_prep.sbatch                 # SLURM (edit --gauges/--months inside first)
+# or fully interactively:
 export HF_TOKEN=$(tr -d ' \r\n' < ~/huggingface.txt)
 python prep_hpc.py --gauges "07331600, 07316000" --months 2023_01-2025_06
 ```
@@ -97,6 +97,15 @@ freely after a timeout. Budget very roughly 2–10 min per month (one CONUS
 MRMS tar download dominates; HPC networks are slower than HF-internal).
 
 ## 5. Train
+
+No scheduler:
+
+```bash
+chmod +x run_train.sh && ./run_train.sh
+tail -f train.log                        # watch epochs / val NSE
+```
+
+SLURM:
 
 ```bash
 sbatch slurm_train.sbatch
