@@ -219,6 +219,17 @@ def status():
             f"lookback {ck.get('lookback')} h → horizon {ck.get('horizon')} h")
 
 
+def reload_model():
+    """Drop the cached model and refetch the checkpoint from the model repo —
+    used after an external (HPC) training run uploads new weights."""
+    global _model, _ck
+    with _lock:
+        _model, _ck = None, None
+    # hf_hub_download resolves the latest commit on each call, so _ensure_model
+    # (via status) fetches the new checkpoint revision automatically
+    return "reloaded → " + status()
+
+
 with gr.Blocks(title="CREST_nowcast") as demo:
     gr.Markdown("# 🔮 CREST_nowcast — DI-LSTM streamflow nowcasting backend\n"
                 "Serves the AI nowcast tail for "
@@ -228,6 +239,8 @@ with gr.Blocks(title="CREST_nowcast") as demo:
     with gr.Tab("Status"):
         st = gr.Textbox(label="model status", value="press refresh")
         gr.Button("refresh").click(status, outputs=st, api_name="status")
+        gr.Button("Reload model (after HPC training)").click(
+            reload_model, outputs=st, api_name="reload")
         gpu_out = gr.Textbox(label="GPU check")
         gr.Button("ZeroGPU check").click(gpu_check, outputs=gpu_out, api_name="gpu_check")
     with gr.Tab("Data prep"):
