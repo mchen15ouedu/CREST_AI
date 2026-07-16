@@ -224,6 +224,8 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
   background: rgba(17,23,31,.92); border: 1px solid #223; border-radius: 8px; padding: 8px 10px; color: #cfe0ee;
   width: 160px;
 }
+/* slide right while the Model-options panel is expanded so they never overlap */
+#left-panel:not(.collapsed):not(.hidden) ~ #q-legend { left: 324px; }
 #q-legend .q-title { font-size: 11px; color: #8fa3b3; margin-bottom: 5px; }
 #q-legend .q-bar { height: 10px; border-radius: 4px;
   background: linear-gradient(90deg, #59626c 0%, #7e8a95 14%, #3fae5a 23%, #57c258 36%,

@@ -492,6 +492,9 @@ function handleSimEvent(simId, ev) {
     else addMsg(`✅ <b>${ev.gauge_id}</b> complete (${ev.n} steps)`, "status");
     if (ev.gauge_id === panelGauge) renderHydro(ev.gauge_id);
     if (ev.returncode === 0) fetchNowcast(ev.gauge_id);
+  } else if (ev.kind === "params") {
+    // effective run parameters — used to pre-fill Model options for manual tuning
+    (gaugeResult[ev.gauge_id] = gaugeResult[ev.gauge_id] || {}).runParams = ev;
   } else if (ev.kind === "result") {
     gaugeResult[ev.gauge_id] = { ...(gaugeResult[ev.gauge_id] || {}),
       meta: ev.meta, metrics: ev.metrics, report: ev.report };
@@ -680,9 +683,41 @@ function maybeOfferCalibration(gid, metrics) {
     lp.classList.remove("collapsed");
     document.getElementById("adv-body").classList.remove("hidden");
     document.getElementById("adv-arrow").textContent = "▾";
-    addMsg("🛠 Opened <b>Model options → Advanced parameters</b>. Adjust values and hit Simulate again — " +
+    const pf = prefillModelOptions(gid);
+    addMsg("🛠 Opened <b>Model options</b> pre-filled with this run's setup — " +
+      `window <b>${document.getElementById("k-start").value || "?"} → ` +
+      `${document.getElementById("k-end").value || "?"}</b>` +
+      (pf.model ? `, model <b>${pf.model.toUpperCase()}</b>` : "") +
+      (pf.n ? `, <b>${pf.n}</b> parameter values (${pf.src || "a-priori"})` : "") +
+      ". That's your starting point — adjust, hit <b>Set</b>, then Simulate again; " +
       "if your run beats the stored NSE, the parameters are saved for this basin automatically.", "bot");
   };
+}
+
+// pre-fill the Model options panel from the last run's effective setup, so
+// manual tuning starts from what the AI actually used (window, model, params)
+function prefillModelOptions(gid) {
+  const rp = (gaugeResult[gid] || {}).runParams || {};
+  if (lastSim && lastSim.tStart) {
+    document.getElementById("k-start").value = lastSim.tStart.slice(0, 10);
+    if (lastSim.tEnd) document.getElementById("k-end").value = lastSim.tEnd.slice(0, 10);
+    if (lastSim.hours) document.getElementById("k-hours").value = lastSim.hours;
+  }
+  const meta = (gaugeResult[gid] || {}).meta || {};
+  const model = rp.model || meta.model;
+  if (["crestphys", "crest", "hp"].includes(model))
+    document.getElementById("k-model").value = model;   // enables the param inputs
+  updateParamAvailability();
+  let n = 0;
+  const vals = { ...(rp.wb || {}), ...(rp.kw || {}) };
+  Object.entries(vals).forEach(([k, v]) => {
+    const inp = document.getElementById("adv-" + String(k).toLowerCase());
+    if (inp && typeof v === "number" && isFinite(v)) {
+      inp.value = +v.toPrecision(4);
+      n++;
+    }
+  });
+  return { n, model, src: rp.source };
 }
 
 async function startCalibration(gid) {
@@ -1118,7 +1153,8 @@ function renderHydroBig() {
   el.style.height = Math.round(_hmBaseH() * Math.max(1, (hmZoom + 1) / 2)) + "px";
   const { traces, layout } = _hydroFig(rows, true,
     gaugeResult[panelGauge] && gaugeResult[panelGauge].nowcast);
-  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
+  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true,
+                                     scrollZoom: true, doubleClick: "reset" });
   _bindHydroClick(el, panelGauge);
   applyHmZoom();
   if (hydroSelTime) renderReadout(panelGauge, hydroSelTime);
@@ -1144,6 +1180,10 @@ function closeHydroModal() {
 document.getElementById("rp-expand").onclick = openHydroModal;
 document.getElementById("hm-zin").onclick = () => hmZoomBy(+HM_ZSTEP);
 document.getElementById("hm-zout").onclick = () => hmZoomBy(-HM_ZSTEP);
+document.getElementById("hm-reset").onclick = () => {
+  hmZoom = 1;                 // undo canvas magnification AND any axis drag/scroll zoom
+  renderHydroBig();           // fresh layout -> original full time range
+};
 document.getElementById("hm-close").onclick = closeHydroModal;
 document.getElementById("hydro-modal").addEventListener("click", (e) => {
   if (e.target.id === "hydro-modal") closeHydroModal();
@@ -1682,7 +1722,7 @@ function buildAdvanced() {
       const l = document.createElement("label");
       l.textContent = k;
       const inp = document.createElement("input");
-      inp.type = "number"; inp.step = "any"; inp.placeholder = "auto";
+      inp.type = "number"; inp.step = "0.01"; inp.placeholder = "auto";
       inp.id = "adv-" + k; inp.dataset.param = k;
       l.appendChild(inp); grid.appendChild(l);
     });

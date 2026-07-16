@@ -86,6 +86,8 @@ class SimJob:
                     self.meta[gid] = payload
                 elif kind == "params":
                     self.params[gid] = payload      # effective wb/kw for paramstore
+                    # also to the client: manual tuning pre-fills Model options
+                    self._emit({"kind": "params", "gauge_id": gid, **payload})
                 elif kind == "status":
                     self._emit({"kind": "status", "gauge_id": gid, "msg": payload})
                 elif kind == "hydro":
