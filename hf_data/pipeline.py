@@ -381,6 +381,15 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         yield ("done", {"returncode": -9, "cancelled": True})
         return
 
+    if timestep == "1h" and not no_cache and not use_mock:
+        try:      # fleet pre-runs (read-only repo): rows serve instantly below,
+            from hf_data import fleetstore     # states give 10-day warm starts
+            if fleetstore.ensure_local(g["id"], cache_model) == "fetched":
+                yield ("status", "🚚 pre-simulated by the background fleet — "
+                                 "loading saved results and model states")
+        except Exception:
+            pass
+
     # --- result cache: reuse overlap, simulate only the missing window (task #6) ---
     # the row cache is hourly; a sub-hourly run neither reuses nor writes it
     hourly = timestep == "1h" and not no_cache
