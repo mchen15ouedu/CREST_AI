@@ -1,13 +1,16 @@
 # Migrating the DI-LSTM nowcaster pipeline to an HPC (SLURM)
 
-Both sbatch files are pre-configured for **OU OSCER (Sooner)**: partitions
-`sooner_test` (CPU, default, 48 h) and `sooner_gpu_test` (L40S/H100/RTX 6000
-Ada via `--gres=gpu:1`, 48 h), `module load Mamba` + `source activate`
-(OSCER says never run `mamba init` — it breaks other Anaconda setups), and
-`HF_HOME=/scratch/$USER/hf_cache` (auto-purged ~2 weeks; fine, it's all
-re-downloadable). To pin a GPU type use `--partition=sooner_gpu_test_h100`
-or `..._ada`. On another cluster, edit the partition/module lines per the
-"SLURM knobs" section at the bottom.
+The sbatch files are cluster-agnostic — three lines to adapt on any SLURM
+system (partition, module load, scratch path). Discover your cluster's values:
+
+```bash
+sinfo -o "%P %G %l"        # partitions, their GPUs (gres), walltime limits
+module avail 2>&1 | grep -iE "mamba|conda"
+echo $SCRATCH; df -h /scratch 2>/dev/null   # where the big filesystem lives
+```
+
+(For reference, OU OSCER Sooner used `sooner_test` / `sooner_gpu_test` and
+`module load Mamba`.)
 
 What moves where:
 
@@ -42,13 +45,25 @@ cd CREST_AI/nowcast_space        # model.py train.py data.py train_hpc.py prep_h
 
 ## 2. Environment (once)
 
+Conda envs and caches are what silently fill home quotas — put them on
+scratch from the start:
+
 ```bash
-module load Mamba                # OSCER; elsewhere: Anaconda3/Miniconda
+module load Mamba                              # or Anaconda3/Miniconda
+export SCRATCH=/scratch/$USER                  # adjust to your cluster
+conda config --add envs_dirs $SCRATCH/conda_envs
+conda config --add pkgs_dirs $SCRATCH/conda_pkgs
+export PIP_CACHE_DIR=$SCRATCH/pip_cache
+
 mamba create -n nowcast python=3.11 -y
-source activate nowcast          # OSCER convention (no `mamba init`, no `conda activate`)
+source activate nowcast                        # (avoid `mamba init` on shared clusters)
 pip install torch numpy pandas pyarrow huggingface_hub requests
 python -c "import torch; print(torch.cuda.is_available())"   # on a GPU node: True
 ```
+
+Caveat: many clusters purge scratch (2–4 weeks untouched). Everything here is
+re-creatable (env from this README, data/checkpoints live in the HF repos),
+so a purge costs minutes, not work.
 
 If the default `torch` wheel doesn't see the GPU, install the build matching
 the cluster's CUDA driver, e.g. `pip install torch --index-url
@@ -112,6 +127,27 @@ python train_hpc.py --gauges "01011000, 08166200, 08167000, 08144500" \
 Space → Status tab → **Reload model** (or REST `api_name=reload`). The
 dashboard's next nowcast call uses the new checkpoint automatically. Nothing
 else to deploy.
+
+## Claude Code on the cluster (optional collaborator)
+
+To have Claude Code work alongside you on the HPC without the interactive
+login (no browser / paste there):
+
+```bash
+# on your LAPTOP (logged-in Claude Code, working clipboard):
+claude setup-token            # browser flow → prints a 1-year token; save to a file
+scp claude_token.txt <you>@<hpc>:~/.claude_code_token
+
+# on the HPC (type these short lines by hand):
+chmod 600 ~/.claude_code_token
+echo 'export CLAUDE_CODE_OAUTH_TOKEN=$(cat ~/.claude_code_token)' >> ~/.bashrc
+echo 'export CLAUDE_CONFIG_DIR=$SCRATCH/claude_config' >> ~/.bashrc   # keep ~/.claude off home quota
+source ~/.bashrc && claude    # starts authenticated, no paste needed
+```
+
+Run it on the login node inside the cloned `CREST_AI/nowcast_space` folder —
+this README plus the code is enough context for it to submit and monitor the
+SLURM jobs.
 
 ## SLURM knobs to check on your cluster
 
