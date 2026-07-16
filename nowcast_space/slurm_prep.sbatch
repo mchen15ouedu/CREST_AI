@@ -1,16 +1,16 @@
 #!/bin/bash
-# Data prep on a CPU node (no GPU needed). Downloads one CONUS MRMS month-tar
-# per month, so give it scratch space + generous time for many months.
+# Data prep on an OSCER Sooner CPU node (no GPU needed). Downloads one CONUS
+# MRMS month-tar per month — /scratch keeps that off your home quota.
 #   sbatch slurm_prep.sbatch
 #
 #SBATCH --job-name=nowcast_prep
-#SBATCH --partition=normal         # any CPU partition
+#SBATCH --partition=sooner_test        # default CPU partition, 48 h max
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=12:00:00
 #SBATCH --output=prep_%j.log
 
-module load Anaconda3 2>/dev/null || module load Mamba 2>/dev/null || true
+module load Mamba                      # OSCER: never run `mamba init`; use source activate
 source activate nowcast
 
 export HF_TOKEN=$(cat ~/.hf_token)

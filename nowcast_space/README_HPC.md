@@ -1,5 +1,14 @@
 # Migrating the DI-LSTM nowcaster pipeline to an HPC (SLURM)
 
+Both sbatch files are pre-configured for **OU OSCER (Sooner)**: partitions
+`sooner_test` (CPU, default, 48 h) and `sooner_gpu_test` (L40S/H100/RTX 6000
+Ada via `--gres=gpu:1`, 48 h), `module load Mamba` + `source activate`
+(OSCER says never run `mamba init` — it breaks other Anaconda setups), and
+`HF_HOME=/scratch/$USER/hf_cache` (auto-purged ~2 weeks; fine, it's all
+re-downloadable). To pin a GPU type use `--partition=sooner_gpu_test_h100`
+or `..._ada`. On another cluster, edit the partition/module lines per the
+"SLURM knobs" section at the bottom.
+
 What moves where:
 
 | Piece | Runs on | Why |
@@ -34,9 +43,9 @@ cd CREST_AI/nowcast_space        # model.py train.py data.py train_hpc.py prep_h
 ## 2. Environment (once)
 
 ```bash
-module load Anaconda3            # or Mamba/Miniconda — whatever the cluster provides
-conda create -n nowcast python=3.11 -y
-conda activate nowcast
+module load Mamba                # OSCER; elsewhere: Anaconda3/Miniconda
+mamba create -n nowcast python=3.11 -y
+source activate nowcast          # OSCER convention (no `mamba init`, no `conda activate`)
 pip install torch numpy pandas pyarrow huggingface_hub requests
 python -c "import torch; print(torch.cuda.is_available())"   # on a GPU node: True
 ```
@@ -80,7 +89,7 @@ squeue -u $USER                          # watch the queue
 tail -f nowcast_<jobid>.log              # watch epochs / val NSE
 ```
 
-or interactively (e.g. `srun -p gpu --gres=gpu:1 --mem=16G -t 2:00:00 --pty bash`):
+or interactively (`srun -p sooner_gpu_test --gres=gpu:1 --mem=16G -t 2:00:00 --pty bash`):
 
 ```bash
 export HF_TOKEN=$(cat ~/.hf_token)
