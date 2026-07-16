@@ -50,7 +50,7 @@ scratch from the start:
 
 ```bash
 module load Mamba                              # or Anaconda3/Miniconda
-export SCRATCH=/scratch/$USER                  # adjust to your cluster
+export SCRATCH=/media/scratch/$USER             # this cluster; adjust elsewhere
 conda config --add envs_dirs $SCRATCH/conda_envs
 conda config --add pkgs_dirs $SCRATCH/conda_pkgs
 export PIP_CACHE_DIR=$SCRATCH/pip_cache
@@ -72,8 +72,8 @@ https://download.pytorch.org/whl/cu121`.
 ## 3. Token + cache locations (once)
 
 ```bash
-echo hf_xxxxxxxx > ~/.hf_token && chmod 600 ~/.hf_token     # read+write on the two private repos
-echo 'export HF_HOME=/scratch/$USER/hf_cache' >> ~/.bashrc  # month-tars are GB-scale; keep off home quota
+chmod 600 ~/huggingface.txt        # token file (read+write on the two private repos)
+echo 'export HF_HOME=/media/scratch/$USER/hf_cache' >> ~/.bashrc  # month-tars are GB-scale; keep off home quota
 ```
 
 Compute nodes need outbound HTTPS to huggingface.co (prep also needs
@@ -88,7 +88,7 @@ periods:
 ```bash
 sbatch slurm_prep.sbatch                 # edit --gauges/--months inside first
 # or interactively:
-export HF_TOKEN=$(cat ~/.hf_token)
+export HF_TOKEN=$(tr -d ' \r\n' < ~/huggingface.txt)
 python prep_hpc.py --gauges "07331600, 07316000" --months 2023_01-2025_06
 ```
 
@@ -104,10 +104,10 @@ squeue -u $USER                          # watch the queue
 tail -f nowcast_<jobid>.log              # watch epochs / val NSE
 ```
 
-or interactively (`srun -p sooner_gpu_test --gres=gpu:1 --mem=16G -t 2:00:00 --pty bash`):
+or interactively (`srun -p <gpu-partition> --gres=gpu:1 --mem=16G -t 2:00:00 --pty bash`):
 
 ```bash
-export HF_TOKEN=$(cat ~/.hf_token)
+export HF_TOKEN=$(tr -d ' \r\n' < ~/huggingface.txt)
 python train_hpc.py --gauges "01011000, 08166200, 08167000, 08144500" \
     --months 2023_01-2024_12 --max-epochs 5000 --patience 300
 ```

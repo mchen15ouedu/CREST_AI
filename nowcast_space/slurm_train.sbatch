@@ -20,10 +20,11 @@
 module load Mamba 2>/dev/null || module load Anaconda3 2>/dev/null || true
 source activate nowcast                # see README_HPC.md for the env
 
-# token lives OUTSIDE the repo:  echo hf_... > ~/.hf_token && chmod 600 ~/.hf_token
-export HF_TOKEN=$(cat ~/.hf_token)
+# token file: run once  chmod 600 ~/huggingface.txt
+# (tr strips stray spaces/CRLF in case the file was written on Windows)
+export HF_TOKEN=$(tr -d ' \r\n' < ~/huggingface.txt)
 # keep ALL caches off the (small) home quota
-SCRATCH=${SCRATCH:-/scratch/$USER}
+SCRATCH=${SCRATCH:-/media/scratch/$USER}
 export HF_HOME=${HF_HOME:-$SCRATCH/hf_cache}
 
 cd "$SLURM_SUBMIT_DIR"

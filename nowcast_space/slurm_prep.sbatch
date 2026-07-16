@@ -15,8 +15,8 @@
 module load Mamba 2>/dev/null || module load Anaconda3 2>/dev/null || true
 source activate nowcast
 
-export HF_TOKEN=$(cat ~/.hf_token)
-SCRATCH=${SCRATCH:-/scratch/$USER}
+export HF_TOKEN=$(tr -d ' \r\n' < ~/huggingface.txt)
+SCRATCH=${SCRATCH:-/media/scratch/$USER}
 export HF_HOME=${HF_HOME:-$SCRATCH/hf_cache}
 
 cd "$SLURM_SUBMIT_DIR"
