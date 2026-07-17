@@ -12,6 +12,8 @@ Space variables (Settings → Variables):
   FLEET_START / FLEET_END   period (defaults 2021-07-01 / 2026-06-30)
   FLEET_ORDER    "forward" (default) or "reverse" — run two runners (e.g. this
                  Space + the user's server) from opposite ends of the catalog
+  FLEET_SHARD    "K/N" — this runner takes gauges with catalog-index % N == K;
+                 N sibling Spaces with shards 0/N..N-1/N split the work disjointly
 Secret: HF_TOKEN (write access — uploads to vincewin/CREST_fleet).
 """
 import http.server
@@ -72,6 +74,8 @@ def fleet_loop():
             "--end", os.environ.get("FLEET_END", "2026-06-30")]
     if os.environ.get("FLEET_ORDER", "forward") == "reverse":
         args.append("--reverse")
+    if os.environ.get("FLEET_SHARD"):              # "K/N" — multi-Space split
+        args += ["--shard", os.environ["FLEET_SHARD"]]
     while True:
         state["phase"] = "running"
         state["passes"] += 1

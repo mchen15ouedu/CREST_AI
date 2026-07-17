@@ -129,6 +129,9 @@ def main():
     ap.add_argument("--reverse", action="store_true",
                     help="walk the catalog backwards — lets two runners (Space + "
                          "server) work from opposite ends without collisions")
+    ap.add_argument("--shard", default="",
+                    help='"K/N": run only gauges with catalog-index %% N == K — '
+                         "N parallel runners split the catalog disjointly")
     args = ap.parse_args()
 
     if not os.path.exists(os.path.join("EF5", "bin", "ef5")):
@@ -149,6 +152,10 @@ def main():
     else:
         ids = [s.strip().zfill(8) for s in args.gauges.split(",") if s.strip()]
 
+    if args.shard:
+        k, n = map(int, args.shard.split("/"))
+        ids = [g for i, g in enumerate(ids) if i % n == k]
+        print(f"shard {k}/{n}: {len(ids)} gauges in this slice", flush=True)
     done = _done_keys()
     todo = [g for g in ids if not any(k.startswith(g + "_") for k in done)]
     if args.reverse:
