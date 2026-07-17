@@ -126,6 +126,9 @@ def main():
     ap.add_argument("--gauges", default="all",
                     help='"all", comma list, or path to a file of gauge ids')
     ap.add_argument("--limit", type=int, default=0, help="stop after N gauges (0=all)")
+    ap.add_argument("--reverse", action="store_true",
+                    help="walk the catalog backwards — lets two runners (Space + "
+                         "server) work from opposite ends without collisions")
     args = ap.parse_args()
 
     if not os.path.exists(os.path.join("EF5", "bin", "ef5")):
@@ -148,6 +151,8 @@ def main():
 
     done = _done_keys()
     todo = [g for g in ids if not any(k.startswith(g + "_") for k in done)]
+    if args.reverse:
+        todo.reverse()
     if args.limit:
         todo = todo[:args.limit]
     print(f"fleet: {len(ids)} requested, {len(ids) - len(todo)} already done, "
