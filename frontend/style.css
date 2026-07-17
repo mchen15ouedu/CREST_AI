@@ -29,7 +29,8 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Se
   box-shadow: 0 6px 24px rgba(0,0,0,.45); display: flex; flex-direction: column; overflow: hidden;
 }
 #left-panel { left: 12px; }
-#right-panel { right: 12px; width: 380px; }
+/* narrower bottom reach leaves the bottom-right Leaflet layers control uncovered */
+#right-panel { right: 12px; width: 380px; max-height: calc(100% - var(--chat-h) - 118px); }
 .panel-head {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 10px 12px; font-weight: 600; border-bottom: 1px solid #223; background: rgba(255,255,255,.03);
@@ -38,6 +39,15 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Se
 .panel.collapsed .panel-body, .panel.collapsed #rp-tabs { display: none; }
 .panel.hidden { display: none; }
 .panel-head .toggle, .panel-head .close { background: none; border: none; color: #8fa3b3; cursor: pointer; font-size: 15px; }
+
+/* chip to bring the results panel back after the ✕ closes it */
+#rp-reopen {
+  position: absolute; top: 52px; right: 12px; z-index: 601;
+  border: 1px solid #3a5a7a; background: rgba(27,42,58,.96); color: #ffd479;
+  border-radius: 8px; padding: 7px 12px; font-size: 13px; cursor: pointer;
+  box-shadow: 0 6px 24px rgba(0,0,0,.45);
+}
+#rp-reopen:hover { background: #24425c; }
 
 /* right-panel gauge tabs */
 #rp-tabs { display: flex; gap: 4px; padding: 6px 8px 0; flex-wrap: wrap; border-bottom: 1px solid #223; }

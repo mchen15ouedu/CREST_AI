@@ -41,8 +41,10 @@ const map = L.map("map", { zoomControl: true, layers: [esriTopo] }).setView([39,
 map.createPane("q2d");
 map.getPane("q2d").style.zIndex = 450;
 const q2dGroup = L.layerGroup().addTo(map);      // toggleable in the layers control
+// bottom-right keeps it clear of the right results panel (which owns the top-right
+// edge and used to cover this control — test-user feedback 2026-07-17)
 L.control.layers({ "Topographic": esriTopo, "Satellite": esriImg, "Dark": osm },
-  { "2-D streamflow": q2dGroup }, { position: "topright" }).addTo(map);
+  { "2-D streamflow": q2dGroup }, { position: "bottomright" }).addTo(map);
 
 // ---- state -------------------------------------------------------------
 const gaugeMarkers = {};          // id -> marker
@@ -279,6 +281,10 @@ function confirmDates(ud, d) {
 
 function renderResult(d) {
   eventLayer.clearLayers();
+  // a new location: drop the previous location's gauge selection so it can't
+  // pile up past the simulate cap (feedback 2026-07-17)
+  selected.clear();
+  selKeyAtRun = "";                 // and release any "already simulated" hold
   queryCtx = { t_start: d.t_start, t_end: d.t_end, bbox: d.bbox, label: d.label };
   (d.event_pins || []).forEach((e) => {
     L.circleMarker([e.lat, e.lon], { radius: 9, color: "#fff", weight: 2,
@@ -876,6 +882,7 @@ function focusGauge(id) {
   panelGauge = id;
   const g = gaugeData[id];
   document.getElementById("right-panel").classList.remove("hidden");
+  document.getElementById("rp-reopen").classList.add("hidden");
   document.getElementById("rp-title").textContent = `${id} · ${g ? g.name : ""}`;
   renderTabs();
   renderFavBtn();
@@ -1690,7 +1697,13 @@ function openExpertGate(onYes) {
 document.querySelectorAll(".panel-head .toggle, .panel-head .close").forEach((btn) => {
   btn.onclick = () => {
     const p = document.getElementById(btn.dataset.target);
-    if (btn.classList.contains("close")) { p.classList.add("hidden"); return; }
+    if (btn.classList.contains("close")) {
+      p.classList.add("hidden");
+      // the right panel has no header toggle to bring it back — offer a reopen chip
+      if (p.id === "right-panel" && panelGauge)
+        document.getElementById("rp-reopen").classList.remove("hidden");
+      return;
+    }
     const opening = p.classList.contains("collapsed");
     if (p.id === "left-panel" && opening && !expertGateOk()) {
       openExpertGate(() => p.classList.remove("collapsed"));
@@ -1699,6 +1712,11 @@ document.querySelectorAll(".panel-head .toggle, .panel-head .close").forEach((bt
     p.classList.toggle("collapsed");
   };
 });
+document.getElementById("rp-reopen").onclick = () => {
+  document.getElementById("rp-reopen").classList.add("hidden");
+  if (panelGauge) focusGauge(panelGauge);
+  else document.getElementById("right-panel").classList.remove("hidden");
+};
 // ---- advanced parameters (all model/routing/snow params) ---------------
 const PARAM_GROUPS = [
   { title: "Water balance — CREST / CRESTPHYS",
