@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "crest-demo",
+      "runtimeExecutable": "C:/Users/chenm/anaconda3/envs/rasters/python.exe",
+      "runtimeArgs": ["server.py"],
+      "port": 7860
+    }
+  ]
+}

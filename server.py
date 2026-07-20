@@ -605,6 +605,17 @@ def api_nowcast(sim_id: str, gauge_id: str):
     return _nc.for_job(job, gauge_id)
 
 
+@app.get("/api/nowcast_now")
+def api_nowcast_now(w: float, s: float, e: float, n: float, limit: int = 100,
+                    obs_hours: int = 0, ids: str = ""):
+    """Precomputed fleet nowcasts for every gauge in the viewport/rectangle
+    (or an explicit `ids` comma list) — instant (the updater Space refreshes
+    them hourly), no simulation needed. obs_hours>0 attaches recent observed
+    series (<=25 gauges) for plotting."""
+    from hf_data import nowcaststore
+    return nowcaststore.for_bbox(w, s, e, n, limit, obs_hours, ids)
+
+
 @app.post("/api/cancel/{sim_id}")
 def api_cancel(sim_id: str):
     """Stop a running simulation job: the EF5 processes are killed and the

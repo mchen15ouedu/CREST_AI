@@ -97,6 +97,7 @@ map.on(L.Draw.Event.CREATED, (e) => {
     if (b.contains([g.lat, g.lon])) selected.add(g.id);
   });
   refreshSelection();
+  if (nowcastMode) scheduleNowcast();
 });
 
 // ---- chat --------------------------------------------------------------
@@ -201,6 +202,7 @@ async function loadViewportGauges() {
 map.on("moveend zoomend", () => {
   updateMapMode();
   clearTimeout(vpTimer); vpTimer = setTimeout(loadViewportGauges, 400);
+  if (nowcastMode) scheduleAutoView();
 });
 
 function addGaugePins(pins) {
@@ -304,6 +306,7 @@ function gaugeStyle(id) {
 function toggleGauge(id) {
   selected.has(id) ? selected.delete(id) : selected.add(id);
   refreshSelection();
+  if (nowcastMode) { scheduleNowcast(); return; }   // instant precomputed nowcasts
   if (simHydro[id]) focusGauge(id);        // has results -> show them
 }
 function selKey() { return [...selected].sort().join(","); }
@@ -313,6 +316,12 @@ function refreshSelection() {
   const n = selected.size;
   document.getElementById("selinfo").textContent = n ? `${n} gauge${n > 1 ? "s" : ""} selected` : "";
   const b = document.getElementById("btn-sim");
+  if (nowcastMode) {                       // precomputed — no run to hold/grey
+    b.textContent = `⚡ Nowcast (${n})`;
+    b.disabled = n === 0 || n > 25;
+    if (n > 25) document.getElementById("selinfo").textContent += "  ⚠ max 25 in nowcast";
+    return;
+  }
   // greyed out for the selection that was already simulated (or is running) —
   // changing gauges, the time window, or any model option re-enables it
   const held = selKeyAtRun !== "" && selKey() === selKeyAtRun;
@@ -400,6 +409,7 @@ function windowHours(t0, t1) {
 }
 
 async function simulate() {
+  if (nowcastMode) { showNowcastsFor([...selected]); return; }
   if (simRunning && selKey() === selKeyAtRun) return;   // double-click guard
   const ids = [...selected];
   if (!manualOpts && panelDirty()) {
@@ -1917,6 +1927,134 @@ async function reattach(explicitId) {
     if (j.gauge_ids.length) focusGauge(j.gauge_ids[0]);
   } catch (_) { /* server restarted; job registry is gone */ }
 }
+
+// ---- Nowcast mode: precomputed DI-LSTM +6 h predictions ------------------
+// The updater Space refreshes nowcast/latest.parquet hourly for every CONUS
+// gauge, so this mode never runs a simulation — selection -> instant plot.
+// Gauge-point predictions only: no 2-D streamflow in nowcast mode.
+let nowcastMode = false;
+let nowcastRes = null;              // {t0, times, generated, model, gauges: {id: g}}
+let ncTimer = null;
+
+function setMode(nc) {
+  nowcastMode = nc;
+  const b = document.getElementById("mode-btn");
+  b.textContent = nc ? "⚡ Nowcast" : "🕘 Hindcast";
+  b.classList.toggle("on", nc);
+  refreshSelection();
+  if (nc) {
+    addMsg("⚡ <b>Nowcast mode</b> — no dates needed. Click gauges, draw a rectangle, " +
+           "or just zoom until ≤25 gauges are in view: each shows observed flow plus " +
+           "the AI's next-6-hour prediction, precomputed hourly for every CONUS gauge. " +
+           "<b>Experimental</b>; gauge points only (2-D maps stay in Hindcast).", "status");
+    scheduleAutoView();
+  } else {
+    addMsg("🕘 <b>Hindcast mode</b> — historical CREST simulations (pick gauges and a time window).", "status");
+    if (panelGauge && simHydro[panelGauge]) focusGauge(panelGauge);
+  }
+}
+
+function scheduleNowcast() {
+  clearTimeout(ncTimer);
+  ncTimer = setTimeout(() => { if (selected.size) showNowcastsFor([...selected]); }, 400);
+}
+
+function scheduleAutoView() {        // zoomed to a small area -> show everything in view
+  clearTimeout(ncTimer);
+  ncTimer = setTimeout(() => {
+    if (!nowcastMode || selected.size) return;
+    const b = map.getBounds();
+    const vis = Object.values(gaugeData).filter((g) => b.contains([g.lat, g.lon]));
+    if (vis.length && vis.length <= 25) showNowcastsFor(vis.map((g) => g.id));
+  }, 900);
+}
+
+async function showNowcastsFor(ids) {
+  ids = ids.slice(0, 25);
+  if (!ids.length) return;
+  try {
+    const r = await fetch(`/api/nowcast_now?w=0&s=0&e=0&n=0&ids=${ids.join(",")}&obs_hours=48`);
+    const d = await r.json();
+    if (!d.ok) {
+      addMsg(`⚠️ Nowcast unavailable: ${escapeHtml(d.reason || "no precomputed data yet")}`, "status");
+      return;
+    }
+    nowcastRes = { t0: d.t0, times: d.times, generated: d.generated,
+                   model: d.model, gauges: {} };
+    (d.gauges || []).forEach((g) => { nowcastRes.gauges[g.id] = g; });
+    const first = ids.find((i) => nowcastRes.gauges[i]);
+    if (!first) {
+      addMsg("⚠️ No precomputed nowcast for these gauges (outside CONUS radar coverage?).", "status");
+      return;
+    }
+    focusNowcastGauge(nowcastRes.gauges[panelGauge] ? panelGauge : first);
+  } catch (e) {
+    addMsg(`⚠️ Nowcast fetch failed: ${escapeHtml(e.message)}`, "status");
+  }
+}
+
+function focusNowcastGauge(id) {
+  panelGauge = id;
+  const nc = nowcastRes.gauges[id];
+  const g = gaugeData[id];
+  document.getElementById("right-panel").classList.remove("hidden");
+  document.getElementById("rp-reopen").classList.add("hidden");
+  document.getElementById("rp-title").textContent = `⚡ ${id} · ${g ? g.name : ""}`;
+  const bar = document.getElementById("rp-tabs");
+  bar.innerHTML = "";
+  Object.keys(nowcastRes.gauges).forEach((gid2) => {
+    const t = document.createElement("button");
+    t.className = "rp-tab done" + (gid2 === panelGauge ? " active" : "");
+    t.innerHTML = `<span class="dot"></span>${gid2}`;
+    t.onclick = () => focusNowcastGauge(gid2);
+    bar.appendChild(t);
+  });
+  renderFavBtn();
+  const peak = Math.max(...nc.q);
+  const cards = [statCard("Drainage",
+    Math.round((g ? g.area_km2 : nc.area_km2)).toLocaleString() + " km²")];
+  if (nc.obs_last_q != null) cards.push(statCard("Latest obs", nc.obs_last_q + " m³/s"));
+  if (nc.obs_age_h != null) cards.push(statCard("Obs age", nc.obs_age_h + " h"));
+  cards.push(statCard("Peak +6 h (AI)", (Math.round(peak * 10) / 10) + " m³/s"));
+  document.getElementById("rp-stats").innerHTML = cards.join("");
+  renderNowcastHydro(id);
+  document.getElementById("rp-report").innerHTML =
+    `<div class="adv-note">🔮 AI nowcast issued <b>${nowcastRes.t0 || "?"}</b> (newest radar hour), ` +
+    `refreshed hourly. <b>Experimental</b> — machine-learning prediction at the gauge point, ` +
+    `not a CREST simulation. Switch to 🕘 Hindcast for physics runs and 2-D maps.</div>`;
+}
+
+function renderNowcastHydro(id) {
+  const el = document.getElementById("rp-hydro");
+  document.getElementById("rp-expand").classList.add("hidden");
+  document.getElementById("rp-readout").classList.add("hidden");
+  const nc = nowcastRes.gauges[id];
+  const obs = nc.obs || [];
+  const traces = [];
+  if (obs.length) {
+    traces.push({ x: obs.map((r) => r[0]), y: obs.map((r) => r[1]), name: "Obs Q",
+      mode: "lines", line: { color: "#f4f4f4", width: 1.5, shape: "spline", smoothing: 0.8 } });
+  }
+  traces.push({ x: nowcastRes.times, y: nc.q, name: "🔮 AI next 6 h",
+    mode: "lines+markers", line: { color: "#ff9f43", width: 2, dash: "dot" },
+    marker: { size: 5 } });
+  const issue = (nowcastRes.t0 || "").slice(0, 16);
+  const layout = {
+    margin: { l: 46, r: 12, t: 12, b: 30 }, showlegend: true,
+    legend: { orientation: "h", y: 1.18, font: { size: 9 } },
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+    font: { color: "#cdd9e2", size: 10 },
+    xaxis: { gridcolor: "rgba(255,255,255,.06)" },
+    yaxis: { title: "Q m³/s", rangemode: "tozero", gridcolor: "rgba(255,255,255,.06)" },
+    shapes: issue ? [{ type: "line", x0: issue, x1: issue, y0: 0, y1: 1, yref: "paper",
+                       line: { color: "#ffd23f", width: 1.2, dash: "dot" } }] : [],
+    hovermode: "x",
+  };
+  if (el.querySelector(".muted")) el.innerHTML = "";
+  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
+}
+
+document.getElementById("mode-btn").onclick = () => setMode(!nowcastMode);
 
 // ---- boot ----------------------------------------------------------------
 initAuth();

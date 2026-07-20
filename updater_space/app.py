@@ -34,12 +34,13 @@ from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-FEEDS = ["temp", "pet", "mrms", "mrms_recent", "usgs"]   # temp first (matches local routine)
+FEEDS = ["temp", "pet", "mrms", "mrms_recent", "nowcast", "usgs"]   # temp first (matches local routine)
 SCRIPTS = {
     "temp": "update_temp_narr.py",
     "pet": "update_pet.py",
     "mrms": "update_mrms.py",
     "mrms_recent": "update_mrms_recent.py",   # rolling Pass1 for AI nowcasting
+    "nowcast": "run_nowcast_all.py",          # DI-LSTM nowcasts for all gauges
     "usgs": "update_usgs_obs.py",
     "check": "check_forcing_freshness.py",
 }
