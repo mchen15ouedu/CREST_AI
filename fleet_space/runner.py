@@ -23,12 +23,35 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 SRC = "/app/src"
 LOG = "/tmp/fleet.log"
 CACHE = "/tmp/crest_cache"
 started = time.time()
 state = {"phase": "booting", "passes": 0}
+
+# free Spaces sleep without HTTP traffic (which freezes the fleet) — sibling
+# runners ping each other so the ring stays awake; a GET also WAKES a sleeper
+PEERS = [u.strip() for u in os.environ.get("FLEET_PEERS",
+    "https://vincewin-crest-fleet-runner.hf.space,"
+    "https://vincewin-crest-fleet-runner2.hf.space,"
+    "https://vincewin-crest-fleet-runner3.hf.space").split(",") if u.strip()]
+SELF_HOST = (os.environ.get("SPACE_ID", "").replace("/", "-").replace("_", "-")
+             .lower() + ".hf.space")
+
+
+def keepalive_loop():
+    while True:
+        for u in PEERS:
+            if urllib.parse.urlparse(u).hostname == SELF_HOST:
+                continue
+            try:
+                urllib.request.urlopen(u, timeout=20).read(100)
+            except Exception:
+                pass                 # a sleeping peer is still woken by the request
+        time.sleep(1200)
 
 
 def sh(cmd, **kw):
@@ -130,4 +153,5 @@ class Status(http.server.BaseHTTPRequestHandler):
 if __name__ == "__main__":
     boot_sources()
     threading.Thread(target=fleet_loop, daemon=True).start()
+    threading.Thread(target=keepalive_loop, daemon=True).start()
     http.server.ThreadingHTTPServer(("0.0.0.0", 7860), Status).serve_forever()
