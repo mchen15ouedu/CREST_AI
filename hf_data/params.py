@@ -43,6 +43,15 @@ def _vsicurl(cog: str) -> str:
     return f"/vsicurl/{_RESOLVE}/{cog}"
 
 
+def _download_cog(cog: str) -> str:
+    """Fetch the whole (small, public) param COG to the local HF cache and
+    return its path. Fallback when windowed /vsicurl reads keep failing —
+    reading the local file bypasses /vsicurl (and its chunk cache) entirely."""
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(HF_REPO, cog, repo_type="dataset",
+                           token=os.environ.get("HF_TOKEN"))
+
+
 def clip_param_grids(bbox, out_dir: str, keys=None, unsafe_ssl: bool | None = None) -> dict:
     """Clip requested param COGs to bbox (W,S,E,N). Returns {control_key: local_path}."""
     if unsafe_ssl is None:
@@ -61,16 +70,29 @@ def clip_param_grids(bbox, out_dir: str, keys=None, unsafe_ssl: bool | None = No
             continue
         # /vsicurl reads fail transiently (HF rate limits parallel gauge runs;
         # GDAL then reports "not recognized as being in a supported file
-        # format") — retry with backoff like basic.clip_basic_data
+        # format", or a truncated tile read "got 0 bytes, expected N") — retry
+        # with backoff like basic.clip_basic_data
         err = None
         for attempt in range(3):
             try:
-                _clip_one_param(cog, fname, bbox, out_dir, key, out, skipped)
+                _clip_one_param(_vsicurl(cog), fname, bbox, out_dir, key, out, skipped)
                 err = None
                 break
             except Exception as e:
                 err = e
                 time.sleep(2 * (attempt + 1))
+        if err is not None:
+            # An HF read hiccup can outlast the in-process retries and can
+            # poison GDAL's process-wide /vsicurl chunk cache, so re-reads keep
+            # returning the same bad bytes. Fall back to fetching the whole
+            # (small, public) COG once and clipping from the local copy —
+            # bypasses /vsicurl entirely and is cached for later gauges.
+            try:
+                _clip_one_param(_download_cog(cog), fname, bbox, out_dir, key,
+                                out, skipped)
+                err = None
+            except Exception as e:
+                err = e
         if err is not None:
             raise err
     if skipped:
@@ -79,10 +101,10 @@ def clip_param_grids(bbox, out_dir: str, keys=None, unsafe_ssl: bool | None = No
     return out
 
 
-def _clip_one_param(cog: str, fname: str, bbox, out_dir: str, key: str,
+def _clip_one_param(src_path: str, fname: str, bbox, out_dir: str, key: str,
                     out: dict, skipped: dict) -> None:
     W, S, E, N = bbox
-    with rasterio.open(_vsicurl(cog)) as src:
+    with rasterio.open(src_path) as src:
         b = src.bounds
         # guard: bbox must intersect the grid (catches mis-georeferenced grids)
         if not (b.left < E and b.right > W and b.bottom < N and b.top > S):
