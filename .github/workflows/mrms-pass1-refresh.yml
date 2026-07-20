@@ -1,0 +1,49 @@
+name: MRMS Pass1 + nowcast refresh
+
+# Keeps the near-real-time MRMS Pass1 store and the DI-LSTM nowcasts fresh.
+# NCEP retains only ~25 h of MultiSensor_QPE_01H_Pass1, so this must run often.
+# The heavy work runs in the cloud on the HF Space vincewin/CREST_updater;
+# this job just wakes it (it sleeps) and reports the status line.
+# No secrets needed — the Space's status/run endpoints are public.
+
+on:
+  schedule:
+    - cron: '55 * * * *'      # hourly at :55 UTC (NCEP posts ~50 min after each hour)
+  workflow_dispatch:           # allow manual runs from the Actions tab
+
+concurrency:
+  group: crest-updater         # never overlap with the weekly full-refresh job
+  cancel-in-progress: false
+
+jobs:
+  poke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Wake the updater Space
+        # A timeout still triggers the wake; the Space auto-runs mrms_recent ~20 s after boot.
+        run: curl -sk -m 60 https://vincewin-crest-updater.hf.space/ -o /dev/null || true
+
+      - name: Ensure a run is going
+        # If the Space was already awake, no auto-run fires — trigger one explicitly.
+        # 409 = a run is already in progress, which is fine.
+        run: |
+          sleep 30
+          curl -sk -m 60 -X POST \
+            "https://vincewin-crest-updater.hf.space/api/run?feeds=mrms_recent,nowcast" \
+            -o /dev/null || true
+
+      - name: Poll until idle, then report
+        run: |
+          for i in $(seq 1 16); do   # up to ~8 min
+            curl -sk -m 30 https://vincewin-crest-updater.hf.space/api/status \
+              | grep -q '"running":false' && break
+            sleep 30
+          done
+          s=$(curl -sk -m 30 https://vincewin-crest-updater.hf.space/api/status)
+          echo "$s" | grep -o 'mrms_recent: [^"]*' | head -1
+          echo "$s" | grep -o 'nowcast: t0[^"]*'   | head -1
+          if echo "$s" | grep -q 'MRMS recent  STALE'; then
+            echo "::error::MRMS recent is STALE — Space may be stalled"
+            exit 1
+          fi

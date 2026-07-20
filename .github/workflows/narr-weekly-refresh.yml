@@ -1,0 +1,53 @@
+name: Weekly CREST full data refresh
+
+# Weekly full refresh of every feed the CREST_demo dashboard depends on:
+# TEMP (NARR), PET (FEWS), MRMS (mtarchive), MRMS-recent (Pass1), USGS obs.
+# The boot-time auto-run only refreshes mrms_recent, so the FULL run must be
+# triggered explicitly with POST /api/run (no feeds param = all feeds).
+# Heavy work runs in the cloud on vincewin/CREST_updater; no secrets needed.
+
+on:
+  schedule:
+    - cron: '20 9 * * 1'       # Mondays 09:20 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: crest-updater         # never overlap with the hourly Pass1 job
+  cancel-in-progress: false
+
+jobs:
+  full-refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Wake the Space
+        run: curl -sk -m 60 https://vincewin-crest-updater.hf.space/ -o /dev/null || true
+
+      - name: Wait out any boot auto-run, then start the FULL run
+        run: |
+          sleep 25                         # let the boot auto-run claim the slot first
+          for i in $(seq 1 20); do         # wait until idle (up to ~10 min)
+            curl -sk -m 30 https://vincewin-crest-updater.hf.space/api/status \
+              | grep -q '"running":false' && break
+            sleep 30
+          done
+          # No feeds param = all feeds. 409 (already running) is tolerated.
+          curl -sk -m 60 -X POST "https://vincewin-crest-updater.hf.space/api/run" -o /dev/null || true
+          sleep 20                          # let it register as running
+
+      - name: Wait for the full run to finish, then report
+        run: |
+          for i in $(seq 1 40); do          # up to ~20 min
+            curl -sk -m 30 https://vincewin-crest-updater.hf.space/api/status \
+              | grep -q '"running":false' && break
+            sleep 30
+          done
+          s=$(curl -sk -m 30 https://vincewin-crest-updater.hf.space/api/status)
+          echo "----- results -----"
+          echo "$s" | grep -oE '"(temp|pet|mrms|mrms_recent|usgs)":\[[^]]*\]' | sed 's/\\"/"/g'
+          echo "----- freshness -----"
+          echo "$s" | grep -o 'latest [0-9][^"]*'
+          if echo "$s" | grep -qE '(temp|pet|mrms|usgs)":.*[1-9][0-9]*\}' && \
+             echo "$s" | grep -q '"exit_codes"'; then
+            echo "(check exit_codes in the raw status if a feed looks off)"
+          fi
