@@ -20,6 +20,17 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Se
   align-items: center; gap: 6px;
 }
 .tb-btn.on { border-color: #4cc9a0; color: #9fdcc0; }
+/* mode switch: as prominent as the Model-options panel header */
+#mode-seg { display: flex; border: 1px solid #2a3a49; border-radius: 10px; overflow: hidden; }
+#mode-seg .seg {
+  border: none; background: #142230; color: #8fa3b3; cursor: pointer;
+  padding: 9px 18px; font-size: 15px; font-weight: 600;
+}
+#mode-seg .seg.on { background: #1b2a3a; color: #ffd479; }
+#mode-seg #mode-now.on { background: #3a2413; color: #ff9f43; }
+/* gauge-tab close (unselect) button */
+.rp-tab .x { margin-left: 7px; color: #8fa3b3; font-weight: 400; }
+.rp-tab .x:hover { color: #ff6b6b; }
 #auth img { width: 22px; height: 22px; border-radius: 50%; }
 
 .panel {

@@ -881,15 +881,34 @@ function renderTabs() {
     const t = document.createElement("button");
     t.className = "rp-tab" + (id === panelGauge ? " active" : "") +
                   (gaugeState[id] === "done" ? " done" : gaugeState[id] === "running" ? " running" : "");
-    t.innerHTML = `<span class="dot"></span>${id}`;
+    t.innerHTML = `<span class="dot"></span>${id}<span class="x" title="Close & unselect this gauge">✕</span>`;
     t.onclick = () => focusGauge(id);
+    t.querySelector(".x").onclick = (e) => { e.stopPropagation(); closeSimTab(id); };
     bar.appendChild(t);
   });
+}
+
+function closeSimTab(id) {
+  selected.delete(id);
+  delete simHydro[id]; delete gaugeState[id]; delete gaugeResult[id];
+  if (overlays[id]) { try { q2dGroup.removeLayer(overlays[id]); } catch (_) {} delete overlays[id]; }
+  delete gaugeFrames[id];
+  refreshSelection();
+  const rest = Object.keys(simHydro);
+  if (panelGauge === id) {
+    if (rest.length) { focusGauge(rest[0]); return; }
+    panelGauge = null;
+    document.getElementById("right-panel").classList.add("hidden");
+    document.getElementById("rp-reopen").classList.add("hidden");
+    return;
+  }
+  renderTabs();
 }
 
 function focusGauge(id) {
   if (panelGauge !== id) clearTimestep();      // readout/marker belong to the old gauge
   panelGauge = id;
+  nowcastPanelActive = false;
   const g = gaugeData[id];
   document.getElementById("right-panel").classList.remove("hidden");
   document.getElementById("rp-reopen").classList.add("hidden");
@@ -1162,29 +1181,31 @@ function hmZoomBy(delta) {
 }
 
 function renderHydroBig() {
+  const nc = nowcastPanelActive && nowcastRes && nowcastRes.gauges[panelGauge];
   const rows = simHydro[panelGauge] || [];
-  if (!rows.length) return;
+  if (!nc && !rows.length) return;
   const el = document.getElementById("hm-plot");
   if (!hmBaseW) hmBaseW = document.getElementById("hm-scroll").clientWidth - 2;
   el.style.width = Math.round(hmBaseW * hmZoom) + "px";
   el.style.height = Math.round(_hmBaseH() * Math.max(1, (hmZoom + 1) / 2)) + "px";
-  const { traces, layout } = _hydroFig(rows, true,
-    gaugeResult[panelGauge] && gaugeResult[panelGauge].nowcast);
+  const { traces, layout } = nc ? _nowcastFig(panelGauge, true)
+    : _hydroFig(rows, true, gaugeResult[panelGauge] && gaugeResult[panelGauge].nowcast);
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true,
                                      scrollZoom: true, doubleClick: "reset" });
-  _bindHydroClick(el, panelGauge);
+  if (!nc) _bindHydroClick(el, panelGauge);
   applyHmZoom();
-  if (hydroSelTime) renderReadout(panelGauge, hydroSelTime);
+  if (!nc && hydroSelTime) renderReadout(panelGauge, hydroSelTime);
 }
 
 function openHydroModal() {
-  if (!panelGauge || !(simHydro[panelGauge] || []).length) return;
+  const nc = nowcastPanelActive && nowcastRes && nowcastRes.gauges[panelGauge];
+  if (!panelGauge || (!nc && !(simHydro[panelGauge] || []).length)) return;
   hydroModalOpen = true;
   hmZoom = 1;                                   // start at 100% each time
   hmBaseW = 0;                                  // re-measure (window may have resized)
   const g = gaugeData[panelGauge];
   document.getElementById("hm-title").textContent =
-    `📈 ${panelGauge}${g ? " · " + g.name : ""}`;
+    `${nc ? "⚡" : "📈"} ${panelGauge}${g ? " · " + g.name : ""}`;
   document.getElementById("hydro-modal").classList.remove("hidden");
   renderHydroBig();
 }
@@ -1724,6 +1745,16 @@ document.querySelectorAll(".panel-head .toggle, .panel-head .close").forEach((bt
 });
 document.getElementById("rp-reopen").onclick = () => {
   document.getElementById("rp-reopen").classList.add("hidden");
+  if (nowcastMode) {                 // nowcast results are precomputed — always restorable
+    const have = nowcastRes ? Object.keys(nowcastRes.gauges) : [];
+    if (nowcastRes && nowcastRes.gauges[panelGauge]) focusNowcastGauge(panelGauge);
+    else if (have.length) focusNowcastGauge(have[0]);
+    else {
+      document.getElementById("right-panel").classList.remove("hidden");
+      if (selected.size) scheduleNowcast(); else scheduleAutoView();
+    }
+    return;
+  }
   if (panelGauge) focusGauge(panelGauge);
   else document.getElementById("right-panel").classList.remove("hidden");
 };
@@ -1934,13 +1965,13 @@ async function reattach(explicitId) {
 // Gauge-point predictions only: no 2-D streamflow in nowcast mode.
 let nowcastMode = false;
 let nowcastRes = null;              // {t0, times, generated, model, gauges: {id: g}}
+let nowcastPanelActive = false;     // right panel is currently showing a nowcast
 let ncTimer = null;
 
 function setMode(nc) {
   nowcastMode = nc;
-  const b = document.getElementById("mode-btn");
-  b.textContent = nc ? "⚡ Nowcast" : "🕘 Hindcast";
-  b.classList.toggle("on", nc);
+  document.getElementById("mode-hind").classList.toggle("on", !nc);
+  document.getElementById("mode-now").classList.toggle("on", nc);
   refreshSelection();
   if (nc) {
     addMsg("⚡ <b>Nowcast mode</b> — no dates needed. Click gauges, draw a rectangle, " +
@@ -1995,6 +2026,7 @@ async function showNowcastsFor(ids) {
 
 function focusNowcastGauge(id) {
   panelGauge = id;
+  nowcastPanelActive = true;
   const nc = nowcastRes.gauges[id];
   const g = gaugeData[id];
   document.getElementById("right-panel").classList.remove("hidden");
@@ -2005,8 +2037,9 @@ function focusNowcastGauge(id) {
   Object.keys(nowcastRes.gauges).forEach((gid2) => {
     const t = document.createElement("button");
     t.className = "rp-tab done" + (gid2 === panelGauge ? " active" : "");
-    t.innerHTML = `<span class="dot"></span>${gid2}`;
+    t.innerHTML = `<span class="dot"></span>${gid2}<span class="x" title="Close & unselect this gauge">✕</span>`;
     t.onclick = () => focusNowcastGauge(gid2);
+    t.querySelector(".x").onclick = (e) => { e.stopPropagation(); closeNowcastTab(gid2); };
     bar.appendChild(t);
   });
   renderFavBtn();
@@ -2024,37 +2057,62 @@ function focusNowcastGauge(id) {
     `not a CREST simulation. Switch to 🕘 Hindcast for physics runs and 2-D maps.</div>`;
 }
 
-function renderNowcastHydro(id) {
-  const el = document.getElementById("rp-hydro");
-  document.getElementById("rp-expand").classList.add("hidden");
-  document.getElementById("rp-readout").classList.add("hidden");
+function _nowcastFig(id, big) {
   const nc = nowcastRes.gauges[id];
   const obs = nc.obs || [];
   const traces = [];
   if (obs.length) {
     traces.push({ x: obs.map((r) => r[0]), y: obs.map((r) => r[1]), name: "Obs Q",
-      mode: "lines", line: { color: "#f4f4f4", width: 1.5, shape: "spline", smoothing: 0.8 } });
+      mode: "lines", line: { color: "#f4f4f4", width: big ? 1.8 : 1.5,
+                             shape: "spline", smoothing: 0.8 } });
   }
   traces.push({ x: nowcastRes.times, y: nc.q, name: "🔮 AI next 6 h",
-    mode: "lines+markers", line: { color: "#ff9f43", width: 2, dash: "dot" },
-    marker: { size: 5 } });
+    mode: "lines+markers", line: { color: "#ff9f43", width: big ? 2.4 : 2, dash: "dot" },
+    marker: { size: big ? 7 : 5 } });
   const issue = (nowcastRes.t0 || "").slice(0, 16);
   const layout = {
-    margin: { l: 46, r: 12, t: 12, b: 30 }, showlegend: true,
-    legend: { orientation: "h", y: 1.18, font: { size: 9 } },
+    margin: big ? { l: 56, r: 24, t: 18, b: 40 } : { l: 46, r: 12, t: 12, b: 30 },
+    showlegend: true,
+    legend: { orientation: "h", y: big ? 1.08 : 1.18, font: { size: big ? 11 : 9 } },
     paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
-    font: { color: "#cdd9e2", size: 10 },
+    font: { color: "#cdd9e2", size: big ? 12 : 10 },
     xaxis: { gridcolor: "rgba(255,255,255,.06)" },
     yaxis: { title: "Q m³/s", rangemode: "tozero", gridcolor: "rgba(255,255,255,.06)" },
     shapes: issue ? [{ type: "line", x0: issue, x1: issue, y0: 0, y1: 1, yref: "paper",
                        line: { color: "#ffd23f", width: 1.2, dash: "dot" } }] : [],
     hovermode: "x",
   };
-  if (el.querySelector(".muted")) el.innerHTML = "";
-  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
+  return { traces, layout };
 }
 
-document.getElementById("mode-btn").onclick = () => setMode(!nowcastMode);
+function renderNowcastHydro(id) {
+  const el = document.getElementById("rp-hydro");
+  document.getElementById("rp-expand").classList.remove("hidden");
+  document.getElementById("rp-readout").classList.add("hidden");
+  const { traces, layout } = _nowcastFig(id, false);
+  if (el.querySelector(".muted")) el.innerHTML = "";
+  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
+  if (hydroModalOpen) renderHydroBig();          // keep the big view in sync
+}
+
+function closeNowcastTab(id) {
+  selected.delete(id);
+  if (nowcastRes) delete nowcastRes.gauges[id];
+  refreshSelection();
+  const rest = nowcastRes ? Object.keys(nowcastRes.gauges) : [];
+  if (panelGauge === id) {
+    if (rest.length) { focusNowcastGauge(rest[0]); return; }
+    panelGauge = null;
+    nowcastPanelActive = false;
+    document.getElementById("right-panel").classList.add("hidden");
+    document.getElementById("rp-reopen").classList.add("hidden");
+    return;
+  }
+  focusNowcastGauge(panelGauge);                 // re-render tabs without `id`
+}
+
+document.getElementById("mode-hind").onclick = () => { if (nowcastMode) setMode(false); };
+document.getElementById("mode-now").onclick = () => { if (!nowcastMode) setMode(true); };
 
 // ---- boot ----------------------------------------------------------------
 initAuth();

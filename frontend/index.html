@@ -15,7 +15,10 @@
     <span class="brand">🌊 CREST_demo</span>
     <span class="sub">agentic flash-flood analysis</span>
     <span id="selinfo" class="selinfo"></span>
-    <button id="mode-btn" class="tb-btn" title="Switch between live AI nowcasting (observed flow + next 6 h, no dates needed) and historical CREST simulation">🕘 Hindcast</button>
+    <div id="mode-seg" title="Hindcast = historical CREST simulation. Nowcast = live AI prediction of the next 6 hours (no dates needed).">
+      <button id="mode-hind" class="seg on">🕘 Hindcast</button>
+      <button id="mode-now" class="seg">⚡ Nowcast</button>
+    </div>
     <button id="font-btn" class="tb-btn" title="Display size: normal → bigger → much bigger">🔠 A</button>
     <button id="ai-info-btn" class="tb-btn on" title="Show model progress + event background instead of raw logs">🤖 AI info: ON</button>
     <span id="auth"><a class="tb-btn" href="/login">Sign in</a></span>
