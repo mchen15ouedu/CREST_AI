@@ -63,6 +63,50 @@ def record(text: str, user: str | None = None, contact: str | None = None,
     return rec
 
 
+# ---- addressed-flags (daily review bookkeeping) ---------------------------
+# Comments are NEVER deleted or edited; a flag file at feedback/status/<id>.json
+# marks one as handled so the daily review does no repetitive work:
+#   {"id","addressed":true,"when","by","note"}
+
+def mark_addressed(fb_id: str, note: str = "", by: str = "daily-review",
+                   token: str | None = None) -> bool:
+    token = token or os.environ.get("HF_TOKEN")
+    if not token:
+        return False
+    from huggingface_hub import HfApi
+    rec = {"id": fb_id, "addressed": True, "by": by, "note": (note or "")[:500],
+           "when": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}
+    HfApi(token=token).upload_file(
+        path_or_fileobj=json.dumps(rec).encode(),
+        path_in_repo=f"feedback/status/{fb_id}.json", repo_id=HF_REPO,
+        repo_type="dataset", commit_message=f"feedback {fb_id} addressed")
+    return True
+
+
+def unaddressed(token: str | None = None) -> list[dict]:
+    """All durable comments that have no addressed-flag yet (newest last)."""
+    token = token or os.environ.get("HF_TOKEN")
+    from huggingface_hub import HfApi, hf_hub_download
+    api = HfApi(token=token)
+    files = api.list_repo_files(HF_REPO, repo_type="dataset")
+    flagged = {os.path.basename(f)[:-5] for f in files
+               if f.startswith("feedback/status/") and f.endswith(".json")}
+    out = []
+    for f in sorted(files):
+        if not f.startswith("feedback/") or f.startswith("feedback/status/") \
+                or not f.endswith(".json"):
+            continue
+        fb_id = f.rsplit("_", 1)[-1][:-5]
+        if fb_id in flagged:
+            continue
+        try:
+            p = hf_hub_download(HF_REPO, f, repo_type="dataset", token=token)
+            out.append(json.load(open(p, encoding="utf-8")))
+        except Exception:
+            pass
+    return out
+
+
 def recent(n: int = 100) -> list[dict]:
     try:
         with open(_path(), encoding="utf-8", errors="replace") as fh:
