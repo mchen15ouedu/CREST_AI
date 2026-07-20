@@ -167,13 +167,34 @@ def q2d_live(tif_path: str, prev_min=None):
 
 
 def obs_baseflow(rows: list[dict]) -> float | None:
-    """Baseflow from the USGS observed discharge in the hydrograph rows:
-    the 25th percentile of the observations (a standard low-flow proxy)."""
-    obs = sorted(v for v in (r.get("obs_q") for r in rows)
-                 if isinstance(v, (int, float)) and np.isfinite(v) and v > 0)
-    if len(obs) < 8:
+    """Baseflow from the USGS observed discharge in the hydrograph rows.
+
+    Windows long enough for a proper separation (>=30 days of data) go through
+    the PyPI `baseflow` package's Eckhardt digital filter (daily-resampled) —
+    the same method behind the nowcast flood thresholds. Short event windows
+    fall back to the p25 low-flow proxy (separation needs recessions)."""
+    pairs = [(r.get("time"), v) for r in rows
+             if isinstance((v := r.get("obs_q")), (int, float))
+             and np.isfinite(v) and v > 0]
+    if len(pairs) < 8:
         return None
-    return float(obs[int(0.25 * (len(obs) - 1))])
+    obs = sorted(v for _, v in pairs)
+    p25 = float(obs[int(0.25 * (len(obs) - 1))])
+    try:
+        import pandas as pd
+        s = pd.Series({pd.Timestamp(t): v for t, v in pairs}).sort_index()
+        daily = s.resample("1D").mean().interpolate(limit=5).dropna()
+        if len(daily) < 30:
+            return p25
+        import os as _os
+        _os.environ.setdefault("TQDM_DISABLE", "1")
+        import baseflow as bfl
+        res = bfl.separation(daily.to_frame("g"), method=["Eckhardt"])
+        bf = (res[0] if isinstance(res, tuple) else res)["Eckhardt"]
+        m = float(np.nanmean(np.asarray(bf["g"], dtype="float64")))
+        return m if np.isfinite(m) and m > 0 else p25
+    except Exception:
+        return p25                     # package missing / short record / NaNs
 
 
 def q2d_frames(tif_paths: list[str], baseflow_cms: float | None = None,

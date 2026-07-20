@@ -43,11 +43,11 @@ OUT_PATH = "nowcast/flood_thresholds.parquet"
 _Z = {2: 0.0, 5: 0.8416212, 10: 1.2815516}
 
 
-def fetch_baseflow_chunk(sites: list[str]) -> dict[str, float]:
-    """25th-percentile daily-mean discharge (m3/s) over the last 3 years via
-    the batched NWIS daily-values service — the SAME low-flow convention the
-    hindcast 2-D color scale uses (viz.obs_baseflow: p25 of observations)."""
-    out: dict[str, float] = {}
+def fetch_dv_chunk(sites: list[str]):
+    """Last-3-yr daily-mean discharge series (m3/s) per site via the batched
+    NWIS daily-values service. Returns {sid: pd.Series} (>=90 days each)."""
+    import pandas as pd
+    out = {}
     try:
         r = requests.get("https://waterservices.usgs.gov/nwis/dv/",
                          params={"sites": ",".join(sites), "parameterCd": "00060",
@@ -56,18 +56,41 @@ def fetch_baseflow_chunk(sites: list[str]) -> dict[str, float]:
         r.raise_for_status()
         for ts in r.json().get("value", {}).get("timeSeries", []):
             sid = ts["sourceInfo"]["siteCode"][0]["value"].zfill(8)
-            vals = []
+            when, vals = [], []
             for v in ts["values"][0]["value"]:
                 try:
                     x = float(v["value"])
                 except (TypeError, ValueError):
                     continue
                 if x >= 0:
-                    vals.append(x)
+                    when.append(v["dateTime"]); vals.append(x * CFS_TO_CMS)
             if len(vals) >= 90:                      # need a real record
-                out[sid] = float(np.percentile(vals, 25) * CFS_TO_CMS)
+                s = pd.Series(vals, index=pd.to_datetime(when))
+                out[sid] = s[~s.index.duplicated()].sort_index()
     except Exception:
         pass
+    return out
+
+
+def eckhardt_baseflow(series: dict) -> dict[str, float]:
+    """Mean baseflow per gauge via the PyPI `baseflow` package (Eckhardt
+    digital filter — the top-KGE method on our test gauges). Standard
+    separation replaces the earlier p25-percentile proxy."""
+    import pandas as pd
+    import baseflow as bfl
+    if not series:
+        return {}
+    df = pd.concat(series.values(), axis=1, keys=list(series.keys()))
+    df = df.interpolate(limit=5)                     # bridge small gaps only
+    res = bfl.separation(df, method=["Eckhardt"])
+    if isinstance(res, tuple):
+        res = res[0]
+    bf = res["Eckhardt"] if isinstance(res, dict) else res
+    out = {}
+    for c in bf.columns:
+        m = float(np.nanmean(np.asarray(bf[c], dtype="float64")))
+        if np.isfinite(m) and m >= 0:
+            out[str(c)] = m
     return out
 
 
@@ -150,12 +173,16 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=16) as ex:
         rows = list(ex.map(one, gids))
 
-    print("fetching 3-yr median daily flow (baseflow proxy)...", flush=True)
+    print("baseflow: fetching 3-yr daily flows + Eckhardt separation...", flush=True)
+    os.environ.setdefault("TQDM_DISABLE", "1")       # quiet the package's bars
     base: dict[str, float] = {}
     chunks = [gids[i:i + 100] for i in range(0, len(gids), 100)]
     with ThreadPoolExecutor(max_workers=8) as ex:
-        for got in ex.map(fetch_baseflow_chunk, chunks):
-            base.update(got)
+        for series in ex.map(fetch_dv_chunk, chunks):
+            try:                                     # numba filter: main thread
+                base.update(eckhardt_baseflow(series))
+            except Exception as e:
+                print(f"  baseflow chunk failed: {e}")
 
     q10 = np.array([r[1] for r in rows], "float32")
     ok = np.isfinite(q10)

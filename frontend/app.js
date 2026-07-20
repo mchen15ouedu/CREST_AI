@@ -1531,8 +1531,9 @@ function zoomToUserLocation() {
   if (!("geolocation" in navigator)) return;
   navigator.geolocation.getCurrentPosition((pos) => {
     const lat = pos.coords.latitude, lon = pos.coords.longitude;
-    // don't fight a restored/running simulation or a map the user already moved
-    if (currentSim || simRunning || !mapUntouched()) return;
+    // don't fight a restored/running simulation, a map the user already moved,
+    // or Nowcast mode (its risk overview always starts at the CONUS view)
+    if (currentSim || simRunning || !mapUntouched() || nowcastMode) return;
     if (lat < 24 || lat > 50 || lon < -125 || lon > -66) return;  // outside CONUS
     // no animation: at app open a direct jump beats a cross-country fly-in
     // (and animated zooms can stall in throttled/background tabs)
@@ -2034,6 +2035,9 @@ function setMode(nc) {
   document.getElementById("mode-now").classList.toggle("on", nc);
   refreshSelection();
   if (nc) {
+    // everyone starts from the CONUS overview — the tiered risk map IS the
+    // point of nowcast mode (no auto-zoom, even for signed-in users)
+    map.setView([39, -98], 5, { animate: false });
     addMsg("⚡ <b>Nowcast mode</b> — no dates needed. Colors show where the AI predicts " +
            "trouble within 6 hours: 🔴 ≥ 5-yr flood, 🟠 ≥ 2-yr (bankfull), 🟡 ≥ 5× " +
            "baseflow (density map zoomed out, colored pins zoomed in). Click gauges, " +
