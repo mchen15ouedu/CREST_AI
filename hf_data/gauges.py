@@ -73,7 +73,8 @@ def snap_to_stream(lat: float, lon: float, drain_sqkm: float | None = None,
         os.environ.setdefault("GDAL_HTTP_UNSAFESSL", "YES")
 
     W, S, E, N = lon - search_deg, lat - search_deg, lon + search_deg, lat + search_deg
-    with rasterio.open(_FACC_URL) as ds:
+    from hf_data import basic
+    with rasterio.open(basic._cog_src("basic/na_acc_3s.tif")) as ds:
         win = from_bounds(W, S, E, N, ds.transform).round_offsets().round_lengths()
         acc = ds.read(1, window=win).astype("float64")
         tr = ds.window_transform(win)

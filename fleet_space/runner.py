@@ -16,6 +16,7 @@ Space variables (Settings → Variables):
                  N sibling Spaces with shards 0/N..N-1/N split the work disjointly
 Secret: HF_TOKEN (write access — uploads to vincewin/CREST_fleet).
 """
+import glob
 import http.server
 import json
 import os
@@ -67,13 +68,19 @@ def boot_sources():
 
 def purge_tar_cache():
     """The CONUS month-tars are huge and single-use here — drop old hub-cache
-    blobs so the Space's ephemeral disk never fills mid-pass."""
+    blobs so the Space's ephemeral disk never fills mid-pass. The basic/
+    terrain COGs are kept: every gauge clips from those local copies (windowed
+    /vsicurl reads get rate-limited fleet-wide)."""
     root = os.path.join(CACHE, "hub")
+    keep = {os.path.realpath(p) for p in glob.glob(
+        os.path.join(root, "datasets--*", "snapshots", "*", "basic", "*"))}
     now = time.time()
     for dirpath, _, files in os.walk(root):
         for f in files:
             p = os.path.join(dirpath, f)
             try:
+                if os.path.realpath(p) in keep:
+                    continue
                 if os.path.getsize(p) > 200e6 and now - os.path.getmtime(p) > 2 * 3600:
                     os.remove(p)
             except OSError:
@@ -89,6 +96,8 @@ def fleet_loop():
                CREST_CACHE_DIR=CACHE,
                CREST_FORCING_CACHE_GB=os.environ.get("CREST_FORCING_CACHE_GB", "25"),
                HF_HOME=os.path.join(CACHE, "hub"),
+               GDAL_HTTP_MAX_RETRY="5",        # any remaining /vsicurl reads
+               GDAL_HTTP_RETRY_DELAY="2",      # retry on 429/5xx before failing
                PYTHONUNBUFFERED="1")
     args = ["python3", "fleet/fleet_run.py",
             "--workers", os.environ.get("FLEET_WORKERS", "2"),

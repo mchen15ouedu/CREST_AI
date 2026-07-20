@@ -143,6 +143,14 @@ def main():
     HfApi(token=_token()).create_repo(FLEET_REPO, repo_type="dataset",
                                       private=True, exist_ok=True)
 
+    # thousands of gauges doing anonymous /vsicurl range-reads is exactly what
+    # HF rate-limits (fleet-wide "RasterioIOError: Read failed" storm) — fetch
+    # the three CONUS terrain COGs once so every worker clips a local copy
+    from hf_data import basic
+    print("prefetching CONUS terrain COGs (~7 GB, one-time per container)...",
+          flush=True)
+    basic.prefetch()
+
     if args.gauges == "all":
         from hf_data import gauges as G
         cat = G.load_catalog()
