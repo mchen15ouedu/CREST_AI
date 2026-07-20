@@ -100,9 +100,11 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
 
         def _series(g):
             try:
-                rows = _obs.get_series(g["id"], start, end)
+                rows = _obs.get_series(g["id"], start, end)   # already windowed
+                step = max(1, len(rows) // 800)               # bound payload, keep
+                rows = rows[::step] if step > 1 else rows     # the full time span
                 g["obs"] = [[t.strftime("%Y-%m-%d %H:%M"), round(q, 3)]
-                            for t, q in rows[-min(obs_hours, 168) * 4:]]
+                            for t, q in rows]
             except Exception:
                 g["obs"] = []
         with ThreadPoolExecutor(max_workers=8) as ex:

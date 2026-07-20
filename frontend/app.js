@@ -2070,13 +2070,21 @@ function _nowcastFig(id, big) {
     mode: "lines+markers", line: { color: "#ff9f43", width: big ? 2.4 : 2, dash: "dot" },
     marker: { size: big ? 7 : 5 } });
   const issue = (nowcastRes.t0 || "").slice(0, 16);
+  // default view = 6 h history + 6 h prediction; the full 48 h of obs are in
+  // the traces, so dragging (or scroll-zoom in the enlarged view) reveals them
+  let range = null;
+  if (issue) {
+    const t0ms = Date.parse(issue.replace(" ", "T") + ":00Z");
+    const fmt = (ms) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+    range = [fmt(t0ms - 6 * 3600e3), fmt(t0ms + 6.5 * 3600e3)];
+  }
   const layout = {
     margin: big ? { l: 56, r: 24, t: 18, b: 40 } : { l: 46, r: 12, t: 12, b: 30 },
     showlegend: true,
     legend: { orientation: "h", y: big ? 1.08 : 1.18, font: { size: big ? 11 : 9 } },
     paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
     font: { color: "#cdd9e2", size: big ? 12 : 10 },
-    xaxis: { gridcolor: "rgba(255,255,255,.06)" },
+    xaxis: { gridcolor: "rgba(255,255,255,.06)", range: range || undefined },
     yaxis: { title: "Q m³/s", rangemode: "tozero", gridcolor: "rgba(255,255,255,.06)" },
     shapes: issue ? [{ type: "line", x0: issue, x1: issue, y0: 0, y1: 1, yref: "paper",
                        line: { color: "#ffd23f", width: 1.2, dash: "dot" } }] : [],
