@@ -21,6 +21,8 @@ H = 6
 
 _lock = threading.Lock()
 _cache: dict = {"at": 0.0, "meta": None, "cols": None}
+_thr: dict = {"at": 0.0, "map": None}     # gid -> Q10 (m3/s); static file
+THR_TTL_S = 3600
 
 
 def _load():
@@ -51,6 +53,61 @@ def _fresh():
             return _cache["meta"], _cache["cols"]
 
 
+def _thresholds() -> dict:
+    """10-yr return flood per gauge (scripts/compute_flood_thresholds.py)."""
+    now = time.time()
+    with _lock:
+        if _thr["map"] is not None and now - _thr["at"] < THR_TTL_S:
+            return _thr["map"]
+    try:
+        import pyarrow.parquet as pq
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(REPO, "nowcast/flood_thresholds.parquet",
+                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
+        t = pq.read_table(p)
+        q10 = t.column("q10_cms").to_numpy(zero_copy_only=False)
+        # sub-0.5 m3/s "10-yr floods" (tiny/ephemeral creeks) are below model
+        # noise — flagging them would paint phantom floods on the map
+        m = {g: float(q) for g, q in zip(t.column("gid").to_pylist(), q10)
+             if np.isfinite(q) and q >= 0.5}
+        with _lock:
+            _thr.update(at=now, map=m)
+        return m
+    except Exception:
+        with _lock:
+            return _thr["map"] or {}
+
+
+def all_risk() -> dict:
+    """CONUS-wide flood risk: next-6-h peak vs the 10-yr threshold, every gauge.
+
+    Feeds the Nowcast-mode map: `flood` (lat, lon, ratio, gid — only gauges
+    predicted OVER threshold) draws the red density layer; `ratios` colors
+    the pins when zoomed in."""
+    meta, cols = _fresh()
+    if cols is None:
+        return {"ok": False, "reason": "no precomputed nowcast available yet"}
+    thr = _thresholds()
+    if not thr:
+        return {"ok": False, "reason": "no flood thresholds computed yet"}
+    qmax = np.max(np.stack([cols[f"q{k + 1}"] for k in range(H)], 1), 1)
+    ratios, flood = {}, []
+    for i in range(len(cols["gid"])):
+        gid = str(cols["gid"][i])
+        q10 = thr.get(gid)
+        if not q10:
+            continue
+        r = float(qmax[i]) / q10
+        ratios[gid] = round(r, 3)
+        if r >= 1.0:
+            flood.append([round(float(cols["lat"][i]), 4),
+                          round(float(cols["lon"][i]), 4),
+                          round(min(r, 5.0), 2), gid])
+    return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
+            "n_flood": len(flood), "n_rated": len(ratios),
+            "flood": flood, "ratios": ratios}
+
+
 def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
              obs_hours: int = 0, ids: str = "") -> dict:
     """Nowcasts for every gauge inside the bbox (largest basins first), or —
@@ -78,16 +135,21 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
         t0 = None
     times = ([(t0 + timedelta(hours=k + 1)).strftime("%Y-%m-%d %H:%M")
               for k in range(H)] if t0 else [])
+    thr = _thresholds()
     gauges = []
     for i in idx:
         q = [round(float(cols[f"q{k + 1}"][i]), 3) for k in range(H)]
         age = float(cols["obs_age_h"][i])
         lq = float(cols["obs_last_q"][i])
+        gid = str(cols["gid"][i])
+        q10 = thr.get(gid)
         gauges.append({
-            "id": str(cols["gid"][i]), "lat": round(float(cols["lat"][i]), 5),
+            "id": gid, "lat": round(float(cols["lat"][i]), 5),
             "lon": round(float(cols["lon"][i]), 5),
             "area_km2": round(float(cols["area_km2"][i]), 1),
             "q": q,
+            "q10": round(q10, 1) if q10 else None,
+            "flood": bool(q10 and max(q) >= q10),
             "obs_last_time": str(cols["obs_last_time"][i]) or None,
             "obs_last_q": None if np.isnan(lq) else round(lq, 3),
             "obs_age_h": None if age >= 999 else round(age, 1),

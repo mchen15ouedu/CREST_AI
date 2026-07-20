@@ -28,6 +28,17 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Se
 }
 #mode-seg .seg.on { background: #1b2a3a; color: #ffd479; }
 #mode-seg #mode-now.on { background: #3a2413; color: #ff9f43; }
+/* nowcast flood-risk legend (bottom-left, above Leaflet attribution) */
+#risk-legend {
+  position: absolute; left: 12px; bottom: calc(var(--chat-h) + 46px); z-index: 640;
+  background: rgba(17,23,31,.92); border: 1px solid #4a2020; border-radius: 8px;
+  color: #f0d9d4; font-size: 12.5px; padding: 7px 11px;
+}
+#risk-legend .dot-red {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  background: #ff4030; box-shadow: 0 0 8px #ff4030; margin-right: 4px;
+}
+#risk-legend #risk-count { color: #8fa3b3; margin-left: 6px; }
 /* gauge-tab close (unselect) button */
 .rp-tab .x { margin-left: 7px; color: #8fa3b3; font-weight: 400; }
 .rp-tab .x:hover { color: #ff6b6b; }

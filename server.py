@@ -605,6 +605,15 @@ def api_nowcast(sim_id: str, gauge_id: str):
     return _nc.for_job(job, gauge_id)
 
 
+@app.get("/api/nowcast_risk")
+def api_nowcast_risk():
+    """CONUS-wide flood-risk snapshot for Nowcast mode: which gauges' AI
+    next-6-h peak exceeds their 10-yr return flood (red density layer /
+    red pins)."""
+    from hf_data import nowcaststore
+    return nowcaststore.all_risk()
+
+
 @app.get("/api/nowcast_now")
 def api_nowcast_now(w: float, s: float, e: float, n: float, limit: int = 100,
                     obs_hours: int = 0, ids: str = ""):

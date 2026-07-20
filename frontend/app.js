@@ -82,6 +82,10 @@ let animTimer = null;
 // AI info mode (default ON, persisted)
 let aiInfo = localStorage.getItem("aiInfo") !== "off";
 
+// nowcast-mode state lives here (var: gaugeStyle runs before the nowcast block)
+var nowcastMode = false;
+var riskData = null;              // /api/nowcast_risk {ratios, flood, n_flood, t0}
+
 // ---- drawing (rectangle select) ----------------------------------------
 const drawn = new L.FeatureGroup().addTo(map);
 const drawControl = new L.Control.Draw({
@@ -191,7 +195,9 @@ async function loadViewportGauges() {
     const d = await r.json();
     MAX_SIMS = d.max_sims || MAX_SIMS;
     let pins = d.gauge_pins || [];
-    if (huc8Layer) {                          // only gauges inside visible HUC8s
+    // hindcast: only gauges inside visible HUC8s (simulable basins);
+    // nowcast: every CONUS gauge has a precomputed prediction — no clip
+    if (huc8Layer && !nowcastMode) {
       const vis = visibleHucLayers();
       pins = pins.filter((g) => vis.some((l) =>
         l.getBounds().contains([g.lat, g.lon]) && pipGeom(l.feature.geometry, g.lat, g.lon)));
@@ -202,7 +208,7 @@ async function loadViewportGauges() {
 map.on("moveend zoomend", () => {
   updateMapMode();
   clearTimeout(vpTimer); vpTimer = setTimeout(loadViewportGauges, 400);
-  if (nowcastMode) scheduleAutoView();
+  if (nowcastMode) { scheduleAutoView(); loadNowcastRisk(); }
 });
 
 function addGaugePins(pins) {
@@ -300,8 +306,13 @@ function renderResult(d) {
 
 function gaugeStyle(id) {
   const on = selected.has(id);
-  return { radius: on ? 8 : 5, color: on ? "#fff" : "#0b0f14", weight: on ? 2 : 1,
-    fillColor: on ? "#ffd479" : "#3aa3ff", fillOpacity: 0.95 };
+  // nowcast mode: red pin = AI's next-6-h peak exceeds this gauge's 10-yr flood
+  const flood = nowcastMode && riskData && riskData.ratios &&
+                riskData.ratios[id] >= 1;
+  return { radius: on ? 8 : flood ? 7 : 5,
+    color: on ? "#fff" : flood ? "#fff" : "#0b0f14",
+    weight: on ? 2 : flood ? 1.5 : 1,
+    fillColor: flood ? "#ff4030" : on ? "#ffd479" : "#3aa3ff", fillOpacity: 0.95 };
 }
 function toggleGauge(id) {
   selected.has(id) ? selected.delete(id) : selected.add(id);
@@ -1963,10 +1974,44 @@ async function reattach(explicitId) {
 // The updater Space refreshes nowcast/latest.parquet hourly for every CONUS
 // gauge, so this mode never runs a simulation — selection -> instant plot.
 // Gauge-point predictions only: no 2-D streamflow in nowcast mode.
-let nowcastMode = false;
 let nowcastRes = null;              // {t0, times, generated, model, gauges: {id: g}}
 let nowcastPanelActive = false;     // right panel is currently showing a nowcast
 let ncTimer = null;
+let riskLayer = null;               // red density layer (flood-risk gauges)
+let riskAt = 0;                     // last risk fetch (ms)
+
+async function loadNowcastRisk(force) {
+  if (!force && riskData && Date.now() - riskAt < 5 * 60e3) { syncRiskLayer(); return; }
+  try {
+    const r = await fetch("/api/nowcast_risk");
+    const d = await r.json();
+    if (!d.ok) return;
+    riskData = d; riskAt = Date.now();
+    if (riskLayer) { try { map.removeLayer(riskLayer); } catch (_) {} riskLayer = null; }
+    const pts = (d.flood || []).map((p) => [p[0], p[1], Math.min(p[2], 3)]);
+    if (typeof L.heatLayer === "function") {
+      riskLayer = L.heatLayer(pts, { radius: 32, blur: 22, minOpacity: 0.35, max: 3,
+        gradient: { 0.2: "#5c1010", 0.45: "#a32020", 0.7: "#e03526", 1: "#ff7a5c" } });
+    } else {                              // CDN blocked -> translucent red discs
+      riskLayer = L.layerGroup(pts.map(([lat, lon]) =>
+        L.circleMarker([lat, lon], { radius: 16, stroke: false,
+                                     fillColor: "#ff4030", fillOpacity: 0.35 })));
+    }
+    const n = d.n_flood || 0;
+    document.getElementById("risk-count").textContent =
+      n ? `${n} gauge${n > 1 ? "s" : ""} flagged · issued ${d.t0 || ""}` :
+          `none flagged right now · issued ${d.t0 || ""}`;
+    refreshSelection();                   // recolor visible pins
+    syncRiskLayer();
+  } catch (_) { /* transient */ }
+}
+
+function syncRiskLayer() {                // density map out wide, pins when close
+  const showHeat = nowcastMode && riskLayer && map.getZoom() < PIN_ZOOM;
+  if (showHeat) { if (!map.hasLayer(riskLayer)) riskLayer.addTo(map); }
+  else if (riskLayer && map.hasLayer(riskLayer)) map.removeLayer(riskLayer);
+  document.getElementById("risk-legend").classList.toggle("hidden", !nowcastMode);
+}
 
 function setMode(nc) {
   nowcastMode = nc;
@@ -1974,15 +2019,19 @@ function setMode(nc) {
   document.getElementById("mode-now").classList.toggle("on", nc);
   refreshSelection();
   if (nc) {
-    addMsg("⚡ <b>Nowcast mode</b> — no dates needed. Click gauges, draw a rectangle, " +
-           "or just zoom until ≤25 gauges are in view: each shows observed flow plus " +
-           "the AI's next-6-hour prediction, precomputed hourly for every CONUS gauge. " +
+    addMsg("⚡ <b>Nowcast mode</b> — no dates needed. 🔴 Red shows where the AI predicts " +
+           "flow above the <b>10-year flood</b> within 6 hours (density map zoomed out, " +
+           "red pins zoomed in). Click gauges, draw a rectangle, or zoom until ≤25 are " +
+           "in view for observed flow + the next-6-hour prediction, refreshed hourly. " +
            "<b>Experimental</b>; gauge points only (2-D maps stay in Hindcast).", "status");
+    loadNowcastRisk();
     scheduleAutoView();
   } else {
     addMsg("🕘 <b>Hindcast mode</b> — historical CREST simulations (pick gauges and a time window).", "status");
     if (panelGauge && simHydro[panelGauge]) focusGauge(panelGauge);
   }
+  syncRiskLayer();
+  refreshSelection();                    // pin colors depend on the mode
 }
 
 function scheduleNowcast() {
@@ -2049,6 +2098,10 @@ function focusNowcastGauge(id) {
   if (nc.obs_last_q != null) cards.push(statCard("Latest obs", nc.obs_last_q + " m³/s"));
   if (nc.obs_age_h != null) cards.push(statCard("Obs age", nc.obs_age_h + " h"));
   cards.push(statCard("Peak +6 h (AI)", (Math.round(peak * 10) / 10) + " m³/s"));
+  if (nc.q10 != null) {
+    cards.push(statCard("10-yr flood Q", nc.q10 + " m³/s"));
+    if (nc.flood) cards.push(statCard("⚠ Flood risk", "AI peak > 10-yr flood"));
+  }
   document.getElementById("rp-stats").innerHTML = cards.join("");
   renderNowcastHydro(id);
   document.getElementById("rp-report").innerHTML =
