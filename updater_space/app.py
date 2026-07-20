@@ -34,15 +34,21 @@ from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-FEEDS = ["temp", "pet", "mrms", "usgs"]           # run order: cheap before heavy? temp first (matches local routine)
+FEEDS = ["temp", "pet", "mrms", "mrms_recent", "usgs"]   # temp first (matches local routine)
 SCRIPTS = {
     "temp": "update_temp_narr.py",
     "pet": "update_pet.py",
     "mrms": "update_mrms.py",
+    "mrms_recent": "update_mrms_recent.py",   # rolling Pass1 for AI nowcasting
     "usgs": "update_usgs_obs.py",
     "check": "check_forcing_freshness.py",
 }
 AUTO = os.environ.get("UPDATER_AUTO", "1") == "1"
+# what a wake-up auto-run refreshes. The 6-hourly nowcast wake sets this Space
+# variable to "mrms_recent" (light: ~6 small files) so waking is cheap; the
+# weekly routine POSTs /api/run explicitly for the full refresh.
+AUTO_FEEDS = [f for f in os.environ.get("UPDATER_AUTO_FEEDS", ",".join(FEEDS)).split(",")
+              if f in SCRIPTS and f != "check"] or FEEDS
 AUTO_DELAY_S = float(os.environ.get("UPDATER_AUTO_DELAY_S", "20"))
 KEY = os.environ.get("UPDATER_KEY", "")
 
@@ -124,7 +130,7 @@ def _start(feeds: list[str]) -> bool:
 @app.get("/", response_class=PlainTextResponse)
 def root():
     s = "running" if _state["running"] else ("idle" if _state["finished"] else "starting")
-    return (f"CREST_updater — refreshes CREST_demo data feeds (temp/pet/mrms/usgs)\n"
+    return (f"CREST_updater — refreshes CREST_demo data feeds (temp/pet/mrms/mrms_recent/usgs)\n"
             f"state: {s}   started: {_state['started']}   finished: {_state['finished']}\n"
             f"POST /api/run to trigger, GET /api/status for details\n")
 
@@ -155,7 +161,8 @@ def _auto():
 
     def kickoff():
         time.sleep(AUTO_DELAY_S)                  # let the container settle
-        if _start(FEEDS):
-            _log(f"auto-run started (delay {AUTO_DELAY_S:.0f}s after boot)")
+        if _start(AUTO_FEEDS):
+            _log(f"auto-run started: {','.join(AUTO_FEEDS)} "
+                 f"(delay {AUTO_DELAY_S:.0f}s after boot)")
 
     threading.Thread(target=kickoff, daemon=True).start()

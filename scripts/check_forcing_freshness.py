@@ -107,6 +107,29 @@ def check_store_var(api, var: str) -> tuple[datetime | None, str | None]:
     return None, err or "no datable members in newest tar"
 
 
+def check_mrms_recent(api) -> tuple[datetime | None, str | None]:
+    """Newest loose Pass1 hour in mrms_recent/ (no download — names carry the
+    timestamp). This is the nowcasting feed, refreshed every 6 h."""
+    try:
+        files = api.list_repo_files(HF_REPO, repo_type="dataset")
+    except Exception as e:
+        return None, f"list_repo_files failed: {e}"
+    best = None
+    for f in files:
+        m = re.match(r"mrms_recent/mrms1h_pass1_(\d{10})\.pqf$", f)
+        if not m:
+            continue
+        try:
+            t = datetime.strptime(m.group(1), "%Y%m%d%H")
+        except ValueError:
+            continue
+        if best is None or t > best:
+            best = t
+    if best is None:
+        return None, "no mrms_recent/ members in store"
+    return best, None
+
+
 def check_usgs() -> tuple[datetime | None, str | None]:
     """Newest instantaneous-value timestamp across the probe gauges (live NWIS)."""
     try:
@@ -149,6 +172,7 @@ def main() -> int:
     ap.add_argument("--pet-days", type=float, default=14)
     ap.add_argument("--temp-days", type=float, default=45)   # NARR itself lags weeks
     ap.add_argument("--usgs-hours", type=float, default=12)
+    ap.add_argument("--recent-hours", type=float, default=10)  # 6 h cadence + ~2 h source lag + margin
     args = ap.parse_args()
 
     from huggingface_hub import HfApi
@@ -165,6 +189,10 @@ def main() -> int:
         latest, err = check_store_var(api, var)
         store_lat[var] = latest
         ok &= _report(var.upper(), latest, err, now, timedelta(days=days), "d")
+
+    latest, err = check_mrms_recent(api)
+    ok &= _report("MRMS recent", latest, err, now,
+                  timedelta(hours=args.recent_hours), "h")
 
     latest, err = check_usgs()
     ok &= _report("USGS gauge", latest, err, now,
