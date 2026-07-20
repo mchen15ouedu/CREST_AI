@@ -257,7 +257,8 @@ def main():
         return 1
 
     from huggingface_hub import HfApi
-    tok = open(TOKEN_PATH).read().strip() if os.path.exists(TOKEN_PATH) else None
+    tok = os.environ.get("HF_TOKEN") or (
+        open(TOKEN_PATH).read().strip() if os.path.exists(TOKEN_PATH) else None)
     api = HfApi(token=tok)
     for y, m in months:
         try:

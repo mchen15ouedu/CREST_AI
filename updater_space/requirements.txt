@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+huggingface_hub
+numpy
+pyarrow
+requests
+truststore
+netCDF4
+cftime
+pyproj
+xarray
+cfgrib
+rasterio
