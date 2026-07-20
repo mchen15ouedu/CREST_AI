@@ -172,7 +172,7 @@ def main() -> int:
     ap.add_argument("--pet-days", type=float, default=14)
     ap.add_argument("--temp-days", type=float, default=45)   # NARR itself lags weeks
     ap.add_argument("--usgs-hours", type=float, default=12)
-    ap.add_argument("--recent-hours", type=float, default=10)  # 6 h cadence + ~2 h source lag + margin
+    ap.add_argument("--recent-hours", type=float, default=4)   # hourly cadence + ~2 h source lag + margin
     args = ap.parse_args()
 
     from huggingface_hub import HfApi
