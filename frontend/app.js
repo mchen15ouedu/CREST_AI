@@ -1032,7 +1032,7 @@ function _hydroFig(rows, big, nc) {
   if (nc && nc.ok && nc.times && nc.times.length) {
     const last = rows[rows.length - 1];             // anchor for a continuous tail
     traces.push({ x: [last.time, ...nc.times], y: [last.sim_q, ...nc.q],
-      name: "🔮 AI nowcast", mode: "lines",
+      name: "🔮 nowcast", mode: "lines",
       line: { color: "#ff9f43", width: big ? 2.2 : 1.8, dash: "dot" } });
   }
   const layout = {
@@ -2073,7 +2073,7 @@ async function showNowcastsFor(ids) {
   ids = ids.slice(0, 25);
   if (!ids.length) return;
   try {
-    const r = await fetch(`/api/nowcast_now?w=0&s=0&e=0&n=0&ids=${ids.join(",")}&obs_hours=48`);
+    const r = await fetch(`/api/nowcast_now?w=0&s=0&e=0&n=0&ids=${ids.join(",")}&obs_hours=168`);
     const d = await r.json();
     if (!d.ok) {
       addMsg(`⚠️ Nowcast unavailable: ${escapeHtml(d.reason || "no precomputed data yet")}`, "status");
@@ -2117,12 +2117,12 @@ function focusNowcastGauge(id) {
     Math.round((g ? g.area_km2 : nc.area_km2)).toLocaleString() + " km²")];
   if (nc.obs_last_q != null) cards.push(statCard("Latest obs", nc.obs_last_q + " m³/s"));
   if (nc.obs_age_h != null) cards.push(statCard("Obs age", nc.obs_age_h + " h"));
-  cards.push(statCard("Peak +6 h (AI)", (Math.round(peak * 10) / 10) + " m³/s"));
-  if (nc.qbase != null) cards.push(statCard("Baseflow (3-yr med)", nc.qbase + " m³/s"));
+  cards.push(statCard("Peak +6 h", (Math.round(peak * 10) / 10) + " m³/s"));
+  if (nc.qbase != null) cards.push(statCard("Baseflow (Eckhardt)", nc.qbase + " m³/s"));
   if (nc.q2 != null) cards.push(statCard("2-yr / 5-yr flood", nc.q2 + " / " + (nc.q5 ?? "?") + " m³/s"));
-  const TIER_LABEL = { 1: "🟡 elevated — AI ≥ 5× baseflow",
-                       2: "🟠 minor flood — AI ≥ 2-yr flow",
-                       3: "🔴 flood — AI ≥ 5-yr flow" };
+  const TIER_LABEL = { 1: "🟡 elevated — ≥ 5× baseflow",
+                       2: "🟠 minor flood — ≥ 2-yr flow",
+                       3: "🔴 flood — ≥ 5-yr flow" };
   if (nc.tier) cards.push(statCard("⚠ Risk", TIER_LABEL[nc.tier]));
   document.getElementById("rp-stats").innerHTML = cards.join("");
   renderNowcastHydro(id);
@@ -2141,7 +2141,7 @@ function _nowcastFig(id, big) {
       mode: "lines", line: { color: "#f4f4f4", width: big ? 1.8 : 1.5,
                              shape: "spline", smoothing: 0.8 } });
   }
-  traces.push({ x: nowcastRes.times, y: nc.q, name: "🔮 AI next 6 h",
+  traces.push({ x: nowcastRes.times, y: nc.q, name: "🔮 next 6 h",
     mode: "lines+markers", line: { color: "#ff9f43", width: big ? 2.4 : 2, dash: "dot" },
     marker: { size: big ? 7 : 5 } });
   const issue = (nowcastRes.t0 || "").slice(0, 16);
