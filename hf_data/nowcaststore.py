@@ -53,8 +53,13 @@ def _fresh():
             return _cache["meta"], _cache["cols"]
 
 
+BASE_RISE = 5.0                    # yellow tier: predicted >= 5 x baseflow
+NOISE_Q = 0.5                      # m3/s floor — below this nothing is flagged
+
+
 def _thresholds() -> dict:
-    """10-yr return flood per gauge (scripts/compute_flood_thresholds.py)."""
+    """Per-gauge thresholds {gid: (qbase, q2, q5, q10)} — NaN where unknown.
+    From scripts/compute_flood_thresholds.py (annual-peak LP3 + 3-yr median)."""
     now = time.time()
     with _lock:
         if _thr["map"] is not None and now - _thr["at"] < THR_TTL_S:
@@ -65,11 +70,15 @@ def _thresholds() -> dict:
         p = hf_hub_download(REPO, "nowcast/flood_thresholds.parquet",
                             repo_type="dataset", token=os.environ.get("HF_TOKEN"))
         t = pq.read_table(p)
-        q10 = t.column("q10_cms").to_numpy(zero_copy_only=False)
-        # sub-0.5 m3/s "10-yr floods" (tiny/ephemeral creeks) are below model
-        # noise — flagging them would paint phantom floods on the map
-        m = {g: float(q) for g, q in zip(t.column("gid").to_pylist(), q10)
-             if np.isfinite(q) and q >= 0.5}
+        names = set(t.schema.names)
+
+        def col(n):
+            return (t.column(n).to_numpy(zero_copy_only=False) if n in names
+                    else np.full(len(t), np.nan, "float32"))
+        m = {}
+        q2, q5, q10, qb = col("q2_cms"), col("q5_cms"), col("q10_cms"), col("qbase_cms")
+        for g, b, a2, a5, a10 in zip(t.column("gid").to_pylist(), qb, q2, q5, q10):
+            m[g] = (float(b), float(a2), float(a5), float(a10))
         with _lock:
             _thr.update(at=now, map=m)
         return m
@@ -78,12 +87,33 @@ def _thresholds() -> dict:
             return _thr["map"] or {}
 
 
-def all_risk() -> dict:
-    """CONUS-wide flood risk: next-6-h peak vs the 10-yr threshold, every gauge.
+def _tier(qmax: float, thr: tuple) -> int:
+    """0 quiet · 1 elevated · 2 minor flood (>= Q2) · 3 flood (>= Q5).
 
-    Feeds the Nowcast-mode map: `flood` (lat, lon, ratio, gid — only gauges
-    predicted OVER threshold) draws the red density layer; `ratios` colors
-    the pins when zoomed in."""
+    Elevated needs BOTH >= BASE_RISE x baseflow AND >= 10% of bankfull (Q2):
+    arid/intermittent rivers have p25 baseflow near zero, so a bare multiple
+    would flag them yellow at a trickle. Sub-NOISE_Q flows never flag."""
+    qb, q2, q5, _ = thr
+    if qmax < NOISE_Q:
+        return 0
+    if np.isfinite(q5) and q5 >= NOISE_Q and qmax >= q5:
+        return 3
+    if np.isfinite(q2) and q2 >= NOISE_Q and qmax >= q2:
+        return 2
+    if np.isfinite(qb):
+        thr_y = max(BASE_RISE * qb, NOISE_Q)
+        if np.isfinite(q2):
+            thr_y = max(thr_y, 0.10 * q2)
+        if qmax >= thr_y:
+            return 1
+    return 0
+
+
+def all_risk() -> dict:
+    """CONUS-wide tiered risk: next-6-h AI peak vs baseflow / Q2 / Q5.
+
+    Feeds the Nowcast-mode map: `flagged` [[lat, lon, tier, gid], ...] draws
+    the density layers; `tiers` {gid: tier} colors the pins when zoomed in."""
     meta, cols = _fresh()
     if cols is None:
         return {"ok": False, "reason": "no precomputed nowcast available yet"}
@@ -91,21 +121,22 @@ def all_risk() -> dict:
     if not thr:
         return {"ok": False, "reason": "no flood thresholds computed yet"}
     qmax = np.max(np.stack([cols[f"q{k + 1}"] for k in range(H)], 1), 1)
-    ratios, flood = {}, []
+    tiers, flagged = {}, []
+    counts = [0, 0, 0]
     for i in range(len(cols["gid"])):
         gid = str(cols["gid"][i])
-        q10 = thr.get(gid)
-        if not q10:
+        th = thr.get(gid)
+        if th is None:
             continue
-        r = float(qmax[i]) / q10
-        ratios[gid] = round(r, 3)
-        if r >= 1.0:
-            flood.append([round(float(cols["lat"][i]), 4),
-                          round(float(cols["lon"][i]), 4),
-                          round(min(r, 5.0), 2), gid])
+        tr = _tier(float(qmax[i]), th)
+        tiers[gid] = tr
+        if tr > 0:
+            counts[tr - 1] += 1
+            flagged.append([round(float(cols["lat"][i]), 4),
+                            round(float(cols["lon"][i]), 4), tr, gid])
     return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
-            "n_flood": len(flood), "n_rated": len(ratios),
-            "flood": flood, "ratios": ratios}
+            "n_elevated": counts[0], "n_minor": counts[1], "n_flood": counts[2],
+            "n_rated": len(tiers), "flagged": flagged, "tiers": tiers}
 
 
 def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
@@ -142,14 +173,18 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
         age = float(cols["obs_age_h"][i])
         lq = float(cols["obs_last_q"][i])
         gid = str(cols["gid"][i])
-        q10 = thr.get(gid)
+        th = thr.get(gid)
+
+        def _f(v):
+            return round(v, 2) if th is not None and np.isfinite(v) else None
         gauges.append({
             "id": gid, "lat": round(float(cols["lat"][i]), 5),
             "lon": round(float(cols["lon"][i]), 5),
             "area_km2": round(float(cols["area_km2"][i]), 1),
             "q": q,
-            "q10": round(q10, 1) if q10 else None,
-            "flood": bool(q10 and max(q) >= q10),
+            "qbase": _f(th[0]) if th else None, "q2": _f(th[1]) if th else None,
+            "q5": _f(th[2]) if th else None, "q10": _f(th[3]) if th else None,
+            "tier": _tier(max(q), th) if th else 0,
             "obs_last_time": str(cols["obs_last_time"][i]) or None,
             "obs_last_q": None if np.isnan(lq) else round(lq, 3),
             "obs_age_h": None if age >= 999 else round(age, 1),

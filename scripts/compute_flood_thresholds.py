@@ -39,7 +39,36 @@ from forcing_update_common import HF_REPO, hf_token                             
 
 CFS_TO_CMS = 0.0283168
 OUT_PATH = "nowcast/flood_thresholds.parquet"
-_Z = {2: 0.0, 10: 1.2815516}         # standard-normal quantiles (T-year, p=1-1/T)
+# standard-normal quantiles (T-year, p = 1 - 1/T)
+_Z = {2: 0.0, 5: 0.8416212, 10: 1.2815516}
+
+
+def fetch_baseflow_chunk(sites: list[str]) -> dict[str, float]:
+    """25th-percentile daily-mean discharge (m3/s) over the last 3 years via
+    the batched NWIS daily-values service — the SAME low-flow convention the
+    hindcast 2-D color scale uses (viz.obs_baseflow: p25 of observations)."""
+    out: dict[str, float] = {}
+    try:
+        r = requests.get("https://waterservices.usgs.gov/nwis/dv/",
+                         params={"sites": ",".join(sites), "parameterCd": "00060",
+                                 "statCd": "00003", "period": "P1095D",
+                                 "format": "json", "siteStatus": "all"}, timeout=90)
+        r.raise_for_status()
+        for ts in r.json().get("value", {}).get("timeSeries", []):
+            sid = ts["sourceInfo"]["siteCode"][0]["value"].zfill(8)
+            vals = []
+            for v in ts["values"][0]["value"]:
+                try:
+                    x = float(v["value"])
+                except (TypeError, ValueError):
+                    continue
+                if x >= 0:
+                    vals.append(x)
+            if len(vals) >= 90:                      # need a real record
+                out[sid] = float(np.percentile(vals, 25) * CFS_TO_CMS)
+    except Exception:
+        pass
+    return out
 
 
 def fetch_annual_peaks(site: str) -> np.ndarray:
@@ -114,24 +143,36 @@ def main() -> int:
         if done[0] % 500 == 0:
             print(f"  {done[0]}/{len(gids)} gauges...", flush=True)
         if len(peaks) < args.min_peaks:
-            return gid, float("nan"), float("nan"), len(peaks)
-        return gid, lp3_quantile(peaks, 10), lp3_quantile(peaks, 2), len(peaks)
+            return gid, float("nan"), float("nan"), float("nan"), len(peaks)
+        return (gid, lp3_quantile(peaks, 10), lp3_quantile(peaks, 5),
+                lp3_quantile(peaks, 2), len(peaks))
 
     with ThreadPoolExecutor(max_workers=16) as ex:
         rows = list(ex.map(one, gids))
 
+    print("fetching 3-yr median daily flow (baseflow proxy)...", flush=True)
+    base: dict[str, float] = {}
+    chunks = [gids[i:i + 100] for i in range(0, len(gids), 100)]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for got in ex.map(fetch_baseflow_chunk, chunks):
+            base.update(got)
+
     q10 = np.array([r[1] for r in rows], "float32")
     ok = np.isfinite(q10)
     print(f"thresholds: {ok.sum()}/{len(gids)} gauges with >= {args.min_peaks} "
-          f"annual peaks | Q10 median {np.nanmedian(q10):.1f} m3/s")
+          f"annual peaks, {len(base)} with baseflow | Q10 median "
+          f"{np.nanmedian(q10):.1f} m3/s")
     if args.dry_run:
         for r in rows[:8]:
-            print("  ", r)
+            print("  ", r, "base:", round(base.get(r[0], float('nan')), 2))
         return 0
 
     tbl = pa.table({"gid": [r[0] for r in rows], "q10_cms": q10,
-                    "q2_cms": np.array([r[2] for r in rows], "float32"),
-                    "n_peaks": np.array([r[3] for r in rows], "int32")})
+                    "q5_cms": np.array([r[2] for r in rows], "float32"),
+                    "q2_cms": np.array([r[3] for r in rows], "float32"),
+                    "qbase_cms": np.array([base.get(r[0], float("nan"))
+                                           for r in rows], "float32"),
+                    "n_peaks": np.array([r[4] for r in rows], "int32")})
     tmp = os.path.join(tempfile.mkdtemp(), "flood_thresholds.parquet")
     pq.write_table(tbl, tmp, compression="zstd")
     HfApi(token=token).create_commit(

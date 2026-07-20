@@ -34,11 +34,15 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Se
   background: rgba(17,23,31,.92); border: 1px solid #4a2020; border-radius: 8px;
   color: #f0d9d4; font-size: 12.5px; padding: 7px 11px;
 }
-#risk-legend .dot-red {
+#risk-legend .dot-red, #risk-legend .dot-orange, #risk-legend .dot-yellow {
   display: inline-block; width: 10px; height: 10px; border-radius: 50%;
-  background: #ff4030; box-shadow: 0 0 8px #ff4030; margin-right: 4px;
+  margin-right: 4px;
 }
-#risk-legend #risk-count { color: #8fa3b3; margin-left: 6px; }
+#risk-legend .dot-red { background: #ff4030; box-shadow: 0 0 8px #ff4030; }
+#risk-legend .dot-orange { background: #ff7a00; box-shadow: 0 0 6px #ff7a00; }
+#risk-legend .dot-yellow { background: #ffb300; box-shadow: 0 0 6px #ffb300; }
+#risk-legend .risk-rows { display: flex; flex-direction: column; gap: 2px; }
+#risk-legend #risk-count { color: #8fa3b3; display: block; margin-top: 4px; }
 /* gauge-tab close (unselect) button */
 .rp-tab .x { margin-left: 7px; color: #8fa3b3; font-weight: 400; }
 .rp-tab .x:hover { color: #ff6b6b; }

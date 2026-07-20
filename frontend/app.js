@@ -304,15 +304,18 @@ function renderResult(d) {
   refreshSelection();
 }
 
+const TIER_COLORS = { 1: "#ffb300", 2: "#ff7a00", 3: "#ff4030" };  // elevated/minor/flood
+
 function gaugeStyle(id) {
   const on = selected.has(id);
-  // nowcast mode: red pin = AI's next-6-h peak exceeds this gauge's 10-yr flood
-  const flood = nowcastMode && riskData && riskData.ratios &&
-                riskData.ratios[id] >= 1;
-  return { radius: on ? 8 : flood ? 7 : 5,
-    color: on ? "#fff" : flood ? "#fff" : "#0b0f14",
-    weight: on ? 2 : flood ? 1.5 : 1,
-    fillColor: flood ? "#ff4030" : on ? "#ffd479" : "#3aa3ff", fillOpacity: 0.95 };
+  // nowcast mode: pin colored by risk tier (yellow >=5x baseflow, orange >=Q2,
+  // red >=Q5) from the hourly precomputed predictions
+  const tier = (nowcastMode && riskData && riskData.tiers && riskData.tiers[id]) || 0;
+  return { radius: on ? 8 : tier ? 7 : 5,
+    color: on ? "#fff" : tier ? "#fff" : "#0b0f14",
+    weight: on ? 2 : tier ? 1.5 : 1,
+    fillColor: tier ? TIER_COLORS[tier] : on ? "#ffd479" : "#3aa3ff",
+    fillOpacity: 0.95 };
 }
 function toggleGauge(id) {
   selected.has(id) ? selected.delete(id) : selected.add(id);
@@ -1988,19 +1991,31 @@ async function loadNowcastRisk(force) {
     if (!d.ok) return;
     riskData = d; riskAt = Date.now();
     if (riskLayer) { try { map.removeLayer(riskLayer); } catch (_) {} riskLayer = null; }
-    const pts = (d.flood || []).map((p) => [p[0], p[1], Math.min(p[2], 3)]);
-    if (typeof L.heatLayer === "function") {
-      riskLayer = L.heatLayer(pts, { radius: 32, blur: 22, minOpacity: 0.35, max: 3,
-        gradient: { 0.2: "#5c1010", 0.45: "#a32020", 0.7: "#e03526", 1: "#ff7a5c" } });
-    } else {                              // CDN blocked -> translucent red discs
-      riskLayer = L.layerGroup(pts.map(([lat, lon]) =>
-        L.circleMarker([lat, lon], { radius: 16, stroke: false,
-                                     fillColor: "#ff4030", fillOpacity: 0.35 })));
-    }
-    const n = d.n_flood || 0;
-    document.getElementById("risk-count").textContent =
-      n ? `${n} gauge${n > 1 ? "s" : ""} flagged · issued ${d.t0 || ""}` :
-          `none flagged right now · issued ${d.t0 || ""}`;
+    // one density blob per tier color: draw yellow, then orange, then red on top
+    const byTier = { 1: [], 2: [], 3: [] };
+    (d.flagged || []).forEach((p) => { (byTier[p[2]] || byTier[1]).push([p[0], p[1], 1]); });
+    const GRAD = {
+      1: { 0.3: "#5c4a10", 0.7: "#c78f00", 1: "#ffd23f" },
+      2: { 0.3: "#5c3210", 0.7: "#cc5f00", 1: "#ff9a4d" },
+      3: { 0.3: "#5c1010", 0.7: "#e03526", 1: "#ff7a5c" },
+    };
+    const parts = [];
+    [1, 2, 3].forEach((tr) => {
+      if (!byTier[tr].length) return;
+      if (typeof L.heatLayer === "function") {
+        parts.push(L.heatLayer(byTier[tr], { radius: 32, blur: 22, max: 1,
+                                             minOpacity: 0.35, gradient: GRAD[tr] }));
+      } else {                            // CDN blocked -> translucent discs
+        parts.push(L.layerGroup(byTier[tr].map(([lat, lon]) =>
+          L.circleMarker([lat, lon], { radius: 16, stroke: false,
+            fillColor: TIER_COLORS[tr], fillOpacity: 0.35 }))));
+      }
+    });
+    riskLayer = parts.length ? L.layerGroup(parts) : null;
+    const n = (d.n_elevated || 0) + (d.n_minor || 0) + (d.n_flood || 0);
+    document.getElementById("risk-count").textContent = n
+      ? `🔴${d.n_flood || 0} 🟠${d.n_minor || 0} 🟡${d.n_elevated || 0} · issued ${d.t0 || ""}`
+      : `all quiet right now · issued ${d.t0 || ""}`;
     refreshSelection();                   // recolor visible pins
     syncRiskLayer();
   } catch (_) { /* transient */ }
@@ -2019,11 +2034,12 @@ function setMode(nc) {
   document.getElementById("mode-now").classList.toggle("on", nc);
   refreshSelection();
   if (nc) {
-    addMsg("⚡ <b>Nowcast mode</b> — no dates needed. 🔴 Red shows where the AI predicts " +
-           "flow above the <b>10-year flood</b> within 6 hours (density map zoomed out, " +
-           "red pins zoomed in). Click gauges, draw a rectangle, or zoom until ≤25 are " +
-           "in view for observed flow + the next-6-hour prediction, refreshed hourly. " +
-           "<b>Experimental</b>; gauge points only (2-D maps stay in Hindcast).", "status");
+    addMsg("⚡ <b>Nowcast mode</b> — no dates needed. Colors show where the AI predicts " +
+           "trouble within 6 hours: 🔴 ≥ 5-yr flood, 🟠 ≥ 2-yr (bankfull), 🟡 ≥ 5× " +
+           "baseflow (density map zoomed out, colored pins zoomed in). Click gauges, " +
+           "draw a rectangle, or zoom until ≤25 are in view for observed flow + the " +
+           "next-6-hour prediction, refreshed hourly. <b>Experimental</b>; gauge points " +
+           "only (2-D maps stay in Hindcast).", "status");
     loadNowcastRisk();
     scheduleAutoView();
   } else {
@@ -2098,10 +2114,12 @@ function focusNowcastGauge(id) {
   if (nc.obs_last_q != null) cards.push(statCard("Latest obs", nc.obs_last_q + " m³/s"));
   if (nc.obs_age_h != null) cards.push(statCard("Obs age", nc.obs_age_h + " h"));
   cards.push(statCard("Peak +6 h (AI)", (Math.round(peak * 10) / 10) + " m³/s"));
-  if (nc.q10 != null) {
-    cards.push(statCard("10-yr flood Q", nc.q10 + " m³/s"));
-    if (nc.flood) cards.push(statCard("⚠ Flood risk", "AI peak > 10-yr flood"));
-  }
+  if (nc.qbase != null) cards.push(statCard("Baseflow (3-yr med)", nc.qbase + " m³/s"));
+  if (nc.q2 != null) cards.push(statCard("2-yr / 5-yr flood", nc.q2 + " / " + (nc.q5 ?? "?") + " m³/s"));
+  const TIER_LABEL = { 1: "🟡 elevated — AI ≥ 5× baseflow",
+                       2: "🟠 minor flood — AI ≥ 2-yr flow",
+                       3: "🔴 flood — AI ≥ 5-yr flow" };
+  if (nc.tier) cards.push(statCard("⚠ Risk", TIER_LABEL[nc.tier]));
   document.getElementById("rp-stats").innerHTML = cards.join("");
   renderNowcastHydro(id);
   document.getElementById("rp-report").innerHTML =
