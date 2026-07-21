@@ -114,8 +114,11 @@ def main() -> int:
     have = {h for f in stored if (h := _parse_hour(f)) is not None}
 
     now = _utc_hour_floor()
-    # newest first, so a partial/interrupted run still banks the freshest hours
-    want = [t for i in range(1, args.hours + 1)
+    # newest first, so a partial/interrupted run still banks the freshest hours.
+    # i starts at 0: the file valid at the CURRENT floor hour posts ~:50, so the
+    # :58 self-run must try it — starting at 1 would delay every hour's file to
+    # the NEXT run (a permanent extra hour of lag). Not-yet-posted just misses.
+    want = [t for i in range(0, args.hours + 1)
             if (t := now - timedelta(hours=i)) not in have]
 
     ops, added, misses = [], [], 0
