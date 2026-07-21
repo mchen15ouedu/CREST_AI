@@ -1020,8 +1020,70 @@ function _hydroMarker(t) {
            line: { color: "#ffd23f", width: 1.4, dash: "dot" } };
 }
 
+// ---- hydrograph time zone: gauge-local by default, UTC on toggle ----------
+// Data timestamps stay UTC everywhere; only the plotted axis strings are
+// converted (Intl with the gauge's IANA zone — the browser handles DST).
+let hydroUTC = localStorage.getItem("crest_hydro_tz") === "utc";
+function curTz() {
+  const g = gaugeData[panelGauge] || (nowcastRes && nowcastRes.gauges[panelGauge]);
+  return (g && g.tz) || null;
+}
+function axMs(ms) {                    // epoch ms -> axis string in display tz
+  const tz = hydroUTC ? null : curTz();
+  if (!tz) return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+  return new Intl.DateTimeFormat("sv-SE", { timeZone: tz, year: "numeric",
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+    hour12: false }).format(ms).replace("T", " ");
+}
+function tsDisp(s) {                   // UTC "YYYY-MM-DD HH:MM.." -> axis string
+  if ((hydroUTC || !curTz()) || !s) return s;
+  const ms = Date.parse(String(s).slice(0, 16).replace(" ", "T") + ":00Z");
+  return isFinite(ms) ? axMs(ms) : s;
+}
+function tsBack(s) {                   // axis string -> UTC (for row lookups)
+  const tz = hydroUTC ? null : curTz();
+  const m = String(s).match(/(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)/);
+  if (!tz || !m) return s;
+  const want = Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5]);
+  let ms = want;
+  for (let i = 0; i < 2; i++) {        // fixed-point on the (stable) tz offset
+    const d = axMs(ms).match(/(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)/);
+    ms += want - Date.UTC(+d[1], d[2] - 1, +d[3], +d[4], +d[5]);
+  }
+  return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+}
+function tzTag() {                     // short label for the toggle ("CDT"/"UTC")
+  if (hydroUTC) return "UTC";
+  const tz = curTz();
+  if (!tz) return "UTC";
+  try {
+    const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" })
+      .formatToParts(Date.now());
+    return (p.find((x) => x.type === "timeZoneName") || {}).value || tz;
+  } catch (_) { return tz; }
+}
+function updateTzBtns() {
+  const tip = hydroUTC
+    ? "Hydrograph times in UTC — click to switch to the gauge's local time"
+    : "Hydrograph times in the gauge's local zone — click to switch to UTC";
+  ["rp-tz", "hm-tz"].forEach((i) => {
+    const b = document.getElementById(i);
+    if (b) { b.textContent = "🕐 " + tzTag(); b.title = tip; }
+  });
+}
+function setHydroTz(utc) {
+  hydroUTC = utc;
+  localStorage.setItem("crest_hydro_tz", utc ? "utc" : "local");
+  updateTzBtns();
+  if (panelGauge) {
+    if (nowcastPanelActive) renderNowcastHydro(panelGauge);
+    else if (simHydro[panelGauge]) renderHydro(panelGauge);
+  }
+  if (hydroModalOpen) renderHydroBig();
+}
+
 function _hydroFig(rows, big, nc) {
-  const x = rows.map((r) => r.time), sim = rows.map((r) => r.sim_q),
+  const x = rows.map((r) => tsDisp(r.time)), sim = rows.map((r) => r.sim_q),
     obs = rows.map((r) => r.obs_q), pr = rows.map((r) => r.precip || 0);
   const maxp = Math.max(0.1, ...pr);
   const traces = [
@@ -1033,7 +1095,8 @@ function _hydroFig(rows, big, nc) {
   ];
   if (nc && nc.ok && nc.times && nc.times.length) {
     const last = rows[rows.length - 1];             // anchor for a continuous tail
-    traces.push({ x: [last.time, ...nc.times], y: [last.sim_q, ...nc.q],
+    traces.push({ x: [tsDisp(last.time), ...nc.times.map(tsDisp)],
+      y: [last.sim_q, ...nc.q],
       name: "🔮 nowcast", mode: "lines",
       line: { color: "#ff9f43", width: big ? 2.2 : 1.8, dash: "dot" } });
   }
@@ -1046,7 +1109,7 @@ function _hydroFig(rows, big, nc) {
     xaxis: { gridcolor: "rgba(255,255,255,.06)" },
     yaxis: { title: "Q m³/s", rangemode: "tozero", gridcolor: "rgba(255,255,255,.06)" },
     yaxis2: { overlaying: "y", side: "right", range: [maxp * 3.4, 0], showgrid: false },
-    shapes: hydroSelTime ? [_hydroMarker(hydroSelTime)] : [],
+    shapes: hydroSelTime ? [_hydroMarker(tsDisp(hydroSelTime))] : [],
     hovermode: "x",
   };
   if (!big) layout.height = 250;
@@ -1058,7 +1121,7 @@ function _bindHydroClick(el, id) {
   if (el.removeAllListeners) el.removeAllListeners("plotly_click");
   el.on("plotly_click", (ev) => {
     const p = ev.points && ev.points[0];
-    if (p) selectTimestep(id, String(p.x));
+    if (p) selectTimestep(id, tsBack(String(p.x)));   // axis tz -> UTC key
   });
 }
 
@@ -1089,6 +1152,7 @@ function renderHydro(id) {
         'the model starts producing output (the warm-up runs first).</div>'
       : '<div class="muted">Select a gauge and run a simulation to see its hydrograph.</div>';
     xp.classList.add("hidden");
+    document.getElementById("rp-tz").classList.add("hidden");
     return;
   }
   if (el.querySelector(".muted")) el.innerHTML = "";     // drop placeholder before plotting
@@ -1097,6 +1161,8 @@ function renderHydro(id) {
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
   _bindHydroClick(el, id);
   xp.classList.remove("hidden");
+  document.getElementById("rp-tz").classList.remove("hidden");
+  updateTzBtns();
   if (hydroModalOpen) renderHydroBig();                  // keep the big view live
 }
 
@@ -1126,7 +1192,7 @@ function renderReadout(id, t) {
   ["rp-readout", "hm-readout"].forEach((eid) => {
     const el = document.getElementById(eid);
     if (!row) { el.classList.add("hidden"); return; }
-    const cells = [`<span class="ro t">at<b>${row.time}</b></span>`];
+    const cells = [`<span class="ro t">at<b>${tsDisp(row.time)} ${tzTag()}</b></span>`];
     READOUT_FIELDS.forEach(([k, label, unit, dec]) => {
       const v = row[k];
       if (v == null || !isFinite(v)) return;
@@ -1138,7 +1204,7 @@ function renderReadout(id, t) {
 }
 
 function updateHydroMarker(t) {
-  const shapes = t ? [_hydroMarker(t)] : [];
+  const shapes = t ? [_hydroMarker(tsDisp(t))] : [];   // t is UTC; axis may not be
   ["rp-hydro", "hm-plot"].forEach((eid) => {
     const el = document.getElementById(eid);
     if (el && el.data) { try { Plotly.relayout(el, { shapes }); } catch (_) {} }
@@ -1239,6 +1305,10 @@ document.getElementById("hm-reset").onclick = () => {
   renderHydroBig();           // fresh layout -> original full time range
 };
 document.getElementById("hm-close").onclick = closeHydroModal;
+document.getElementById("rp-tz").onclick = () => setHydroTz(!hydroUTC);
+document.getElementById("hm-tz").onclick = () => setHydroTz(!hydroUTC);
+// no eager updateTzBtns() here: curTz reads nowcastRes, declared later (TDZ);
+// every render path calls it before the buttons become visible anyway
 document.getElementById("hydro-modal").addEventListener("click", (e) => {
   if (e.target.id === "hydro-modal") closeHydroModal();
 });
@@ -2148,30 +2218,30 @@ function _nowcastFig(id, big) {
   const obs = nc.obs || [];
   const traces = [];
   if (obs.length) {
-    traces.push({ x: obs.map((r) => r[0]), y: obs.map((r) => r[1]), name: "Obs Q",
+    traces.push({ x: obs.map((r) => tsDisp(r[0])), y: obs.map((r) => r[1]), name: "Obs Q",
       mode: "lines", line: { color: "#f4f4f4", width: big ? 1.8 : 1.5,
                              shape: "spline", smoothing: 0.8 } });
   }
   // two independent models, drawn in full so any disagreement over the shared
   // first 6 hours is visible rather than hidden
-  traces.push({ x: nowcastRes.times.slice(0, nc.q.length), y: nc.q, name: "🔮 next 6 h",
+  traces.push({ x: nowcastRes.times.slice(0, nc.q.length).map(tsDisp), y: nc.q,
+    name: "🔮 next 6 h",
     mode: "lines+markers", line: { color: "#ff9f43", width: big ? 2.4 : 2, dash: "dot" },
     marker: { size: big ? 7 : 5 } });
   if (nc.q12 && nc.q12.length) {
-    traces.push({ x: nowcastRes.times.slice(0, nc.q12.length), y: nc.q12,
+    traces.push({ x: nowcastRes.times.slice(0, nc.q12.length).map(tsDisp), y: nc.q12,
       name: "🔮 next 12 h",
       mode: "lines+markers", line: { color: "#c77dff", width: big ? 2.4 : 2, dash: "dot" },
       marker: { size: big ? 7 : 5 } });
   }
-  const issue = (nowcastRes.t0 || "").slice(0, 16);
+  const issue = tsDisp((nowcastRes.t0 || "").slice(0, 16));
   // default view = 24 h: 12 h history + 12 h prediction; the full 7 d of obs
   // are in the traces, so dragging (or scroll-zoom enlarged) reveals them
   let range = null;
   if (issue) {
-    const t0ms = Date.parse(issue.replace(" ", "T") + ":00Z");
-    const fmt = (ms) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
-    range = [fmt(t0ms - 12 * 3600e3),
-             fmt(t0ms + (nowcastRes.times.length + 0.5) * 3600e3)];
+    const t0ms = Date.parse((nowcastRes.t0 || "").slice(0, 16).replace(" ", "T") + ":00Z");
+    range = [axMs(t0ms - 12 * 3600e3),
+             axMs(t0ms + (nowcastRes.times.length + 0.5) * 3600e3)];
   }
   const layout = {
     margin: big ? { l: 56, r: 24, t: 18, b: 40 } : { l: 46, r: 12, t: 12, b: 30 },
@@ -2191,6 +2261,8 @@ function _nowcastFig(id, big) {
 function renderNowcastHydro(id) {
   const el = document.getElementById("rp-hydro");
   document.getElementById("rp-expand").classList.remove("hidden");
+  document.getElementById("rp-tz").classList.remove("hidden");
+  updateTzBtns();
   document.getElementById("rp-readout").classList.add("hidden");
   const { traces, layout } = _nowcastFig(id, false);
   if (el.querySelector(".muted")) el.innerHTML = "";

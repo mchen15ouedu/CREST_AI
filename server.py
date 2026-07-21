@@ -378,10 +378,12 @@ def _pins_for_bbox(w: float, s: float, e: float, n: float, limit: int = 300):
     if len(cat) > limit:                            # keep the map responsive
         cx, cy = (w + e) / 2, (s + n) / 2
         cat = cat.assign(_d=((cat.LAT_GAGE - cy) ** 2 + (cat.LNG_GAGE - cx) ** 2)).nsmallest(limit, "_d")
+    from hf_data import gaugetz
     return [{
         "id": str(r.STAID).zfill(8), "name": str(r.STANAME),
         "lat": float(r.LAT_GAGE), "lon": float(r.LNG_GAGE),
         "area_km2": float(r.DRAIN_SQKM),
+        "tz": gaugetz.tz_of(str(r.STAID).zfill(8)),
     } for r in cat.itertuples()]
 
 

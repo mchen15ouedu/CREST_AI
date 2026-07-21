@@ -174,6 +174,7 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
     idx = np.nonzero(m)[0]
     total = int(len(idx))
     idx = idx[np.argsort(-cols["area_km2"][idx])][:max(1, limit)]
+    from hf_data.gaugetz import tz_of as _tz
     qs = _qcols(cols)
     q12s = _q12cols(cols)
     try:
@@ -198,7 +199,7 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
             "id": gid, "lat": round(float(cols["lat"][i]), 5),
             "lon": round(float(cols["lon"][i]), 5),
             "area_km2": round(float(cols["area_km2"][i]), 1),
-            "q": q, "q12": q12 or None,
+            "q": q, "q12": q12 or None, "tz": _tz(gid),
             "qbase": _f(th[0]) if th else None, "q2": _f(th[1]) if th else None,
             "q5": _f(th[2]) if th else None, "q10": _f(th[3]) if th else None,
             "tier": _tier(max(q[:RISK_H]), th) if th else 0,
