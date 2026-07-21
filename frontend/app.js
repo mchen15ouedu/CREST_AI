@@ -2223,9 +2223,9 @@ function updateFocusHalo(id) {
   if (focusHalo) { map.removeLayer(focusHalo); focusHalo = null; }
   if (!g || g.lat == null) return;
   focusHalo = L.circleMarker([g.lat, g.lon], {
-    radius: 12, color: "#ffd23f", weight: 2.5, opacity: 0.95,
-    fillColor: "#ffd23f", fillOpacity: 0.12,
-    className: "focus-halo", interactive: false,
+    radius: 12, color: "#ffffff", weight: 2.5, opacity: 0.95,
+    fillColor: "#ffffff", fillOpacity: 0.10,      // white = selection; never
+    className: "focus-halo", interactive: false,  // collides with risk tiers
   }).addTo(map);
 }
 function panToGauge(id) {

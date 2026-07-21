@@ -293,4 +293,4 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 .leaflet-container { background: #0b0f14; }
 
 /* focused-gauge halo: steady glow ring on the pin the right panel shows */
-.focus-halo { filter: drop-shadow(0 0 6px rgba(255, 210, 63, .9)); }
+.focus-halo { filter: drop-shadow(0 0 6px rgba(255, 255, 255, .95)); }
