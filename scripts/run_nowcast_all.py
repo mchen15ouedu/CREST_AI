@@ -342,9 +342,13 @@ def main() -> int:
     cp = os.path.join(tmp, "precip_cache.parquet")
     pq.write_table(latest, lp, compression="zstd")
     pq.write_table(cache_tbl, cp, compression="zstd")
+    # every issue is also archived (latest.parquet is overwritten hourly) so
+    # forecasts can later be scored against the obs that actually arrived
+    arch = f"nowcast/archive/{t0:%Y%m}/nc_{t0:%Y%m%d%H}.parquet"
     api.create_commit(repo_id=HF_REPO, repo_type="dataset",
                       operations=[CommitOperationAdd(LATEST_PATH, lp),
-                                  CommitOperationAdd(CACHE_PATH, cp)],
+                                  CommitOperationAdd(CACHE_PATH, cp),
+                                  CommitOperationAdd(arch, lp)],
                       commit_message=f"nowcast {t0:%Y%m%d%H}: {len(gid)} gauges")
     print(summary)
     return 0
