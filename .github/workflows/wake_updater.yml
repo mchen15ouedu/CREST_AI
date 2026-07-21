@@ -1,0 +1,39 @@
+name: Hourly MRMS + nowcast refresh
+
+# Wakes the CREST_updater HF Space every hour and triggers the light feeds
+# (Pass1 harvest + nowcast precompute). Runs from GitHub's servers, so the
+# refresh no longer depends on any local machine being on. NCEP retains only
+# ~25 h of MultiSensor Pass1 — hourly cadence keeps the record unbroken.
+#
+# The Space's boot auto-run covers the was-asleep case; the explicit POST
+# covers the already-awake case (409 = a run is already going, which is fine).
+
+on:
+  schedule:
+    - cron: "12 * * * *"     # hourly at :12 UTC (Pass1 posts ~:50)
+  workflow_dispatch: {}      # manual test button
+
+permissions: {}
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wake Space (boot triggers auto-run when it was asleep)
+        run: |
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 60 https://vincewin-crest-updater.hf.space/ || true)
+            echo "wake attempt $i -> HTTP $code"
+            [ "$code" = "200" ] && break
+            sleep 30
+          done
+      - name: Trigger feeds if already awake (409 = run in progress, fine)
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" -m 60 -X POST \
+            "https://vincewin-crest-updater.hf.space/api/run?feeds=mrms_recent,nowcast" || true)
+          echo "run trigger -> HTTP $code"
+      - name: Report status
+        run: |
+          sleep 45
+          curl -s -m 60 https://vincewin-crest-updater.hf.space/api/status | head -c 1200 || true
