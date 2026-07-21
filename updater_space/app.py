@@ -176,12 +176,15 @@ def _auto():
                 target = 58 * 60                  # fire at :58
                 wait = (target - into) if into < target else (3600 - into + target)
                 time.sleep(max(30, wait))
+                # only dedup back-to-back runs (e.g. right after a boot auto-run):
+                # an external trigger mid-hour must NOT suppress the :58 run, or a
+                # new Pass1 hour posted at :50 would wait a whole extra hour.
                 fin = _state["finished"]
                 recent = False
                 if fin:
                     try:
                         t = datetime.fromisoformat(fin)
-                        recent = (datetime.now(timezone.utc) - t).total_seconds() < 45 * 60
+                        recent = (datetime.now(timezone.utc) - t).total_seconds() < 10 * 60
                     except ValueError:
                         pass
                 if not _state["running"] and not recent and _start(AUTO_FEEDS):
