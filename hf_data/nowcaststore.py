@@ -158,12 +158,14 @@ _HS_W = {3: 9.0, 2: 3.0, 1: 1.0}       # tier weights for hotspot scoring
 _HS_CELL = 1.5                          # clustering grid (degrees)
 
 
-def hotspots(max_n: int = 8) -> dict:
+def hotspots(max_n: int | None = None) -> dict:
     """Spatial clusters of flagged gauges, best first — lets the chat agent
     answer "bring me to the flood risk hotspot" with no location given.
 
     Greedy grid clustering: flagged gauges binned into 1.5-deg cells, the
-    best-scoring cell plus its 8 neighbours form one hotspot, repeat. Cached
+    best-scoring cell plus its 8 neighbours form one hotspot, repeat until the
+    cells are exhausted — the count is DYNAMIC (zero on a calm day, dozens in
+    a national outbreak; noise filter below drops lone-yellow specks). Cached
     per issue time (all_risk already TTL-caches the underlying data)."""
     r = all_risk()
     if not r.get("ok"):
@@ -180,7 +182,7 @@ def hotspots(max_n: int = 8) -> dict:
         return sum(_HS_W[m[2]] for m in ms)
 
     used, out = set(), []
-    while len(out) < max_n:
+    while max_n is None or len(out) < max_n:
         best, bs = None, 0.0
         for k, ms in cells.items():
             if k not in used and _score(ms) > bs:

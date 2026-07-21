@@ -466,9 +466,10 @@ def api_chat(req: ChatReq):
         if hs.get("ok"):
             ctx["nowcast_risk"] = {
                 "t0": hs["t0"],
+                "n_hotspots": hs["n_hotspots"],       # true total (dynamic, may be 0)
                 "hotspots": [{k: h[k] for k in ("center", "score", "n_gauges",
                                                 "n_flood", "n_minor", "n_elevated")}
-                             for h in hs["hotspots"]]}
+                             for h in hs["hotspots"][:10]]}   # top 10 for context
     except Exception:
         pass
     try:
