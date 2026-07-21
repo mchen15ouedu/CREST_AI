@@ -158,7 +158,7 @@ _HS_W = {3: 9.0, 2: 3.0, 1: 1.0}       # tier weights for hotspot scoring
 _HS_CELL = 1.5                          # clustering grid (degrees)
 
 
-def hotspots(max_n: int = 3) -> dict:
+def hotspots(max_n: int = 8) -> dict:
     """Spatial clusters of flagged gauges, best first — lets the chat agent
     answer "bring me to the flood risk hotspot" with no location given.
 
@@ -211,6 +211,8 @@ def hotspots(max_n: int = 3) -> dict:
             "top_gauges": [{"id": m[3], "lat": m[0], "lon": m[1], "tier": m[2]}
                            for m in top],
         })
+    # a lone yellow gauge is noise, not a hotspot; one red/orange still counts
+    out = [h for h in out if h["score"] >= 3.0 or h["n_gauges"] >= 2]
     out.sort(key=lambda h: -h["score"])   # greedy seeds by cell, rank by cluster
     val = {"ok": True, "t0": r.get("t0"), "n_hotspots": len(out),
            "hotspots": out}

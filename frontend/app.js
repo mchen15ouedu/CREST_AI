@@ -2360,12 +2360,14 @@ async function zoomToHotspot(i) {
       return;
     }
     if (!nowcastMode) setMode(true);        // hotspot questions live in Nowcast mode
-    const h = d.hotspots[Math.max(0, Math.min(i || 0, d.hotspots.length - 1))];
+    const k = Math.max(0, Math.min(i || 0, d.hotspots.length - 1));
+    const h = d.hotspots[k];
     const [w, s, e, n] = h.bbox;
     map.fitBounds([[s, w], [n, e]], { animate: false, maxZoom: 10 });
-    addMsg(`🎯 Zoomed to the flood-risk cluster: ${h.n_flood} 🔴, ${h.n_minor} 🟠, ` +
-           `${h.n_elevated} 🟡 flagged gauge(s), nowcast issued ${d.t0 || "?"}. ` +
-           `Click any pin (or zoom until ≤25 are in view) for hydrographs.`, "status");
+    addMsg(`🎯 Flood-risk cluster ${k + 1} of ${d.hotspots.length}: ${h.n_flood} 🔴, ` +
+           `${h.n_minor} 🟠, ${h.n_elevated} 🟡 flagged gauge(s), nowcast issued ` +
+           `${d.t0 || "?"}. Click any pin (or zoom until ≤25 are in view) for ` +
+           `hydrographs — or ask for another cluster by number.`, "status");
   } catch (_) {
     addMsg("⚠️ Couldn't fetch the risk hotspots — try again in a moment.", "status");
   }
