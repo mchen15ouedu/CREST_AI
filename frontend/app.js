@@ -2118,10 +2118,10 @@ function focusNowcastGauge(id) {
   if (nc.obs_last_q != null) cards.push(statCard("Latest obs", nc.obs_last_q + " m³/s"));
   if (nc.obs_age_h != null) cards.push(statCard("Obs age", nc.obs_age_h + " h"));
   cards.push(statCard("Peak +6 h", (Math.round(peak6 * 10) / 10) + " m³/s"));
-  if (nc.q.length > 6) {
-    const peakAll = Math.max(...nc.q);
-    cards.push(statCard("Peak +" + nc.q.length + " h",
-      (Math.round(peakAll * 10) / 10) + " m³/s"));
+  if (nc.q12 && nc.q12.length) {
+    const peak12 = Math.max(...nc.q12);
+    cards.push(statCard("Peak +" + nc.q12.length + " h",
+      (Math.round(peak12 * 10) / 10) + " m³/s"));
   }
   if (nc.qbase != null) cards.push(statCard("Baseflow (Eckhardt)", nc.qbase + " m³/s"));
   if (nc.q2 != null) cards.push(statCard("2-yr / 5-yr flood", nc.q2 + " / " + (nc.q5 ?? "?") + " m³/s"));
@@ -2146,11 +2146,14 @@ function _nowcastFig(id, big) {
       mode: "lines", line: { color: "#f4f4f4", width: big ? 1.8 : 1.5,
                              shape: "spline", smoothing: 0.8 } });
   }
-  traces.push({ x: nowcastRes.times.slice(0, 6), y: nc.q.slice(0, 6), name: "🔮 next 6 h",
+  // two independent models, drawn in full so any disagreement over the shared
+  // first 6 hours is visible rather than hidden
+  traces.push({ x: nowcastRes.times.slice(0, nc.q.length), y: nc.q, name: "🔮 next 6 h",
     mode: "lines+markers", line: { color: "#ff9f43", width: big ? 2.4 : 2, dash: "dot" },
     marker: { size: big ? 7 : 5 } });
-  if (nc.q.length > 6) {         // 12-h model: hours 7-12 in their own color
-    traces.push({ x: nowcastRes.times.slice(5), y: nc.q.slice(5), name: "🔮 +7–12 h",
+  if (nc.q12 && nc.q12.length) {
+    traces.push({ x: nowcastRes.times.slice(0, nc.q12.length), y: nc.q12,
+      name: "🔮 next 12 h",
       mode: "lines+markers", line: { color: "#c77dff", width: big ? 2.4 : 2, dash: "dot" },
       marker: { size: big ? 7 : 5 } });
   }
@@ -2161,7 +2164,8 @@ function _nowcastFig(id, big) {
   if (issue) {
     const t0ms = Date.parse(issue.replace(" ", "T") + ":00Z");
     const fmt = (ms) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
-    range = [fmt(t0ms - 6 * 3600e3), fmt(t0ms + (nc.q.length + 0.5) * 3600e3)];
+    range = [fmt(t0ms - 6 * 3600e3),
+             fmt(t0ms + (nowcastRes.times.length + 0.5) * 3600e3)];
   }
   const layout = {
     margin: big ? { l: 56, r: 24, t: 18, b: 40 } : { l: 46, r: 12, t: 12, b: 30 },

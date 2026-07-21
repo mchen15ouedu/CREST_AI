@@ -23,9 +23,15 @@ RISK_H = 6           # tier window: pins/heatmap use the first 6 forecast hours
 
 
 def _qcols(cols) -> list:
-    """Ordered forecast columns q1..qN actually present in latest.parquet."""
+    """Ordered 6-h-model columns q1..qN (risk basis) in latest.parquet."""
     return sorted((n for n in cols if n[0] == "q" and n[1:].isdigit()),
                   key=lambda n: int(n[1:]))
+
+
+def _q12cols(cols) -> list:
+    """Ordered 12-h-model columns q12_1..q12_N (hydrograph-only, own trace)."""
+    return sorted((n for n in cols if n.startswith("q12_") and n[4:].isdigit()),
+                  key=lambda n: int(n[4:]))
 
 _lock = threading.Lock()
 _cache: dict = {"at": 0.0, "meta": None, "cols": None}
@@ -169,16 +175,18 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
     total = int(len(idx))
     idx = idx[np.argsort(-cols["area_km2"][idx])][:max(1, limit)]
     qs = _qcols(cols)
+    q12s = _q12cols(cols)
     try:
         t0 = datetime.strptime(meta.get("t0", ""), "%Y-%m-%d %H:%M UTC")
     except ValueError:
         t0 = None
     times = ([(t0 + timedelta(hours=k + 1)).strftime("%Y-%m-%d %H:%M")
-              for k in range(len(qs))] if t0 else [])
+              for k in range(max(len(qs), len(q12s)))] if t0 else [])
     thr = _thresholds()
     gauges = []
     for i in idx:
         q = [round(float(cols[n][i]), 3) for n in qs]
+        q12 = [round(float(cols[n][i]), 3) for n in q12s]
         age = float(cols["obs_age_h"][i])
         lq = float(cols["obs_last_q"][i])
         gid = str(cols["gid"][i])
@@ -190,7 +198,7 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
             "id": gid, "lat": round(float(cols["lat"][i]), 5),
             "lon": round(float(cols["lon"][i]), 5),
             "area_km2": round(float(cols["area_km2"][i]), 1),
-            "q": q,
+            "q": q, "q12": q12 or None,
             "qbase": _f(th[0]) if th else None, "q2": _f(th[1]) if th else None,
             "q5": _f(th[2]) if th else None, "q10": _f(th[3]) if th else None,
             "tier": _tier(max(q[:RISK_H]), th) if th else 0,

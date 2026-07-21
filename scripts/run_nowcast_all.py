@@ -49,7 +49,7 @@ truststore.inject_into_ssl()
 from forcing_update_common import HF_REPO, hf_token                             # noqa: E402
 
 MODEL_REPO = "vincewin/CREST_nowcast_model"
-MODEL_FILE = "dilstm_h12.pt"      # 12-h retrain; ck["horizon"] is authoritative
+MODEL_FILES = ("dilstm.pt", "dilstm_h12.pt")   # 6-h (risk basis) + 12-h; both run
 RECENT_PREFIX = "mrms_recent/"
 MRMS_GRID = (-130.0, 20.0, 0.01, 3500, 7000, -9999.0)   # xll, yll, cell, nr, nc, nodata
 L, H = 72, 6                      # lookback; H is only the horizon fallback
@@ -59,7 +59,7 @@ LATEST_PATH = "nowcast/latest.parquet"
 
 
 # ---- model (minimal copy of nowcast_space/model.py — KEEP IN SYNC) -----------
-def _model_and_stats(token):
+def _model_and_stats(token, fname):
     import torch
     import torch.nn as nn
 
@@ -75,7 +75,7 @@ def _model_and_stats(token):
             return self.head(out[:, -1])
 
     from huggingface_hub import hf_hub_download
-    p = hf_hub_download(MODEL_REPO, MODEL_FILE, repo_type="model", token=token)
+    p = hf_hub_download(MODEL_REPO, fname, repo_type="model", token=token)
     ck = torch.load(p, map_location="cpu", weights_only=False)
     m = DILSTM(horizon=int(ck.get("horizon", H)))
     m.load_state_dict(ck["state_dict"])
@@ -270,8 +270,9 @@ def main() -> int:
             obs.update(got)
 
     # -- features + batched inference ------------------------------------------
-    model, ck = _model_and_stats(token)
-    stats = ck["stats"]
+    model, ck = _model_and_stats(token, MODEL_FILES[0])
+    model12, ck12 = _model_and_stats(token, MODEL_FILES[1])
+    stats = ck["stats"]                        # identical in both checkpoints
     la = ((np.log10(np.maximum(area, 1.0)) - stats["la_mean"])
           / max(stats["la_std"], 1e-6)).astype("float32")
     feat = np.zeros((len(gid), L, 4), "float32")
@@ -300,12 +301,19 @@ def main() -> int:
             obs_last_t[g] = rows[j][0].strftime("%Y-%m-%d %H:%M")
 
     import torch
+
+    def _infer(m, hor):
+        out = np.zeros((len(gid), hor), "float32")
+        with torch.no_grad():
+            for i in range(0, len(gid), 2048):
+                y = m(torch.from_numpy(feat[i:i + 2048]))
+                out[i:i + 2048] = np.maximum(np.expm1(y.numpy()), 0.0)
+        return out
+
     hor = int(ck.get("horizon", H))
-    preds = np.zeros((len(gid), hor), "float32")
-    with torch.no_grad():
-        for i in range(0, len(gid), 2048):
-            y = model(torch.from_numpy(feat[i:i + 2048]))
-            preds[i:i + 2048] = np.maximum(np.expm1(y.numpy()), 0.0)
+    hor12 = int(ck12.get("horizon", 12))
+    preds = _infer(model, hor)
+    preds12 = _infer(model12, hor12)
 
     # -- outputs ---------------------------------------------------------------
     md = {b"t0": t0.strftime("%Y-%m-%d %H:00 UTC").encode(),
@@ -313,13 +321,19 @@ def main() -> int:
           b"model_epoch": str(ck.get("epoch")).encode(),
           b"model_val_nse": str(ck.get("val_nse")).encode(),
           b"model_when": str(ck.get("when")).encode(),
-          b"horizon": str(hor).encode()}
+          b"horizon": str(hor).encode(),
+          b"model12_epoch": str(ck12.get("epoch")).encode(),
+          b"model12_val_nse": str(ck12.get("val_nse")).encode(),
+          b"model12_when": str(ck12.get("when")).encode(),
+          b"horizon12": str(hor12).encode()}
     cols = {"gid": gid.tolist(), "lat": lat.astype("float32"),
             "lon": lon.astype("float32"), "area_km2": area.astype("float32"),
             "obs_last_time": obs_last_t, "obs_last_q": obs_last_q,
             "obs_age_h": obs_age}
     for k in range(hor):
         cols[f"q{k + 1}"] = preds[:, k]
+    for k in range(hor12):                     # 12-h model, own column family
+        cols[f"q12_{k + 1}"] = preds12[:, k]
     latest = pa.table(cols).replace_schema_metadata(md)
 
     keep = {f"h{t:%Y%m%d%H}" for t in hours}
@@ -332,7 +346,8 @@ def main() -> int:
                f"({n_obs_fresh} with obs <=6 h old) | precip hours: "
                f"{sum(1 for t in hours if f'h{t:%Y%m%d%H}' in cached)}/{L} "
                f"({computed} new, {from_pass2} via Pass2, {len(missing)} missing) | "
-               f"model h{hor} epoch {ck.get('epoch')} val_nse {ck.get('val_nse')}")
+               f"models h{hor} e{ck.get('epoch')} nse {ck.get('val_nse')} + "
+               f"h{hor12} e{ck12.get('epoch')} nse {ck12.get('val_nse')}")
     if args.dry_run:
         print(summary + " [dry-run: no upload]")
         return 0
