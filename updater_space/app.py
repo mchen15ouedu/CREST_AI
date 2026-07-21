@@ -157,13 +157,33 @@ def run(feeds: str = "", key: str = ""):
 
 @app.on_event("startup")
 def _auto():
-    if not AUTO:
-        return
+    if AUTO:
+        def kickoff():
+            time.sleep(AUTO_DELAY_S)              # let the container settle
+            if _start(AUTO_FEEDS):
+                _log(f"auto-run started: {','.join(AUTO_FEEDS)} "
+                     f"(delay {AUTO_DELAY_S:.0f}s after boot)")
+        threading.Thread(target=kickoff, daemon=True).start()
 
-    def kickoff():
-        time.sleep(AUTO_DELAY_S)                  # let the container settle
-        if _start(AUTO_FEEDS):
-            _log(f"auto-run started: {','.join(AUTO_FEEDS)} "
-                 f"(delay {AUTO_DELAY_S:.0f}s after boot)")
-
-    threading.Thread(target=kickoff, daemon=True).start()
+    # self-scheduler: external cron (GitHub Actions ~2.5-3 h effective, local
+    # task only while the desktop app is open) can't guarantee hourly cadence,
+    # so as long as this container is awake (fleet keep-alive ring pings it)
+    # the light feeds run themselves at :58 — right after NCEP posts Pass1.
+    if os.environ.get("UPDATER_HOURLY", "1") == "1":
+        def hourly():
+            while True:
+                into = time.time() % 3600         # seconds into the hour
+                target = 58 * 60                  # fire at :58
+                wait = (target - into) if into < target else (3600 - into + target)
+                time.sleep(max(30, wait))
+                fin = _state["finished"]
+                recent = False
+                if fin:
+                    try:
+                        t = datetime.fromisoformat(fin)
+                        recent = (datetime.now(timezone.utc) - t).total_seconds() < 45 * 60
+                    except ValueError:
+                        pass
+                if not _state["running"] and not recent and _start(AUTO_FEEDS):
+                    _log(f"hourly self-run started: {','.join(AUTO_FEEDS)}")
+        threading.Thread(target=hourly, daemon=True).start()
