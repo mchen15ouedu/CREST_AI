@@ -294,5 +294,13 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 .pin { border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.5); }
 .leaflet-container { background: #0b0f14; }
 
-/* focused-gauge halo: steady glow ring on the pin the right panel shows */
-.focus-halo { filter: drop-shadow(0 0 6px rgba(255, 255, 255, .95)); }
+/* focused-gauge teardrop pin: white stroke reads on dark bases, dark shadow
+   reads on the bright topo base */
+.focus-pin { pointer-events: none; }
+.focus-pin svg { filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .75)); }
+.fp-bounce svg { animation: fpdrop .55s cubic-bezier(.3, .8, .4, 1.15); }
+@keyframes fpdrop {
+  0%   { transform: translateY(-16px); }
+  60%  { transform: translateY(2px); }
+  100% { transform: translateY(0); }
+}

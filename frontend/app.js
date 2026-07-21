@@ -2288,16 +2288,24 @@ function closeNowcastTab(id) {
   focusNowcastGauge(panelGauge);                 // re-render tabs without `id`
 }
 
-// ---- focused-gauge halo: a steady glow ring on the pin the panel shows ---
+// ---- focused-gauge marker: a full-size teardrop pin above the gauge ------
+// Dual-contrast (white stroke + dark drop-shadow) so it reads on the bright
+// topo base as well as the dark/satellite bases; magenta is used by nothing
+// else on the map. The tip touches the gauge point; risk pins stay visible.
+const FOCUS_PIN_SVG =
+  '<svg width="30" height="42" viewBox="0 0 30 42">' +
+  '<path d="M15 41 C15 41 2.5 23.5 2.5 14 A12.5 12.5 0 1 1 27.5 14 ' +
+  'C27.5 23.5 15 41 15 41 Z" fill="#e6399b" stroke="#fff" stroke-width="2.5"/>' +
+  '<circle cx="15" cy="14" r="4.6" fill="#fff"/></svg>';
 let focusHalo = null;
 function updateFocusHalo(id) {
   const g = (id && (gaugeData[id] || (nowcastRes && nowcastRes.gauges[id]))) || null;
   if (focusHalo) { map.removeLayer(focusHalo); focusHalo = null; }
   if (!g || g.lat == null) return;
-  focusHalo = L.circleMarker([g.lat, g.lon], {
-    radius: 12, color: "#ffffff", weight: 2.5, opacity: 0.95,
-    fillColor: "#ffffff", fillOpacity: 0.10,      // white = selection; never
-    className: "focus-halo", interactive: false,  // collides with risk tiers
+  focusHalo = L.marker([g.lat, g.lon], {
+    icon: L.divIcon({ className: "focus-pin fp-bounce", html: FOCUS_PIN_SVG,
+                      iconSize: [30, 42], iconAnchor: [15, 41] }),
+    interactive: false, zIndexOffset: 1500,
   }).addTo(map);
 }
 function panToGauge(id) {
@@ -2305,16 +2313,12 @@ function panToGauge(id) {
   if (g && g.lat != null && !map.getBounds().contains([g.lat, g.lon]))
     map.panTo([g.lat, g.lon], { animate: false });
 }
-function popFocusHalo() {          // one smooth settle (18px -> 12px), no looping
-  if (!focusHalo) return;
-  const t0 = performance.now();
-  const step = (t) => {
-    if (!focusHalo) return;
-    const p = Math.min(1, (t - t0) / 350);
-    focusHalo.setRadius(12 + 8 * (1 - p) * (1 - p));
-    if (p < 1) requestAnimationFrame(step);
-  };
-  requestAnimationFrame(step);
+function popFocusHalo() {              // re-drop the pin once (tab re-click)
+  const el = focusHalo && focusHalo.getElement && focusHalo.getElement();
+  if (!el) return;
+  el.classList.remove("fp-bounce");
+  void el.offsetWidth;                 // reflow restarts the CSS animation
+  el.classList.add("fp-bounce");
 }
 
 // ---- upstream river network (nowcast): HydroRIVERS walk from the gauge ---
