@@ -153,6 +153,72 @@ def all_risk() -> dict:
             "n_rated": len(tiers), "flagged": flagged, "tiers": tiers}
 
 
+_hs: dict = {"t0": None, "val": None}
+_HS_W = {3: 9.0, 2: 3.0, 1: 1.0}       # tier weights for hotspot scoring
+_HS_CELL = 1.5                          # clustering grid (degrees)
+
+
+def hotspots(max_n: int = 3) -> dict:
+    """Spatial clusters of flagged gauges, best first — lets the chat agent
+    answer "bring me to the flood risk hotspot" with no location given.
+
+    Greedy grid clustering: flagged gauges binned into 1.5-deg cells, the
+    best-scoring cell plus its 8 neighbours form one hotspot, repeat. Cached
+    per issue time (all_risk already TTL-caches the underlying data)."""
+    r = all_risk()
+    if not r.get("ok"):
+        return {"ok": False, "reason": r.get("reason")}
+    with _lock:
+        if _hs["val"] is not None and _hs["t0"] == r.get("t0"):
+            return _hs["val"]
+    cells: dict = {}
+    for lat, lon, tier, gid in r["flagged"]:
+        cells.setdefault((int(lat // _HS_CELL), int(lon // _HS_CELL)),
+                         []).append((lat, lon, tier, gid))
+
+    def _score(ms):
+        return sum(_HS_W[m[2]] for m in ms)
+
+    used, out = set(), []
+    while len(out) < max_n:
+        best, bs = None, 0.0
+        for k, ms in cells.items():
+            if k not in used and _score(ms) > bs:
+                best, bs = k, _score(ms)
+        if best is None:
+            break
+        members = []
+        for di in (-1, 0, 1):                   # merge the 3x3 neighbourhood
+            for dj in (-1, 0, 1):
+                k2 = (best[0] + di, best[1] + dj)
+                if k2 in cells and k2 not in used:
+                    members += cells[k2]
+                    used.add(k2)
+        lats = [m[0] for m in members]
+        lons = [m[1] for m in members]
+        counts = [0, 0, 0]
+        for m in members:
+            counts[m[2] - 1] += 1
+        top = sorted(members, key=lambda m: -_HS_W[m[2]])[:5]
+        pad = 0.3
+        out.append({
+            "center": [round(float(np.mean(lats)), 3),
+                       round(float(np.mean(lons)), 3)],
+            "bbox": [round(min(lons) - pad, 3), round(min(lats) - pad, 3),
+                     round(max(lons) + pad, 3), round(max(lats) + pad, 3)],
+            "score": round(_score(members), 1), "n_gauges": len(members),
+            "n_flood": counts[2], "n_minor": counts[1], "n_elevated": counts[0],
+            "top_gauges": [{"id": m[3], "lat": m[0], "lon": m[1], "tier": m[2]}
+                           for m in top],
+        })
+    out.sort(key=lambda h: -h["score"])   # greedy seeds by cell, rank by cluster
+    val = {"ok": True, "t0": r.get("t0"), "n_hotspots": len(out),
+           "hotspots": out}
+    with _lock:
+        _hs.update(t0=r.get("t0"), val=val)
+    return val
+
+
 def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
              obs_hours: int = 0, ids: str = "") -> dict:
     """Nowcasts for every gauge inside the bbox (largest basins first), or —

@@ -459,8 +459,20 @@ def api_chat(req: ChatReq):
     about the current simulation, and routes locate/set_time actions.
     {"action": "fallback"} tells the client to use its rule-based path."""
     from hf_data import chatagent
+    ctx = dict(req.context or {})
+    try:                             # live risk summary so the agent can route
+        from hf_data import nowcaststore
+        hs = nowcaststore.hotspots()  # "hotspot" questions with no location
+        if hs.get("ok"):
+            ctx["nowcast_risk"] = {
+                "t0": hs["t0"],
+                "hotspots": [{k: h[k] for k in ("center", "score", "n_gauges",
+                                                "n_flood", "n_minor", "n_elevated")}
+                             for h in hs["hotspots"]]}
+    except Exception:
+        pass
     try:
-        d = chatagent.respond(req.message, req.history, req.context)
+        d = chatagent.respond(req.message, req.history, ctx)
     except Exception as e:
         crashlog.capture("chat", e, message_text=req.message[:200])
         return {"action": "fallback", "error": str(e)}
@@ -625,6 +637,14 @@ def api_nowcast_now(w: float, s: float, e: float, n: float, limit: int = 100,
     series (<=25 gauges) for plotting."""
     from hf_data import nowcaststore
     return nowcaststore.for_bbox(w, s, e, n, limit, obs_hours, ids)
+
+
+@app.get("/api/nowcast_hotspots")
+def api_nowcast_hotspots():
+    """Ranked spatial clusters of flagged flood-risk gauges — the chat agent's
+    answer to "bring me to the flood risk hotspot" (no location needed)."""
+    from hf_data import nowcaststore
+    return nowcaststore.hotspots()
 
 
 @app.get("/api/upstream")

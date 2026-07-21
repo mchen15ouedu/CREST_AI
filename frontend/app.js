@@ -1372,6 +1372,7 @@ function chatContext() {
     map_zoomed_in: map.getZoom() >= PIN_ZOOM,
     signed_in: userSignedIn,
     sim_running: simRunning,
+    nowcast_mode: nowcastMode,
     last_window: lastSim ? { start: lastSim.tStart, end: lastSim.tEnd } : null,
     results: Object.entries(gaugeResult).map(([id, r]) => ({
       gauge: id, name: gaugeData[id] ? gaugeData[id].name : null,
@@ -1442,6 +1443,8 @@ async function handleChat(text) {
   if (d.action === "locate" && d.location_query) {
     awaitingTime = false;
     runQuery(d.location_query, ud || (d.start ? { start: d.start, end: d.end || null } : null), false);
+  } else if (d.action === "hotspot") {
+    zoomToHotspot(d.hotspot_index || 0);
   } else if (d.event_info) {
     lastEventInfoLabel = null;            // user explicitly asked -> refresh the card
     fetchEventInfo();
@@ -2346,6 +2349,26 @@ async function showUpstreamNet(id) {
 }
 function clearUpstreamNet() {
   if (riverLayer) { map.removeLayer(riverLayer); riverLayer = null; riverGid = null; }
+}
+
+// ---- flood-risk hotspot zoom: "bring me to the hotspot" (no location) ----
+async function zoomToHotspot(i) {
+  try {
+    const d = await (await fetch("/api/nowcast_hotspots")).json();
+    if (!d.ok || !d.hotspots || !d.hotspots.length) {
+      addMsg("✅ No flagged flood-risk clusters right now — the nowcast map is quiet.", "status");
+      return;
+    }
+    if (!nowcastMode) setMode(true);        // hotspot questions live in Nowcast mode
+    const h = d.hotspots[Math.max(0, Math.min(i || 0, d.hotspots.length - 1))];
+    const [w, s, e, n] = h.bbox;
+    map.fitBounds([[s, w], [n, e]], { animate: false, maxZoom: 10 });
+    addMsg(`🎯 Zoomed to the flood-risk cluster: ${h.n_flood} 🔴, ${h.n_minor} 🟠, ` +
+           `${h.n_elevated} 🟡 flagged gauge(s), nowcast issued ${d.t0 || "?"}. ` +
+           `Click any pin (or zoom until ≤25 are in view) for hydrographs.`, "status");
+  } catch (_) {
+    addMsg("⚠️ Couldn't fetch the risk hotspots — try again in a moment.", "status");
+  }
 }
 
 document.getElementById("mode-hind").onclick = () => { if (nowcastMode) setMode(false); };
