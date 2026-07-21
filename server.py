@@ -625,6 +625,16 @@ def api_nowcast_now(w: float, s: float, e: float, n: float, limit: int = 100,
     return nowcaststore.for_bbox(w, s, e, n, limit, obs_hours, ids)
 
 
+@app.get("/api/upstream")
+def api_upstream(gid: str):
+    """River network upstream of a gauge (HydroRIVERS topology walk) — drawn
+    on the Nowcast map when the gauge is focused. Static data, LRU-cached.
+    JSONResponse directly: jsonable_encoder walking ~50k coord floats costs
+    ~2 s; plain json.dumps is ~50 ms."""
+    from hf_data import rivernet
+    return JSONResponse(rivernet.upstream(gid))
+
+
 @app.post("/api/cancel/{sim_id}")
 def api_cancel(sim_id: str):
     """Stop a running simulation job: the EF5 processes are killed and the

@@ -896,7 +896,7 @@ function renderTabs() {
     t.className = "rp-tab" + (id === panelGauge ? " active" : "") +
                   (gaugeState[id] === "done" ? " done" : gaugeState[id] === "running" ? " running" : "");
     t.innerHTML = `<span class="dot"></span>${id}<span class="x" title="Close & unselect this gauge">✕</span>`;
-    t.onclick = () => focusGauge(id);
+    t.onclick = () => { flashGauge(id); focusGauge(id); };
     t.querySelector(".x").onclick = (e) => { e.stopPropagation(); closeSimTab(id); };
     bar.appendChild(t);
   });
@@ -2048,6 +2048,7 @@ function setMode(nc) {
     scheduleAutoView();
   } else {
     addMsg("🕘 <b>Hindcast mode</b> — historical CREST simulations (pick gauges and a time window).", "status");
+    clearUpstreamNet();
     if (panelGauge && simHydro[panelGauge]) focusGauge(panelGauge);
   }
   syncRiskLayer();
@@ -2107,7 +2108,7 @@ function focusNowcastGauge(id) {
     const t = document.createElement("button");
     t.className = "rp-tab done" + (gid2 === panelGauge ? " active" : "");
     t.innerHTML = `<span class="dot"></span>${gid2}<span class="x" title="Close & unselect this gauge">✕</span>`;
-    t.onclick = () => focusNowcastGauge(gid2);
+    t.onclick = () => { flashGauge(gid2); focusNowcastGauge(gid2); };
     t.querySelector(".x").onclick = (e) => { e.stopPropagation(); closeNowcastTab(gid2); };
     bar.appendChild(t);
   });
@@ -2130,6 +2131,7 @@ function focusNowcastGauge(id) {
                        3: "🔴 flood — ≥ 5-yr flow" };
   if (nc.tier) cards.push(statCard("⚠ Risk", TIER_LABEL[nc.tier]));
   document.getElementById("rp-stats").innerHTML = cards.join("");
+  showUpstreamNet(id);
   renderNowcastHydro(id);
   document.getElementById("rp-report").innerHTML =
     `<div class="adv-note">🔮 AI nowcast issued <b>${nowcastRes.t0 || "?"}</b> (newest radar hour), ` +
@@ -2201,11 +2203,58 @@ function closeNowcastTab(id) {
     if (rest.length) { focusNowcastGauge(rest[0]); return; }
     panelGauge = null;
     nowcastPanelActive = false;
+    clearUpstreamNet();
     document.getElementById("right-panel").classList.add("hidden");
     document.getElementById("rp-reopen").classList.add("hidden");
     return;
   }
   focusNowcastGauge(panelGauge);                 // re-render tabs without `id`
+}
+
+// ---- locate ping: brief expanding rings + name tip on the gauge pin ------
+let pingMarker = null, pingTimer = null;
+function flashGauge(id) {
+  const g = gaugeData[id] || (nowcastRes && nowcastRes.gauges[id]) || null;
+  if (!g || g.lat == null) return;
+  if (pingMarker) { map.removeLayer(pingMarker); clearTimeout(pingTimer); pingMarker = null; }
+  if (!map.getBounds().contains([g.lat, g.lon])) map.panTo([g.lat, g.lon], { animate: false });
+  pingMarker = L.marker([g.lat, g.lon], {
+    icon: L.divIcon({ className: "gauge-ping", html: "<i></i><i></i>", iconSize: [0, 0] }),
+    interactive: false, zIndexOffset: 1200,
+  }).addTo(map)
+    .bindTooltip(`📍 ${id}${g.name ? " · " + g.name : ""}`,
+      { permanent: true, direction: "top", offset: [0, -12], className: "ping-tip" })
+    .openTooltip();
+  pingTimer = setTimeout(() => {
+    if (pingMarker) { map.removeLayer(pingMarker); pingMarker = null; }
+  }, 2400);
+}
+
+// ---- upstream river network (nowcast): HydroRIVERS walk from the gauge ---
+let riverLayer = null, riverGid = null;
+const riverCache = {};              // gid -> /api/upstream payload (static data)
+async function showUpstreamNet(id) {
+  if (!nowcastMode) return;
+  if (riverGid === id && riverLayer) return;
+  clearUpstreamNet();
+  try {
+    let d = riverCache[id];
+    if (!d) {
+      d = await (await fetch(`/api/upstream?gid=${id}`)).json();
+      riverCache[id] = d;
+    }
+    if (!d.ok || !nowcastMode || panelGauge !== id) return;
+    const grp = L.layerGroup();
+    d.lines.forEach((l) => L.polyline(l.xy, {
+      color: "#4fc3f7", opacity: 0.65, interactive: false,
+      weight: Math.min(4, 1 + 0.55 * (l.o - d.min_order)),
+    }).addTo(grp));
+    riverLayer = grp.addTo(map);
+    riverGid = id;
+  } catch (_) { /* network is decoration — never block the panel */ }
+}
+function clearUpstreamNet() {
+  if (riverLayer) { map.removeLayer(riverLayer); riverLayer = null; riverGid = null; }
 }
 
 document.getElementById("mode-hind").onclick = () => { if (nowcastMode) setMode(false); };
