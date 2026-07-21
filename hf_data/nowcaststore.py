@@ -1,10 +1,12 @@
 """Precomputed fleet nowcasts — read side of scripts/run_nowcast_all.py.
 
 The updater Space refreshes nowcast/latest.parquet in vincewin/CREST_data
-hourly (DI-LSTM +6 h predictions for every CONUS GAGES-II gauge, issue time
-t0 = newest MRMS Pass1 hour). This module serves it to the dashboard with a
-short in-process TTL cache; hf_hub_download's etag check makes the refresh a
-cheap no-op until the Space actually uploads a new file.
+hourly (DI-LSTM hourly predictions q1..qN — currently N=12 — for every CONUS
+GAGES-II gauge, issue time t0 = newest MRMS Pass1 hour). This module serves
+it to the dashboard with a short in-process TTL cache; hf_hub_download's
+etag check makes the refresh a cheap no-op until the Space actually uploads
+a new file. Risk tiers (pins/heatmap) stay on the FIRST RISK_H hours so the
+map coloring is unchanged as the model horizon grows.
 """
 from __future__ import annotations
 
@@ -17,7 +19,13 @@ import numpy as np
 
 REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")
 TTL_S = 240
-H = 6
+RISK_H = 6           # tier window: pins/heatmap use the first 6 forecast hours
+
+
+def _qcols(cols) -> list:
+    """Ordered forecast columns q1..qN actually present in latest.parquet."""
+    return sorted((n for n in cols if n[0] == "q" and n[1:].isdigit()),
+                  key=lambda n: int(n[1:]))
 
 _lock = threading.Lock()
 _cache: dict = {"at": 0.0, "meta": None, "cols": None}
@@ -120,7 +128,7 @@ def all_risk() -> dict:
     thr = _thresholds()
     if not thr:
         return {"ok": False, "reason": "no flood thresholds computed yet"}
-    qmax = np.max(np.stack([cols[f"q{k + 1}"] for k in range(H)], 1), 1)
+    qmax = np.max(np.stack([cols[n] for n in _qcols(cols)[:RISK_H]], 1), 1)
     tiers, flagged = {}, []
     counts = [0, 0, 0]
     for i in range(len(cols["gid"])):
@@ -160,16 +168,17 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
     idx = np.nonzero(m)[0]
     total = int(len(idx))
     idx = idx[np.argsort(-cols["area_km2"][idx])][:max(1, limit)]
+    qs = _qcols(cols)
     try:
         t0 = datetime.strptime(meta.get("t0", ""), "%Y-%m-%d %H:%M UTC")
     except ValueError:
         t0 = None
     times = ([(t0 + timedelta(hours=k + 1)).strftime("%Y-%m-%d %H:%M")
-              for k in range(H)] if t0 else [])
+              for k in range(len(qs))] if t0 else [])
     thr = _thresholds()
     gauges = []
     for i in idx:
-        q = [round(float(cols[f"q{k + 1}"][i]), 3) for k in range(H)]
+        q = [round(float(cols[n][i]), 3) for n in qs]
         age = float(cols["obs_age_h"][i])
         lq = float(cols["obs_last_q"][i])
         gid = str(cols["gid"][i])
@@ -184,7 +193,7 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
             "q": q,
             "qbase": _f(th[0]) if th else None, "q2": _f(th[1]) if th else None,
             "q5": _f(th[2]) if th else None, "q10": _f(th[3]) if th else None,
-            "tier": _tier(max(q), th) if th else 0,
+            "tier": _tier(max(q[:RISK_H]), th) if th else 0,
             "obs_last_time": str(cols["obs_last_time"][i]) or None,
             "obs_last_q": None if np.isnan(lq) else round(lq, 3),
             "obs_age_h": None if age >= 999 else round(age, 1),

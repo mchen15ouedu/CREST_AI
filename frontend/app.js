@@ -2112,12 +2112,17 @@ function focusNowcastGauge(id) {
     bar.appendChild(t);
   });
   renderFavBtn();
-  const peak = Math.max(...nc.q);
+  const peak6 = Math.max(...nc.q.slice(0, 6));
   const cards = [statCard("Drainage",
     Math.round((g ? g.area_km2 : nc.area_km2)).toLocaleString() + " km²")];
   if (nc.obs_last_q != null) cards.push(statCard("Latest obs", nc.obs_last_q + " m³/s"));
   if (nc.obs_age_h != null) cards.push(statCard("Obs age", nc.obs_age_h + " h"));
-  cards.push(statCard("Peak +6 h", (Math.round(peak * 10) / 10) + " m³/s"));
+  cards.push(statCard("Peak +6 h", (Math.round(peak6 * 10) / 10) + " m³/s"));
+  if (nc.q.length > 6) {
+    const peakAll = Math.max(...nc.q);
+    cards.push(statCard("Peak +" + nc.q.length + " h",
+      (Math.round(peakAll * 10) / 10) + " m³/s"));
+  }
   if (nc.qbase != null) cards.push(statCard("Baseflow (Eckhardt)", nc.qbase + " m³/s"));
   if (nc.q2 != null) cards.push(statCard("2-yr / 5-yr flood", nc.q2 + " / " + (nc.q5 ?? "?") + " m³/s"));
   const TIER_LABEL = { 1: "🟡 elevated — ≥ 5× baseflow",
@@ -2141,17 +2146,22 @@ function _nowcastFig(id, big) {
       mode: "lines", line: { color: "#f4f4f4", width: big ? 1.8 : 1.5,
                              shape: "spline", smoothing: 0.8 } });
   }
-  traces.push({ x: nowcastRes.times, y: nc.q, name: "🔮 next 6 h",
+  traces.push({ x: nowcastRes.times.slice(0, 6), y: nc.q.slice(0, 6), name: "🔮 next 6 h",
     mode: "lines+markers", line: { color: "#ff9f43", width: big ? 2.4 : 2, dash: "dot" },
     marker: { size: big ? 7 : 5 } });
+  if (nc.q.length > 6) {         // 12-h model: hours 7-12 in their own color
+    traces.push({ x: nowcastRes.times.slice(5), y: nc.q.slice(5), name: "🔮 +7–12 h",
+      mode: "lines+markers", line: { color: "#c77dff", width: big ? 2.4 : 2, dash: "dot" },
+      marker: { size: big ? 7 : 5 } });
+  }
   const issue = (nowcastRes.t0 || "").slice(0, 16);
-  // default view = 6 h history + 6 h prediction; the full 48 h of obs are in
+  // default view = 6 h history + full prediction; the full 7 d of obs are in
   // the traces, so dragging (or scroll-zoom in the enlarged view) reveals them
   let range = null;
   if (issue) {
     const t0ms = Date.parse(issue.replace(" ", "T") + ":00Z");
     const fmt = (ms) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
-    range = [fmt(t0ms - 6 * 3600e3), fmt(t0ms + 6.5 * 3600e3)];
+    range = [fmt(t0ms - 6 * 3600e3), fmt(t0ms + (nc.q.length + 0.5) * 3600e3)];
   }
   const layout = {
     margin: big ? { l: 56, r: 24, t: 18, b: 40 } : { l: 46, r: 12, t: 12, b: 30 },

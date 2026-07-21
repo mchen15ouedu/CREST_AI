@@ -49,9 +49,10 @@ truststore.inject_into_ssl()
 from forcing_update_common import HF_REPO, hf_token                             # noqa: E402
 
 MODEL_REPO = "vincewin/CREST_nowcast_model"
+MODEL_FILE = "dilstm_h12.pt"      # 12-h retrain; ck["horizon"] is authoritative
 RECENT_PREFIX = "mrms_recent/"
 MRMS_GRID = (-130.0, 20.0, 0.01, 3500, 7000, -9999.0)   # xll, yll, cell, nr, nc, nodata
-L, H = 72, 6
+L, H = 72, 6                      # lookback; H is only the horizon fallback
 CFS_TO_CMS = 0.0283168
 CACHE_PATH = "nowcast/precip_cache.parquet"
 LATEST_PATH = "nowcast/latest.parquet"
@@ -74,9 +75,9 @@ def _model_and_stats(token):
             return self.head(out[:, -1])
 
     from huggingface_hub import hf_hub_download
-    p = hf_hub_download(MODEL_REPO, "dilstm.pt", repo_type="model", token=token)
+    p = hf_hub_download(MODEL_REPO, MODEL_FILE, repo_type="model", token=token)
     ck = torch.load(p, map_location="cpu", weights_only=False)
-    m = DILSTM()
+    m = DILSTM(horizon=int(ck.get("horizon", H)))
     m.load_state_dict(ck["state_dict"])
     m.eval()
     return m, ck
@@ -299,7 +300,8 @@ def main() -> int:
             obs_last_t[g] = rows[j][0].strftime("%Y-%m-%d %H:%M")
 
     import torch
-    preds = np.zeros((len(gid), H), "float32")
+    hor = int(ck.get("horizon", H))
+    preds = np.zeros((len(gid), hor), "float32")
     with torch.no_grad():
         for i in range(0, len(gid), 2048):
             y = model(torch.from_numpy(feat[i:i + 2048]))
@@ -310,12 +312,13 @@ def main() -> int:
           b"generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC").encode(),
           b"model_epoch": str(ck.get("epoch")).encode(),
           b"model_val_nse": str(ck.get("val_nse")).encode(),
-          b"model_when": str(ck.get("when")).encode()}
+          b"model_when": str(ck.get("when")).encode(),
+          b"horizon": str(hor).encode()}
     cols = {"gid": gid.tolist(), "lat": lat.astype("float32"),
             "lon": lon.astype("float32"), "area_km2": area.astype("float32"),
             "obs_last_time": obs_last_t, "obs_last_q": obs_last_q,
             "obs_age_h": obs_age}
-    for k in range(H):
+    for k in range(hor):
         cols[f"q{k + 1}"] = preds[:, k]
     latest = pa.table(cols).replace_schema_metadata(md)
 
@@ -329,7 +332,7 @@ def main() -> int:
                f"({n_obs_fresh} with obs <=6 h old) | precip hours: "
                f"{sum(1 for t in hours if f'h{t:%Y%m%d%H}' in cached)}/{L} "
                f"({computed} new, {from_pass2} via Pass2, {len(missing)} missing) | "
-               f"model epoch {ck.get('epoch')} val_nse {ck.get('val_nse')}")
+               f"model h{hor} epoch {ck.get('epoch')} val_nse {ck.get('val_nse')}")
     if args.dry_run:
         print(summary + " [dry-run: no upload]")
         return 0
