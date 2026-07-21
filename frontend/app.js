@@ -2158,13 +2158,13 @@ function _nowcastFig(id, big) {
       marker: { size: big ? 7 : 5 } });
   }
   const issue = (nowcastRes.t0 || "").slice(0, 16);
-  // default view = 6 h history + full prediction; the full 7 d of obs are in
-  // the traces, so dragging (or scroll-zoom in the enlarged view) reveals them
+  // default view = 24 h: 12 h history + 12 h prediction; the full 7 d of obs
+  // are in the traces, so dragging (or scroll-zoom enlarged) reveals them
   let range = null;
   if (issue) {
     const t0ms = Date.parse(issue.replace(" ", "T") + ":00Z");
     const fmt = (ms) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
-    range = [fmt(t0ms - 6 * 3600e3),
+    range = [fmt(t0ms - 12 * 3600e3),
              fmt(t0ms + (nowcastRes.times.length + 0.5) * 3600e3)];
   }
   const layout = {
