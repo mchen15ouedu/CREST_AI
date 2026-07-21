@@ -292,17 +292,5 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 .pin { border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.5); }
 .leaflet-container { background: #0b0f14; }
 
-/* locate ping: expanding rings + name tip when a gauge tab is clicked */
-.gauge-ping { pointer-events: none; }
-.gauge-ping i { position: absolute; left: -10px; top: -10px; width: 20px; height: 20px;
-  border-radius: 50%; border: 2.5px solid #ffd23f; opacity: 0;
-  animation: gping 1.05s ease-out 2; }
-.gauge-ping i:nth-child(2) { animation-delay: .35s; }
-@keyframes gping {
-  0%   { transform: scale(.35); opacity: .95; }
-  100% { transform: scale(3.4); opacity: 0; }
-}
-.ping-tip { background: #1c2733; border: 1px solid #ffd23f; color: #ffe9a8;
-  font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px;
-  box-shadow: 0 2px 8px rgba(0,0,0,.5); }
-.ping-tip::before { border-top-color: #ffd23f; }
+/* focused-gauge halo: steady glow ring on the pin the right panel shows */
+.focus-halo { filter: drop-shadow(0 0 6px rgba(255, 210, 63, .9)); }

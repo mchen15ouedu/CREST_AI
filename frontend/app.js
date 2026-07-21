@@ -896,7 +896,7 @@ function renderTabs() {
     t.className = "rp-tab" + (id === panelGauge ? " active" : "") +
                   (gaugeState[id] === "done" ? " done" : gaugeState[id] === "running" ? " running" : "");
     t.innerHTML = `<span class="dot"></span>${id}<span class="x" title="Close & unselect this gauge">✕</span>`;
-    t.onclick = () => { flashGauge(id); focusGauge(id); };
+    t.onclick = () => { panToGauge(id); focusGauge(id); popFocusHalo(); };
     t.querySelector(".x").onclick = (e) => { e.stopPropagation(); closeSimTab(id); };
     bar.appendChild(t);
   });
@@ -912,6 +912,7 @@ function closeSimTab(id) {
   if (panelGauge === id) {
     if (rest.length) { focusGauge(rest[0]); return; }
     panelGauge = null;
+    updateFocusHalo(null);
     document.getElementById("right-panel").classList.add("hidden");
     document.getElementById("rp-reopen").classList.add("hidden");
     return;
@@ -927,6 +928,7 @@ function focusGauge(id) {
   document.getElementById("right-panel").classList.remove("hidden");
   document.getElementById("rp-reopen").classList.add("hidden");
   document.getElementById("rp-title").textContent = `${id} · ${g ? g.name : ""}`;
+  updateFocusHalo(id);
   renderTabs();
   renderFavBtn();
   renderStats(id);
@@ -2033,6 +2035,7 @@ function setMode(nc) {
   nowcastMode = nc;
   document.getElementById("mode-hind").classList.toggle("on", !nc);
   document.getElementById("mode-now").classList.toggle("on", nc);
+  updateFocusHalo(null);               // the mode's own refocus re-adds it
   refreshSelection();
   if (nc) {
     // everyone starts from the CONUS overview — the tiered risk map IS the
@@ -2108,7 +2111,7 @@ function focusNowcastGauge(id) {
     const t = document.createElement("button");
     t.className = "rp-tab done" + (gid2 === panelGauge ? " active" : "");
     t.innerHTML = `<span class="dot"></span>${gid2}<span class="x" title="Close & unselect this gauge">✕</span>`;
-    t.onclick = () => { flashGauge(gid2); focusNowcastGauge(gid2); };
+    t.onclick = () => { panToGauge(gid2); focusNowcastGauge(gid2); popFocusHalo(); };
     t.querySelector(".x").onclick = (e) => { e.stopPropagation(); closeNowcastTab(gid2); };
     bar.appendChild(t);
   });
@@ -2131,6 +2134,7 @@ function focusNowcastGauge(id) {
                        3: "🔴 flood — ≥ 5-yr flow" };
   if (nc.tier) cards.push(statCard("⚠ Risk", TIER_LABEL[nc.tier]));
   document.getElementById("rp-stats").innerHTML = cards.join("");
+  updateFocusHalo(id);
   showUpstreamNet(id);
   renderNowcastHydro(id);
   document.getElementById("rp-report").innerHTML =
@@ -2204,6 +2208,7 @@ function closeNowcastTab(id) {
     panelGauge = null;
     nowcastPanelActive = false;
     clearUpstreamNet();
+    updateFocusHalo(null);
     document.getElementById("right-panel").classList.add("hidden");
     document.getElementById("rp-reopen").classList.add("hidden");
     return;
@@ -2211,23 +2216,33 @@ function closeNowcastTab(id) {
   focusNowcastGauge(panelGauge);                 // re-render tabs without `id`
 }
 
-// ---- locate ping: brief expanding rings + name tip on the gauge pin ------
-let pingMarker = null, pingTimer = null;
-function flashGauge(id) {
-  const g = gaugeData[id] || (nowcastRes && nowcastRes.gauges[id]) || null;
+// ---- focused-gauge halo: a steady glow ring on the pin the panel shows ---
+let focusHalo = null;
+function updateFocusHalo(id) {
+  const g = (id && (gaugeData[id] || (nowcastRes && nowcastRes.gauges[id]))) || null;
+  if (focusHalo) { map.removeLayer(focusHalo); focusHalo = null; }
   if (!g || g.lat == null) return;
-  if (pingMarker) { map.removeLayer(pingMarker); clearTimeout(pingTimer); pingMarker = null; }
-  if (!map.getBounds().contains([g.lat, g.lon])) map.panTo([g.lat, g.lon], { animate: false });
-  pingMarker = L.marker([g.lat, g.lon], {
-    icon: L.divIcon({ className: "gauge-ping", html: "<i></i><i></i>", iconSize: [0, 0] }),
-    interactive: false, zIndexOffset: 1200,
-  }).addTo(map)
-    .bindTooltip(`📍 ${id}${g.name ? " · " + g.name : ""}`,
-      { permanent: true, direction: "top", offset: [0, -12], className: "ping-tip" })
-    .openTooltip();
-  pingTimer = setTimeout(() => {
-    if (pingMarker) { map.removeLayer(pingMarker); pingMarker = null; }
-  }, 2400);
+  focusHalo = L.circleMarker([g.lat, g.lon], {
+    radius: 12, color: "#ffd23f", weight: 2.5, opacity: 0.95,
+    fillColor: "#ffd23f", fillOpacity: 0.12,
+    className: "focus-halo", interactive: false,
+  }).addTo(map);
+}
+function panToGauge(id) {
+  const g = gaugeData[id] || (nowcastRes && nowcastRes.gauges[id]) || null;
+  if (g && g.lat != null && !map.getBounds().contains([g.lat, g.lon]))
+    map.panTo([g.lat, g.lon], { animate: false });
+}
+function popFocusHalo() {          // one smooth settle (18px -> 12px), no looping
+  if (!focusHalo) return;
+  const t0 = performance.now();
+  const step = (t) => {
+    if (!focusHalo) return;
+    const p = Math.min(1, (t - t0) / 350);
+    focusHalo.setRadius(12 + 8 * (1 - p) * (1 - p));
+    if (p < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 // ---- upstream river network (nowcast): HydroRIVERS walk from the gauge ---
