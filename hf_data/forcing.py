@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 import truststore
 truststore.inject_into_ssl()  # local corporate-MITM fix; harmless on HF runners
 from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError
 
 HF_REPO = "vincewin/CREST_data"
 
@@ -173,8 +174,17 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
             local_tar = hf_hub_download(repo, ref.strftime(cfg.month_fmt),
                                         repo_type="dataset", cache_dir=cache_dir)
         except Exception:                        # fallback to year-tar (pre-reshard)
-            local_tar = hf_hub_download(repo, ref.strftime(cfg.year_fmt),
-                                        repo_type="dataset", cache_dir=cache_dir)
+            try:
+                local_tar = hf_hub_download(repo, ref.strftime(cfg.year_fmt),
+                                            repo_type="dataset", cache_dir=cache_dir)
+            except EntryNotFoundError:           # genuine data gap (permanent 404):
+                # fail loudly but readably — never silently run with no forcing.
+                # (transient network errors raise other types and still propagate.)
+                raise RuntimeError(
+                    f"{var.upper()} forcing is not available for {year}-{month:02d} — "
+                    f"the archive does not cover this period. Try a more recent "
+                    f"date range."
+                ) from None
         with tarfile.open(local_tar) as tf:
             names = set(tf.getnames())
             for t in steps:
