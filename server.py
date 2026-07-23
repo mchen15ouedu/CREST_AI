@@ -628,10 +628,12 @@ def api_nowcast(sim_id: str, gauge_id: str):
     return _nc.for_job(job, gauge_id)
 
 
-# ungauged-point nowcast window: 12 h of routed-from-observed history shown
-# before t0, 12 h of routed-from-prediction ahead of it (matches the 24-h
-# gauge-nowcast window and the DI-LSTM 12-h horizon)
-NOWCAST_PAST_H = 12
+# ungauged-point nowcast window. An ungauged point has no observations to show
+# as historical context the way a gauged point does (its nowcast panel plots 7
+# days of observed flow before the prediction), so the routed line itself spans
+# that 7-day context: 168 h of routed-from-observed history before t0, then the
+# 12 h routed-from-prediction tail (the DI-LSTM horizon)
+NOWCAST_PAST_H = 168
 NOWCAST_FWD_H = 12
 
 

@@ -2235,8 +2235,10 @@ async function runRoutedNowcast(id) {
     lastSim = { tStart: d.t_start, tEnd: d.t_end, hours: NOWCAST_WINDOW_H,
                 expectedSteps: NOWCAST_WINDOW_H + 1 };
     addMsg(`🔮 <b>${id}</b> — routing upstream gauges' flow (observed + AI nowcast) ` +
-      "to this ungauged point. The hydrograph streams in as EF5 routes; the dashed " +
-      "orange tail past “now” is driven by the upstream <b>predictions</b>.", "status");
+      "to this ungauged point. There are no observations here, so the line is the " +
+      "routed model itself: <b>7 days</b> of history (solid, from observed upstream " +
+      "flow) then the 12-hour prediction (dashed orange past “now”, from the upstream " +
+      "nowcasts).", "status");
     renderTabs();
     focusGauge(id);
     openStream(d.sim_id);
@@ -2244,7 +2246,7 @@ async function runRoutedNowcast(id) {
     addMsg("⚠️ " + escapeHtml(String(err.message || err)), "status");
   }
 }
-const NOWCAST_WINDOW_H = 24;   // [t0-12h, t0+12h]
+const NOWCAST_WINDOW_H = 180;  // [t0-168h, t0+12h] — 7-day routed history + 12h nowcast
 
 function scheduleAutoView() {        // zoomed to a small area -> show everything in view
   clearTimeout(ncTimer);
