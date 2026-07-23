@@ -185,8 +185,9 @@ function updateMapMode() {
   const showPins = zoomedIn || !!queryCtx;
   if (showPins) { if (!map.hasLayer(gaugeLayer)) gaugeLayer.addTo(map); }
   else if (map.hasLayer(gaugeLayer)) map.removeLayer(gaugeLayer);
-  const showVps = showPins && !nowcastMode;          // virtual pts: hindcast only
-  if (showVps) { if (!map.hasLayer(vpLayer)) vpLayer.addTo(map); }
+  // virtual points show in both modes now: hindcast simulates them, nowcast
+  // routes upstream flow to them on click
+  if (showPins) { if (!map.hasLayer(vpLayer)) vpLayer.addTo(map); }
   else if (map.hasLayer(vpLayer)) map.removeLayer(vpLayer);
 }
 
@@ -350,7 +351,15 @@ function gaugeStyle(id) {
 function toggleGauge(id) {
   selected.has(id) ? selected.delete(id) : selected.add(id);
   refreshSelection();
-  if (nowcastMode) { scheduleNowcast(); return; }   // instant precomputed nowcasts
+  if (nowcastMode) {
+    // ungauged point: no precomputed prediction — route upstream gauges' flow
+    // to it on demand; gauged points serve their instant precomputed nowcast
+    if (gaugeData[id] && gaugeData[id].virtual) {
+      if (selected.has(id)) runRoutedNowcast(id);
+      return;
+    }
+    scheduleNowcast(); return;             // instant precomputed nowcasts
+  }
   if (simHydro[id]) focusGauge(id);        // has results -> show them
 }
 function selKey() { return [...selected].sort().join(","); }
@@ -1112,7 +1121,14 @@ function setHydroTz(utc) {
   if (hydroModalOpen) renderHydroBig();
 }
 
-function _hydroFig(rows, big, nc) {
+// routedNowcast[id] = { t0 } — ungauged points whose panel hydrograph is a
+// routed nowcast: the Sim Q line splits at t0 into routed-from-observed (solid)
+// and routed-from-prediction (dashed), with a "now" divider
+const routedNowcast = {};
+
+function _utcMs(t) { return Date.parse(String(t).replace(" ", "T") + "Z"); }
+
+function _hydroFig(rows, big, nc, splitT0) {
   const x = rows.map((r) => tsDisp(r.time)), sim = rows.map((r) => r.sim_q),
     obs = rows.map((r) => r.obs_q), pr = rows.map((r) => r.precip || 0);
   const maxp = Math.max(0.1, ...pr);
@@ -1126,15 +1142,31 @@ function _hydroFig(rows, big, nc) {
     traces.push({ x, y: obs, name: "Obs Q", mode: "lines",
       line: { color: "#f4f4f4", width: big ? 1.6 : 1.3, shape: "spline", smoothing: 0.8 } });
   }
-  traces.push({ x, y: sim, name: "Sim Q", mode: "lines",
-    line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } });
-  if (nc && nc.ok && nc.times && nc.times.length) {
-    const last = rows[rows.length - 1];             // anchor for a continuous tail
-    traces.push({ x: [tsDisp(last.time), ...nc.times.map(tsDisp)],
-      y: [last.sim_q, ...nc.q],
-      name: "🔮 nowcast", mode: "lines",
-      line: { color: "#ff9f43", width: big ? 2.2 : 1.8, dash: "dot" } });
+  if (splitT0) {
+    // routed nowcast: one continuous line, solid up to t0, dashed after —
+    // build two y-arrays that share the t0 point so they join seamlessly
+    const t0ms = _utcMs(splitT0);
+    const past = rows.map((r) => (_utcMs(r.time) <= t0ms ? r.sim_q : null));
+    const fut = rows.map((r) => (_utcMs(r.time) >= t0ms ? r.sim_q : null));
+    traces.push({ x, y: past, name: "Routed (obs upstream)", mode: "lines",
+      connectgaps: false,
+      line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } });
+    traces.push({ x, y: fut, name: "🔮 Routed nowcast", mode: "lines",
+      connectgaps: false,
+      line: { color: "#ff9f43", width: big ? 2.4 : 2.0, dash: "dot", shape: "spline", smoothing: 0.8 } });
+  } else {
+    traces.push({ x, y: sim, name: "Sim Q", mode: "lines",
+      line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } });
+    if (nc && nc.ok && nc.times && nc.times.length) {
+      const last = rows[rows.length - 1];           // anchor for a continuous tail
+      traces.push({ x: [tsDisp(last.time), ...nc.times.map(tsDisp)],
+        y: [last.sim_q, ...nc.q],
+        name: "🔮 nowcast", mode: "lines",
+        line: { color: "#ff9f43", width: big ? 2.2 : 1.8, dash: "dot" } });
+    }
   }
+  const shapes = hydroSelTime ? [_hydroMarker(tsDisp(hydroSelTime))] : [];
+  if (splitT0) shapes.push(_nowLine(tsDisp(splitT0)));
   const layout = {
     margin: big ? { l: 56, r: 56, t: 18, b: 40 } : { l: 46, r: 46, t: 12, b: 30 },
     bargap: 0, showlegend: true,
@@ -1144,11 +1176,16 @@ function _hydroFig(rows, big, nc) {
     xaxis: { gridcolor: "rgba(255,255,255,.06)" },
     yaxis: { title: "Q m³/s", rangemode: "tozero", gridcolor: "rgba(255,255,255,.06)" },
     yaxis2: { overlaying: "y", side: "right", range: [maxp * 3.4, 0], showgrid: false },
-    shapes: hydroSelTime ? [_hydroMarker(tsDisp(hydroSelTime))] : [],
+    shapes,
     hovermode: "x",
   };
   if (!big) layout.height = 250;
   return { traces, layout };
+}
+
+function _nowLine(xstr) {
+  return { type: "line", x0: xstr, x1: xstr, yref: "paper", y0: 0, y1: 1,
+    line: { color: "#ff9f43", width: 1, dash: "dash" }, opacity: 0.55 };
 }
 
 function _bindHydroClick(el, id) {
@@ -1192,7 +1229,8 @@ function renderHydro(id) {
   }
   if (el.querySelector(".muted")) el.innerHTML = "";     // drop placeholder before plotting
   const { traces, layout } = _hydroFig(rows, false,
-    gaugeResult[id] && gaugeResult[id].nowcast);
+    gaugeResult[id] && gaugeResult[id].nowcast,
+    routedNowcast[id] && routedNowcast[id].t0);
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
   _bindHydroClick(el, id);
   xp.classList.remove("hidden");
@@ -1306,7 +1344,8 @@ function renderHydroBig() {
   el.style.width = Math.round(hmBaseW * hmZoom) + "px";
   el.style.height = Math.round(_hmBaseH() * Math.max(1, (hmZoom + 1) / 2)) + "px";
   const { traces, layout } = nc ? _nowcastFig(panelGauge, true)
-    : _hydroFig(rows, true, gaugeResult[panelGauge] && gaugeResult[panelGauge].nowcast);
+    : _hydroFig(rows, true, gaugeResult[panelGauge] && gaugeResult[panelGauge].nowcast,
+                routedNowcast[panelGauge] && routedNowcast[panelGauge].t0);
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true,
                                      scrollZoom: true, doubleClick: "reset" });
   if (!nc) _bindHydroClick(el, panelGauge);
@@ -2144,11 +2183,7 @@ function setMode(nc) {
   document.getElementById("mode-hind").classList.toggle("on", !nc);
   document.getElementById("mode-now").classList.toggle("on", nc);
   updateFocusHalo(null);               // the mode's own refocus re-adds it
-  if (nc) {                            // virtual points are hindcast-only:
-    if (map.hasLayer(vpLayer)) map.removeLayer(vpLayer);     // no nowcast data
-    [...selected].filter((id) => gaugeData[id] && gaugeData[id].virtual)
-      .forEach((id) => selected.delete(id));
-  } else { updateMapMode(); }          // re-adds vpLayer if pins are showing
+  updateMapMode();                     // vpLayer shows in both modes now
   refreshSelection();
   if (nc) {
     // everyone starts from the CONUS overview — the tiered risk map IS the
@@ -2158,8 +2193,10 @@ function setMode(nc) {
            "trouble within 6 hours: 🔴 ≥ 5-yr flood, 🟠 ≥ 2-yr (bankfull), 🟡 ≥ 5× " +
            "baseflow (density map zoomed out, colored pins zoomed in). Click gauges, " +
            "draw a rectangle, or zoom until ≤25 are in view for observed flow + the " +
-           "next-6-hour prediction, refreshed hourly. <b>Experimental</b>; gauge points " +
-           "only (2-D maps stay in Hindcast).", "status");
+           "next-6-hour prediction, refreshed hourly. Purple dashed <b>ungauged points</b> " +
+           "have no gauge to predict from — click one and the AI routes its upstream " +
+           "gauges' nowcasts down to it. <b>Experimental</b>; gauge points only " +
+           "(2-D maps stay in Hindcast).", "status");
     loadNowcastRisk();
     scheduleAutoView();
   } else {
@@ -2177,6 +2214,37 @@ function scheduleNowcast() {
   clearTimeout(ncTimer);
   ncTimer = setTimeout(() => { if (selected.size) showNowcastsFor([...selected]); }, 400);
 }
+
+// ungauged point in nowcast mode: route its upstream gauges' flow (observed +
+// their DI-LSTM nowcast) to it via EF5. Streams like a hindcast; the panel
+// hydrograph splits at t0 into routed-from-observed and routed-from-prediction.
+async function runRoutedNowcast(id) {
+  try {
+    const r = await fetch("/api/nowcast_route", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gauge_id: id, prev_sim_id: currentSim }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      addMsg(`⚠️ Routed nowcast unavailable: ${escapeHtml(d.reason || "no data")}`, "status");
+      selected.delete(id); refreshSelection();
+      return;
+    }
+    routedNowcast[id] = { t0: d.t0 };
+    simHydro[id] = []; gaugeState[id] = "running"; delete gaugeResult[id];
+    lastSim = { tStart: d.t_start, tEnd: d.t_end, hours: NOWCAST_WINDOW_H,
+                expectedSteps: NOWCAST_WINDOW_H + 1 };
+    addMsg(`🔮 <b>${id}</b> — routing upstream gauges' flow (observed + AI nowcast) ` +
+      "to this ungauged point. The hydrograph streams in as EF5 routes; the dashed " +
+      "orange tail past “now” is driven by the upstream <b>predictions</b>.", "status");
+    renderTabs();
+    focusGauge(id);
+    openStream(d.sim_id);
+  } catch (err) {
+    addMsg("⚠️ " + escapeHtml(String(err.message || err)), "status");
+  }
+}
+const NOWCAST_WINDOW_H = 24;   // [t0-12h, t0+12h]
 
 function scheduleAutoView() {        // zoomed to a small area -> show everything in view
   clearTimeout(ncTimer);

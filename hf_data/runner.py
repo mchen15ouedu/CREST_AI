@@ -140,7 +140,10 @@ def run_ef5(control_path: str, output_dir: str, gauge_id: str, model: str = "cre
     if os.name != "nt":            # line-buffer stdout so crashes keep the trail
         cmd = ["stdbuf", "-oL", "-eL"] + cmd
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
-    ts = os.path.join(output_dir, f"ts.{gauge_id}.{model}.csv")
+    # EF5 lowercases the gauge id in the timeseries filename. All-digit USGS ids
+    # are unaffected, but a virtual point's "V…" id is written as "v…", so the
+    # expected path must lowercase too or the rows are never read (0-row runs).
+    ts = os.path.join(output_dir, f"ts.{gauge_id.lower()}.{model}.csv")
     return RunHandle(output_dir=output_dir, ts_path=ts, model=model, proc=proc)
 
 

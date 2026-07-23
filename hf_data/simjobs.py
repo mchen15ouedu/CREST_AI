@@ -81,6 +81,7 @@ class SimJob:
                     timestep=self.opts.get("timestep", "1h"),
                     warmup_days=int(self.opts.get("warmup_days", 90)),
                     scheme=self.opts.get("scheme", "full"),
+                    nowcast_t0=self.opts.get("nowcast_t0"),
                     cancel=self.cancel):
                 if kind == "meta":
                     self.meta[gid] = payload

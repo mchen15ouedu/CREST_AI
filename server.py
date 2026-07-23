@@ -628,6 +628,49 @@ def api_nowcast(sim_id: str, gauge_id: str):
     return _nc.for_job(job, gauge_id)
 
 
+# ungauged-point nowcast window: 12 h of routed-from-observed history shown
+# before t0, 12 h of routed-from-prediction ahead of it (matches the 24-h
+# gauge-nowcast window and the DI-LSTM 12-h horizon)
+NOWCAST_PAST_H = 12
+NOWCAST_FWD_H = 12
+
+
+class NowcastRouteReq(BaseModel):
+    gauge_id: str                       # a virtual ("V…") point
+    prev_sim_id: str | None = None
+
+
+@app.post("/api/nowcast_route")
+def api_nowcast_route(req: NowcastRouteReq, request: Request):
+    """Nowcast for an UNGAUGED point by routing upstream gauges' flow to it:
+    each upstream cut gauge is injected with its observed discharge up to t0
+    and its DI-LSTM prediction beyond t0, and EF5 routes the combined inflow
+    (plus local runoff) to the point. Streams like a simulation via
+    /api/stream/{sim_id}; the window is [t0-12h, t0+12h] with t0 the current
+    precomputed nowcast issue time."""
+    from hf_data import virtualpoints, nowcaststore
+    if not virtualpoints.is_virtual(req.gauge_id):
+        return JSONResponse({"ok": False, "reason": "not an ungauged point"},
+                            status_code=422)
+    t0 = nowcaststore.issue_t0()
+    if t0 is None:
+        return JSONResponse({"ok": False,
+                             "reason": "no precomputed nowcast is available yet"},
+                            status_code=503)
+    if req.prev_sim_id:                               # supersede a stale run
+        prev = simjobs.get_job(req.prev_sim_id)
+        if prev and not prev.done.is_set():
+            prev.cancel.set()
+    t_start = t0 - timedelta(hours=NOWCAST_PAST_H)
+    t_end = t0 + timedelta(hours=NOWCAST_FWD_H)
+    opts = {"model": "auto", "scheme": "speed", "snow": "auto", "timestep": "1h",
+            "warmup_days": 10, "nowcast_t0": t0}
+    job = simjobs.start_job([req.gauge_id], t_start, t_end, opts)
+    return {"ok": True, "sim_id": job.id, "gauge_id": req.gauge_id,
+            "t0": t0.strftime("%Y-%m-%dT%H:%M:%S"),
+            "t_start": t_start.isoformat(), "t_end": t_end.isoformat()}
+
+
 @app.get("/api/nowcast_risk")
 def api_nowcast_risk():
     """CONUS-wide flood-risk snapshot for Nowcast mode: which gauges' AI

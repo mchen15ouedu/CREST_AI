@@ -223,6 +223,43 @@ def hotspots(max_n: int | None = None) -> dict:
     return val
 
 
+def issue_t0() -> datetime | None:
+    """Issue time of the current precomputed nowcast (UTC), or None."""
+    meta, cols = _fresh()
+    if cols is None:
+        return None
+    try:
+        return datetime.strptime(meta.get("t0", ""), "%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return None
+
+
+def nowcast_series(gid: str) -> list[tuple[datetime, float]]:
+    """A single gauge's DI-LSTM prediction as [(datetime, cms), ...] starting
+    t0+1h — the future inflow injected at an upstream cut gauge when routing a
+    nowcast to an ungauged downstream point. Uses the 12-h model columns
+    (q12_1..q12_N); falls back to the 6-h columns. Empty if the gauge has no
+    precomputed nowcast (e.g. outside CONUS radar coverage)."""
+    meta, cols = _fresh()
+    if cols is None:
+        return []
+    t0 = issue_t0()
+    if t0 is None:
+        return []
+    sid = str(gid).zfill(8)
+    idx = np.nonzero(cols["gid"] == sid)[0]
+    if len(idx) == 0:
+        return []
+    i = int(idx[0])
+    qn = _q12cols(cols) or _qcols(cols)
+    out = []
+    for k, name in enumerate(qn):
+        v = float(cols[name][i])
+        if np.isfinite(v):
+            out.append((t0 + timedelta(hours=k + 1), max(0.0, v)))
+    return out
+
+
 def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
              obs_hours: int = 0, ids: str = "") -> dict:
     """Nowcasts for every gauge inside the bbox (largest basins first), or —
