@@ -205,7 +205,8 @@ class MockEF5:
 
     def __init__(self, output_dir, gauge_id="01011000", model="crestphys",
                  bounds=(-69.83, 46.32, -68.33, 47.82), n_steps=48, t0=None,
-                 dt_hours=1, delay=0.15, write_grids=True, facc_path=None):
+                 dt_hours=1, delay=0.15, write_grids=True, facc_path=None,
+                 has_obs=True):
         self.output_dir = output_dir
         self.gauge_id, self.model = gauge_id, model
         self.bounds, self.n_steps = bounds, n_steps
@@ -213,6 +214,7 @@ class MockEF5:
         self.dt = timedelta(hours=dt_hours)
         self.delay, self.write_grids = delay, write_grids
         self.facc_path = facc_path            # clipped flow-acc -> realistic network
+        self.has_obs = has_obs                # ungauged points: EF5 writes NaN obs
         self.ts_path = os.path.join(output_dir, f"ts.{gauge_id}.{model}.csv")
 
     def handle(self) -> RunHandle:
@@ -235,10 +237,11 @@ class MockEF5:
                     # a plausible flood pulse
                     q = 5 + 60 * math.exp(-((k - self.n_steps * 0.4) ** 2) / (2 * (self.n_steps * 0.12) ** 2))
                     obs = q * (0.9 + 0.05 * math.sin(k / 3.0))
+                    obs_s = f"{obs:.2f}" if self.has_obs else "nan"   # ungauged: no obs
                     p = max(0.0, 8 * math.exp(-((k - self.n_steps * 0.3) ** 2) / (2 * 3.0 ** 2)))
                     sm = 55 + 30 * (q - 5) / 60.0            # wets up with the pulse
                     gw = 7.0 + 0.02 * k
-                    ts.write(f"{t:%Y-%m-%d %H:%M},{q:.2f},{obs:.2f},{p:.2f},0.10,"
+                    ts.write(f"{t:%Y-%m-%d %H:%M},{q:.2f},{obs_s},{p:.2f},0.10,"
                              f"{sm:.2f},{gw:.2f},0.0000,0.0000,0.6960\n")
                     ts.flush()
                     if self.write_grids:

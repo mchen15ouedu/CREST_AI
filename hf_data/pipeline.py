@@ -689,7 +689,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     if use_mock:
         handle = MockEF5(out_dir, gauge_id=g["id"], model=ef5_model, bounds=bbox,
                          n_steps=run_hours + 1, t0=run_start, delay=0.15,   # inclusive of run_end
-                         write_grids=grids,
+                         write_grids=grids, has_obs=not g.get("virtual"),
                          facc_path=os.path.join(grid_dir, "facc_clip.tif")).start()
     else:
         handle = run_ef5(spec.control_path, out_dir, g["id"], model=ef5_model)

@@ -1116,13 +1116,18 @@ function _hydroFig(rows, big, nc) {
   const x = rows.map((r) => tsDisp(r.time)), sim = rows.map((r) => r.sim_q),
     obs = rows.map((r) => r.obs_q), pr = rows.map((r) => r.precip || 0);
   const maxp = Math.max(0.1, ...pr);
+  // ungauged points have no observations — plot simulation only, and drop the
+  // Obs Q trace so no empty "Obs Q" entry appears in the legend
+  const hasObs = obs.some((v) => typeof v === "number" && isFinite(v));
   const traces = [
     { x, y: pr, name: "Precip", type: "bar", marker: { color: "#5b9bd5" }, yaxis: "y2", opacity: 0.7 },
-    { x, y: obs, name: "Obs Q", mode: "lines",
-      line: { color: "#f4f4f4", width: big ? 1.6 : 1.3, shape: "spline", smoothing: 0.8 } },
-    { x, y: sim, name: "Sim Q", mode: "lines",
-      line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } },
   ];
+  if (hasObs) {
+    traces.push({ x, y: obs, name: "Obs Q", mode: "lines",
+      line: { color: "#f4f4f4", width: big ? 1.6 : 1.3, shape: "spline", smoothing: 0.8 } });
+  }
+  traces.push({ x, y: sim, name: "Sim Q", mode: "lines",
+    line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } });
   if (nc && nc.ok && nc.times && nc.times.length) {
     const last = rows[rows.length - 1];             // anchor for a continuous tail
     traces.push({ x: [tsDisp(last.time), ...nc.times.map(tsDisp)],
