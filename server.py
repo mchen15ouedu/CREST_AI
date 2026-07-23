@@ -389,9 +389,17 @@ def _pins_for_bbox(w: float, s: float, e: float, n: float, limit: int = 300):
 
 @app.get("/api/gauges")
 def api_gauges(w: float, s: float, e: float, n: float):
-    """USGS gauge pins for the current viewport — works with zero AI interaction."""
+    """USGS gauge pins for the current viewport — works with zero AI interaction.
+    vp_pins: ungauged virtual points (HydroBASINS pour points) that fill the
+    coverage gaps — hindcast-simulatable via upstream-gauge injection."""
     pins = _pins_for_bbox(w, s, e, n)
-    return {"gauge_pins": pins, "n_gauges": len(pins), "max_sims": MAX_SIMS}
+    try:
+        from hf_data import virtualpoints
+        vps = virtualpoints.for_bbox(w, s, e, n)
+    except Exception:
+        vps = []
+    return {"gauge_pins": pins, "vp_pins": vps,
+            "n_gauges": len(pins), "max_sims": MAX_SIMS}
 
 
 class Query(BaseModel):
@@ -761,6 +769,10 @@ class CalRequest(BaseModel):
 
 @app.post("/api/calibrate")
 def api_calibrate(req: CalRequest):
+    from hf_data import virtualpoints
+    if virtualpoints.is_virtual(req.gauge_id):
+        return JSONResponse({"error": "ungauged points have no observations — "
+                                      "calibration is not possible"}, status_code=422)
     job = caljobs.start_job(req.gauge_id,
                             datetime.fromisoformat(req.t_start),
                             datetime.fromisoformat(req.t_end),

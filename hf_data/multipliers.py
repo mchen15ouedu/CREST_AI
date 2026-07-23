@@ -64,6 +64,27 @@ def to_control_params(station_id: str, model: str = "crestphys"):
     return wb, m["kw"]
 
 
+def nearest_station(lat: float, lon: float) -> tuple[str, float] | None:
+    """(station_id, dist_km) of the calibrated gauge closest to a coordinate.
+
+    Regionalization for ungauged virtual points: with no observations to
+    calibrate against, the point borrows the full multiplier set of its
+    nearest calibrated neighbor — the same spatial-proximity transfer the
+    table itself uses for uncalibrated gauges (source_station).
+    """
+    from hf_data import gauges
+    cat = gauges.load_catalog()
+    tbl = _table()
+    cat = cat[cat.STAID.isin(tbl.index)]
+    if cat.empty:
+        return None
+    d2 = (cat.LAT_GAGE - lat) ** 2 + ((cat.LNG_GAGE - lon) ** 2)
+    i = d2.idxmin()
+    r = cat.loc[i]
+    km = float(d2.loc[i]) ** 0.5 * 111.0
+    return str(r.STAID).zfill(8), km
+
+
 if __name__ == "__main__":
     tbl = _table()
     print(f"multiplier table: {len(tbl)} gauges")

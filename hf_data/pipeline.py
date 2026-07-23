@@ -218,6 +218,9 @@ def _run_lock(gauge_id: str, model: str) -> threading.Lock:
 
 
 def gauge_info(gauge_id: str):
+    from hf_data import virtualpoints
+    if virtualpoints.is_virtual(gauge_id):        # ungauged pour-point outlet
+        return virtualpoints.info(str(gauge_id))
     df = gauges._catalog()
     sid = str(gauge_id).zfill(8)
     row = df.loc[df.STAID == sid]
@@ -245,6 +248,21 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
         model = "crest" if g["lon"] < WEST_LON else "crestphys"
     ef5_model = model                            # MODEL= + EF5 output-file naming
     wb_model = "crest" if model in ("crest", "hp") else "crestphys"  # multiplier source
+    if g.get("virtual"):
+        if scheme != "speed":
+            # an ungauged point has no observations: injecting upstream USGS obs
+            # and simulating only the incremental area is the whole design —
+            # full-basin runs of a big ungauged outlet would also be uncacheable-slow
+            scheme = "speed"
+            yield ("status", "🛰 ungauged point — speed scheme forced: upstream USGS "
+                             "gauges (where present) feed the run as boundary inflow")
+        if warmup_days > 10:
+            # upstream injection carries the main river, so only the small
+            # incremental area needs spin-up — and with no observations to
+            # compare against, a long warm-up buys nothing
+            warmup_days = 10
+            yield ("status", "🕐 ungauged point — warm-up shortened to 10 days "
+                             "(injected upstream flow carries the river)")
     yield ("meta", {**g, "model": model})        # for the report + right panel
 
     lock = _run_lock(g["id"], ef5_model)
@@ -381,7 +399,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         yield ("done", {"returncode": -9, "cancelled": True})
         return
 
-    if timestep == "1h" and not no_cache and not use_mock:
+    if timestep == "1h" and not no_cache and not use_mock and not g.get("virtual"):
         try:      # fleet pre-runs (read-only repo): rows serve instantly below,
             from hf_data import fleetstore     # states give 10-day warm starts
             if fleetstore.ensure_local(g["id"], cache_model) == "fetched":
@@ -435,6 +453,16 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                      f"{run_end:%Y-%m-%d %H:%M} ({run_hours} h @ {timestep})")
 
     wbkw = multipliers.to_control_params(g["id"], model=wb_model)
+    if wbkw is None and g.get("virtual"):
+        # ungauged point: borrow the nearest calibrated gauge's multiplier set
+        # (spatial-proximity regionalization — calibration here is impossible)
+        near = multipliers.nearest_station(g["lat"], g["lon"])
+        if near:
+            wbkw = multipliers.to_control_params(near[0], model=wb_model)
+            if wbkw:
+                yield ("status", f"🧭 ungauged point — borrowing calibrated "
+                                 f"parameters from the nearest gauge "
+                                 f"{near[0]} ({near[1]:.0f} km away)")
     if wbkw is None:
         yield ("status", "⚠️ no calibrated params for this gauge")
         yield ("done", {"returncode": -1})
@@ -508,7 +536,10 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         yield ("status", f"warm start from exact saved state @ {pl['load_state_time']:%Y-%m-%d %H:%M}")
 
     usgs_dir = ""
-    if not use_mock:                                  # real run: USGS observed discharge -> OBS=
+    if not use_mock and g.get("virtual"):
+        yield ("status", "🛰 no observations exist at an ungauged point — the "
+                         "hydrograph shows simulation only (no NSE)")
+    elif not use_mock:                                # real run: USGS observed discharge -> OBS=
         usgs_dir = os.path.join(work, "USGS")
         try:
             oinf: dict = {}

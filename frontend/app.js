@@ -52,6 +52,9 @@ const gaugeData = {};             // id -> {id,name,lat,lon,area_km2}
 const selected = new Set();
 let eventLayer = L.layerGroup().addTo(map);
 let gaugeLayer = L.layerGroup().addTo(map);
+// virtual points (ungauged HydroBASINS outlets) — hindcast-only layer:
+// simulated with upstream-gauge injection, no observations, no nowcast
+let vpLayer = L.layerGroup().addTo(map);
 let MAX_SIMS = 10;
 
 let queryCtx = null;              // {t_start, t_end, bbox, label}  (AI-defined window)
@@ -182,6 +185,9 @@ function updateMapMode() {
   const showPins = zoomedIn || !!queryCtx;
   if (showPins) { if (!map.hasLayer(gaugeLayer)) gaugeLayer.addTo(map); }
   else if (map.hasLayer(gaugeLayer)) map.removeLayer(gaugeLayer);
+  const showVps = showPins && !nowcastMode;          // virtual pts: hindcast only
+  if (showVps) { if (!map.hasLayer(vpLayer)) vpLayer.addTo(map); }
+  else if (map.hasLayer(vpLayer)) map.removeLayer(vpLayer);
 }
 
 // ---- map-first gauge pins (no AI needed) --------------------------------
@@ -195,14 +201,18 @@ async function loadViewportGauges() {
     const d = await r.json();
     MAX_SIMS = d.max_sims || MAX_SIMS;
     let pins = d.gauge_pins || [];
+    let vps = d.vp_pins || [];
     // hindcast: only gauges inside visible HUC8s (simulable basins);
     // nowcast: every CONUS gauge has a precomputed prediction — no clip
     if (huc8Layer && !nowcastMode) {
       const vis = visibleHucLayers();
-      pins = pins.filter((g) => vis.some((l) =>
-        l.getBounds().contains([g.lat, g.lon]) && pipGeom(l.feature.geometry, g.lat, g.lon)));
+      const inHuc = (g) => vis.some((l) =>
+        l.getBounds().contains([g.lat, g.lon]) && pipGeom(l.feature.geometry, g.lat, g.lon));
+      pins = pins.filter(inHuc);
+      vps = vps.filter(inHuc);
     }
     addGaugePins(pins);
+    addVpPins(vps);
   } catch (_) { /* offline / transient */ }
 }
 map.on("moveend zoomend", () => {
@@ -219,6 +229,19 @@ function addGaugePins(pins) {
       .bindTooltip(`${g.id} · ${g.name}<br>${Math.round(g.area_km2).toLocaleString()} km²`, { direction: "top" })
       .on("click", () => toggleGauge(g.id));
     m.addTo(gaugeLayer); gaugeMarkers[g.id] = m;
+  });
+}
+
+function addVpPins(pins) {
+  pins.forEach((g) => {
+    if (gaugeMarkers[g.id]) return;
+    gaugeData[g.id] = g;                              // g.virtual === true
+    const m = L.circleMarker([g.lat, g.lon], gaugeStyle(g.id))
+      .bindTooltip(`◇ Ungauged point · ${Math.round(g.area_km2).toLocaleString()} km²<br>` +
+        `simulated with upstream-gauge inflow injection — no observations`,
+        { direction: "top" })
+      .on("click", () => toggleGauge(g.id));
+    m.addTo(vpLayer); gaugeMarkers[g.id] = m;
   });
 }
 
@@ -308,6 +331,13 @@ const TIER_COLORS = { 1: "#ffb300", 2: "#ff7a00", 3: "#ff4030" };  // elevated/m
 
 function gaugeStyle(id) {
   const on = selected.has(id);
+  if (gaugeData[id] && gaugeData[id].virtual) {
+    // ungauged virtual point: hollow dashed diamond-gray look so it can never
+    // be mistaken for a USGS gauge; selection turns it the usual amber
+    return { radius: on ? 8 : 5, color: on ? "#fff" : "#b9a7e6",
+      weight: on ? 2 : 1.4, dashArray: on ? null : "3,3",
+      fillColor: on ? "#ffd479" : "#6f5aa8", fillOpacity: on ? 0.95 : 0.55 };
+  }
   // nowcast mode: pin colored by risk tier (yellow >=5x baseflow, orange >=Q2,
   // red >=Q5) from the hourly precomputed predictions
   const tier = (nowcastMode && riskData && riskData.tiers && riskData.tiers[id]) || 0;
@@ -2109,6 +2139,11 @@ function setMode(nc) {
   document.getElementById("mode-hind").classList.toggle("on", !nc);
   document.getElementById("mode-now").classList.toggle("on", nc);
   updateFocusHalo(null);               // the mode's own refocus re-adds it
+  if (nc) {                            // virtual points are hindcast-only:
+    if (map.hasLayer(vpLayer)) map.removeLayer(vpLayer);     // no nowcast data
+    [...selected].filter((id) => gaugeData[id] && gaugeData[id].virtual)
+      .forEach((id) => selected.delete(id));
+  } else { updateMapMode(); }          // re-adds vpLayer if pins are showing
   refreshSelection();
   if (nc) {
     // everyone starts from the CONUS overview — the tiered risk map IS the
@@ -2123,7 +2158,9 @@ function setMode(nc) {
     loadNowcastRisk();
     scheduleAutoView();
   } else {
-    addMsg("🕘 <b>Hindcast mode</b> — historical CREST simulations (pick gauges and a time window).", "status");
+    addMsg("🕘 <b>Hindcast mode</b> — historical CREST simulations (pick gauges and a time window). " +
+           "Purple dashed pins are <b>ungauged points</b>: river outlets with no USGS gauge that fill " +
+           "the coverage gaps — simulated with upstream gauge observations injected as inflow.", "status");
     clearUpstreamNet();
     if (panelGauge && simHydro[panelGauge]) focusGauge(panelGauge);
   }
@@ -2141,7 +2178,7 @@ function scheduleAutoView() {        // zoomed to a small area -> show everythin
   ncTimer = setTimeout(() => {
     if (!nowcastMode || selected.size) return;
     const b = map.getBounds();
-    const vis = Object.values(gaugeData).filter((g) => b.contains([g.lat, g.lon]));
+    const vis = Object.values(gaugeData).filter((g) => !g.virtual && b.contains([g.lat, g.lon]));
     if (vis.length && vis.length <= 25) showNowcastsFor(vis.map((g) => g.id));
   }, 900);
 }
