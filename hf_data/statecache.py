@@ -78,6 +78,63 @@ def save_record(gauge, model, rows: list[dict], state_times: list[str],
     return rec
 
 
+CHECKPOINT_DAYS = float(os.environ.get("CREST_CHECKPOINT_DAYS", "10"))
+
+
+def prune_states(gauge, model, checkpoint_days: float = CHECKPOINT_DAYS) -> int:
+    """Bound state storage for a warm-marched point: keep the NEWEST state (to
+    warm-start the next hour) plus one checkpoint every `checkpoint_days` (kept
+    for future hindcast), delete every intermediate hourly state. Also drops the
+    removed times from the JSON index so _state_choice can't pick a state whose
+    grids are gone. Returns the number of state *files* removed.
+
+    Each save-time has several .tif grids (SM/GW/…); they are grouped by
+    timestamp and kept or dropped together."""
+    import glob as _glob
+    import re as _re
+    d = state_dir(gauge, model)
+    by_t: dict[datetime, list[str]] = {}
+    for p in _glob.glob(os.path.join(d, "*.tif")):
+        m = _re.search(r"_(\d{8})_(\d{4})\.tif$", os.path.basename(p))
+        if not m:
+            continue
+        try:
+            t = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M")
+        except ValueError:
+            continue
+        by_t.setdefault(t, []).append(p)
+    if len(by_t) <= 1:
+        return 0
+    times = sorted(by_t)
+    keep = {times[-1]}                                # newest → next warm-start
+    last_ck = None
+    for t in times:                                  # 10-day-spaced checkpoints
+        if last_ck is None or (t - last_ck).total_seconds() >= checkpoint_days * 86400:
+            keep.add(t)
+            last_ck = t
+    removed = 0
+    for t, paths in by_t.items():
+        if t in keep:
+            continue
+        for p in paths:
+            try:
+                os.remove(p)
+                removed += 1
+            except OSError:
+                pass
+    if removed:                                      # keep the index consistent
+        rec = load_record(gauge, model)
+        if rec and rec.get("state_times"):
+            kept = {t.strftime(TS_FMT) for t in keep}
+            rec["state_times"] = [s for s in rec["state_times"] if s in kept]
+            try:
+                with open(results_path(gauge, model), "w") as f:
+                    json.dump(rec, f)
+            except OSError:
+                pass
+    return removed
+
+
 def nearest_state(gauge, model, t: datetime, tol_days: float = STATE_TOL_DAYS):
     """Nearest saved-state time within +/- tol_days of t (exact wins), or None."""
     rec = load_record(gauge, model)

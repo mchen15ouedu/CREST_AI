@@ -682,6 +682,26 @@ def api_nowcast_risk():
     return nowcaststore.all_risk()
 
 
+@app.get("/api/_rn_test")
+def api_rn_test(gid: str, key: str = ""):
+    """TEMP (V24 dev): run the two-phase incremental routed nowcast for one
+    ungauged point and report phase status + timing, to verify the state
+    hand-off (Phase B should warm-start from Phase A's t0 state). Removed once
+    the keep-warm Space + store serving land."""
+    if key != os.environ.get("CREST_DEV_KEY", "rn-dev"):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    import time as _t
+    from hf_data import routednow, nowcaststore
+    t0 = nowcaststore.issue_t0()
+    if t0 is None:
+        return {"ok": False, "reason": "no nowcast t0"}
+    a = _t.time()
+    r = routednow.compute(gid, t0)
+    return {"ok": r["ok"], "gid": gid, "t0": r["t0"], "elapsed_s": round(_t.time() - a, 1),
+            "n_history": len(r["history"]), "n_forecast": len(r["forecast"]),
+            "q": r["q"][:6], "status": r.get("status", []), "reason": r.get("reason")}
+
+
 @app.get("/api/nowcast_now")
 def api_nowcast_now(w: float, s: float, e: float, n: float, limit: int = 100,
                     obs_hours: int = 0, ids: str = ""):
