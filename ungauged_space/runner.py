@@ -98,9 +98,10 @@ def _checkpoints(vp, model) -> set:
     return set(st[:-1])                        # drop the newest (warm-start head)
 
 
-def run_one(vp: str, t0_iso: str) -> dict:
-    """Advance one ungauged point and, when a new checkpoint appears, persist it
-    to CREST_fleet. Returns the compact row for the nowcast parquet."""
+def run_one(vp: str, t0_iso: str, force_upload: bool = False) -> dict:
+    """Advance one ungauged point and, when a new checkpoint appears (or the
+    parent flags it as not-yet-in-fleet), persist it to CREST_fleet. Returns the
+    compact row for the nowcast parquet."""
     from hf_data import routednow
     t0 = datetime.fromisoformat(t0_iso)
     model = None
@@ -112,21 +113,15 @@ def run_one(vp: str, t0_iso: str) -> dict:
         info = None
 
     before = _checkpoints(vp, model) if model else set()
-    had_fleet = False
-    if model:
-        try:
-            from hf_data import fleetstore
-            had_fleet = fleetstore.ensure_local(vp, model) is not None
-        except Exception:
-            pass
 
-    r = routednow.compute(vp, t0)              # ensure_local (again, cached) + both phases + prune
+    r = routednow.compute(vp, t0)              # ensure_local (cached) + both phases + prune
     if not r.get("ok"):
         return {"vp": vp, "ok": False, "reason": r.get("reason")}
 
     model = r.get("cache_model") or model
+    key = f"{str(vp).zfill(8)}_{model}" if model else None
     after = _checkpoints(vp, model) if model else set()
-    new_ckpt = bool(after - before) or not had_fleet     # 10-day event, or bootstrap
+    new_ckpt = bool(after - before) or force_upload      # 10-day event, or (re)bootstrap
     uploaded = False
     if new_ckpt and model and os.environ.get("HF_TOKEN"):
         try:
@@ -134,14 +129,20 @@ def run_one(vp: str, t0_iso: str) -> dict:
         except Exception as e:
             _safe_note(vp, f"fleet upload failed: {type(e).__name__}: {e}")
 
-    return {"vp": vp, "ok": True, "uploaded": uploaded,
+    return {"vp": vp, "ok": True, "uploaded": uploaded, "key": key,
             "lat": r.get("lat"), "lon": r.get("lon"), "area_km2": r.get("area_km2"),
             "q": r.get("q"), "history": r.get("history")}
 
 
-def _upload_fleet(vp, model) -> bool:
+def _upload_fleet(vp, model, attempts: int = 6) -> bool:
     """Pack the (pruned) state dir + record and commit to CREST_fleet, keeping
-    the local copies for next hour's warm start."""
+    the local copies for next hour's warm start.
+
+    Many workers commit to the same repo ref, so a racing commit loses the
+    parent-oid check (HTTP 412 / "reference update failed"). Retry with a
+    pid-jittered backoff so the burst serializes instead of dropping states."""
+    import random
+    import time as _t
     from hf_data import statebundle, statecache, fleetstore
     from huggingface_hub import CommitOperationAdd, HfApi
     key = f"{str(vp).zfill(8)}_{model}"
@@ -153,10 +154,18 @@ def _upload_fleet(vp, model) -> bool:
     ops = [CommitOperationAdd(f"states/{key}.pqf", blob)]
     if os.path.exists(rec_path):
         ops.append(CommitOperationAdd(f"results/{key}.json", rec_path))
-    HfApi(token=os.environ["HF_TOKEN"]).create_commit(
-        repo_id=fleetstore.REPO, repo_type="dataset", operations=ops,
-        commit_message=f"ungauged checkpoint {key}")
-    return True
+    api = HfApi(token=os.environ["HF_TOKEN"])
+    for i in range(attempts):
+        try:
+            api.create_commit(repo_id=fleetstore.REPO, repo_type="dataset",
+                              operations=ops,
+                              commit_message=f"ungauged checkpoint {key}")
+            return True
+        except Exception:
+            if i == attempts - 1:
+                raise
+            _t.sleep(min(30.0, 1.5 ** i + random.uniform(0, 1.5)))
+    return False
 
 
 def _safe_note(vp, msg):
@@ -169,17 +178,41 @@ def _safe_note(vp, msg):
 # --------------------------------------------------------------------------- #
 # hourly pass (parent)
 # --------------------------------------------------------------------------- #
-def _all_points() -> list[str]:
+def _all_points() -> list[dict]:
     from hf_data import virtualpoints
     w, s, e, n = CONUS
     pts = virtualpoints.for_bbox(w, s, e, n, limit=100000)
-    ids = [p["id"] for p in pts]
     shard = os.environ.get("UNGAUGED_SHARD", "")
     if shard:
         k, nn = map(int, shard.split("/"))
-        ids = [g for i, g in enumerate(ids) if i % nn == k]
+        pts = [p for i, p in enumerate(pts) if i % nn == k]
     lim = int(os.environ.get("UNGAUGED_LIMIT", "0") or 0)
-    return ids[:lim] if lim else ids
+    return pts[:lim] if lim else pts
+
+
+_uploaded_keys: set = set()          # fleet keys known-present (seeded at boot)
+
+
+def _seed_uploaded_keys():
+    """List the ungauged checkpoints already in CREST_fleet so we don't
+    re-upload them, and so any point NOT listed is (re)attempted every pass
+    until it lands — self-healing past commit-collision drops."""
+    try:
+        from hf_data import fleetstore
+        from huggingface_hub import HfApi
+        files = HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
+            fleetstore.REPO, repo_type="dataset")
+        for f in files:
+            if f.startswith("states/V") and f.endswith(".pqf"):
+                _uploaded_keys.add(f[len("states/"):-len(".pqf")])
+        _log(f"seeded {len(_uploaded_keys)} existing ungauged checkpoints from CREST_fleet")
+    except Exception as e:
+        _log(f"could not seed fleet keys: {type(e).__name__}: {e}")
+
+
+def _key_for(vp, lon) -> str:
+    from hf_data import routednow
+    return f"{str(vp).zfill(8)}_{routednow._cache_model(lon)}"
 
 
 def _current_t0():
@@ -195,15 +228,18 @@ def _current_t0():
 
 def run_pass(t0):
     from hf_data import ungaugednow_store
-    ids = _all_points()
+    pts = _all_points()
     workers = int(os.environ.get("UNGAUGED_WORKERS", "8"))
-    _log(f"pass {state['passes'] + 1}: {len(ids)} points @ t0={t0} "
-         f"| {workers} workers")
+    _log(f"pass {state['passes'] + 1}: {len(pts)} points @ t0={t0} "
+         f"| {workers} workers | {len(_uploaded_keys)} checkpoints already in fleet")
     t_start = time.time()
     rows, ok, fail, up = [], 0, 0, 0
     t0_iso = t0.isoformat()
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(run_one, g, t0_iso): g for g in ids}
+        futs = {}
+        for p in pts:
+            force = _key_for(p["id"], p["lon"]) not in _uploaded_keys   # not yet in fleet
+            futs[pool.submit(run_one, p["id"], t0_iso, force)] = p["id"]
         for i, fu in enumerate(as_completed(futs), 1):
             try:
                 r = fu.result()
@@ -211,12 +247,15 @@ def run_pass(t0):
                 r = {"vp": futs[fu], "ok": False, "reason": f"{type(e).__name__}: {e}"}
             if r.get("ok"):
                 ok += 1
-                up += 1 if r.get("uploaded") else 0
+                if r.get("uploaded"):
+                    up += 1
+                    if r.get("key"):
+                        _uploaded_keys.add(r["key"])
                 rows.append(r)
             else:
                 fail += 1
             if i % 200 == 0:
-                _log(f"  {i}/{len(ids)} done ({ok} ok, {fail} fail, {up} uploaded)")
+                _log(f"  {i}/{len(pts)} done ({ok} ok, {fail} fail, {up} uploaded)")
 
     if rows:
         try:
@@ -244,6 +283,7 @@ def warm_loop():
     os.chdir(SRC)                              # EF5 runs relative to ./EF5/bin/ef5
     import sys
     sys.path.insert(0, SRC)
+    _seed_uploaded_keys()                       # so we don't re-upload what's already there
     last_t0 = None
     while True:
         try:
