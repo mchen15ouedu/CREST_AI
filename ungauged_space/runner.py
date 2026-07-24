@@ -210,9 +210,15 @@ def _seed_uploaded_keys():
         _log(f"could not seed fleet keys: {type(e).__name__}: {e}")
 
 
-def _key_for(vp, lon) -> str:
+def _keys_for(vp, lon):
+    """Both candidate fleet keys for a point — the truncated speed domain
+    ("<model>-spd") and the full-basin fallback ("<model>"). We don't know which
+    a point uses until it runs, so a point is "already checkpointed" if EITHER
+    is in the ledger."""
     from hf_data import routednow
-    return f"{str(vp).zfill(8)}_{routednow._cache_model(lon)}"
+    base = routednow._cache_model(lon)[:-4]         # strip "-spd"
+    g = str(vp).zfill(8)
+    return f"{g}_{base}-spd", f"{g}_{base}"
 
 
 def _current_t0():
@@ -238,7 +244,8 @@ def run_pass(t0):
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futs = {}
         for p in pts:
-            force = _key_for(p["id"], p["lon"]) not in _uploaded_keys   # not yet in fleet
+            k_spd, k_base = _keys_for(p["id"], p["lon"])
+            force = k_spd not in _uploaded_keys and k_base not in _uploaded_keys
             futs[pool.submit(run_one, p["id"], t0_iso, force)] = p["id"]
         for i, fu in enumerate(as_completed(futs), 1):
             try:

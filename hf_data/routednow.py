@@ -55,36 +55,48 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
 
     status: list[str] = []
 
+    # A point with a qualifying upstream cut gauge runs the truncated SPEED
+    # domain (state key "<model>-spd", injection-driven); a headwater point with
+    # none falls back to the FULL basin (state key "<model>", MRMS-driven). We
+    # don't know which until the run resolves the scheme, so consider both keys.
+    base_model = "crest" if info["lon"] < WEST_LON else "crestphys"
+    spd_model = base_model + "-spd"
+
     # Cold-boot warm-start: the app's pipeline skips the fleet fetch for virtual
     # points (it serves them from the parquet store, not EF5), so pull our own
     # last checkpoint from CREST_fleet HERE. On a warm container the state is
     # already on local disk and this is a cheap no-op; after a Space restart it
-    # refetches the newest 10-day checkpoint so Phase A short-warms instead of
-    # doing a full 3-month cold start.
-    cache_model = _cache_model(info["lon"])
+    # refetches the newest 10-day checkpoint (whichever variant exists) so Phase
+    # A short-warms instead of doing a full 3-month cold start.
     try:
         from hf_data import fleetstore
-        if fleetstore.ensure_local(gid, cache_model) == "fetched":
-            status.append("[boot] 🚚 fetched last checkpoint from CREST_fleet")
+        for m in (spd_model, base_model):
+            if fleetstore.ensure_local(gid, m) == "fetched":
+                status.append(f"[boot] 🚚 fetched {m} checkpoint from CREST_fleet")
     except Exception:
         pass
 
-    def _drain(gen, tag) -> list[dict]:
+    def _drain(gen, tag):
         rows: list[dict] = []
+        model = None
         for kind, ev in gen:
             if kind == "hydro":
                 rows += ev.get("rows", [])
             elif kind == "status":
                 status.append(f"[{tag}] {ev}")
-        return rows
+            elif kind == "params" and ev.get("cache_model"):
+                model = ev["cache_model"]          # the key EF5 actually saved state under
+        return rows, model
 
-    # Phase A: cached hindcast to t0 (advances + saves state; observed only)
-    hist = _drain(pipeline.run_gauge(
+    # Phase A: cached hindcast to t0 (advances + saves state; observed only).
+    # Its reported cache_model is the one the end-of-window state is stored under.
+    hist, cache_model = _drain(pipeline.run_gauge(
         gid, hist_start, t0, use_mock=False, scheme="speed", grids=False,
         warmup_days=10), "A")
+    cache_model = cache_model or spd_model
 
     # Phase B: 12-h forecast warm-started from the t0 state (no cold warm-up)
-    fcst = _drain(pipeline.run_gauge(
+    fcst, _ = _drain(pipeline.run_gauge(
         gid, t0, t_end, use_mock=False, scheme="speed", grids=False,
         warmup_days=0, nowcast_t0=t0), "B")
 
