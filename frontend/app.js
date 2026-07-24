@@ -378,8 +378,8 @@ function toggleGauge(id) {
   selected.has(id) ? selected.delete(id) : selected.add(id);
   refreshSelection();
   if (nowcastMode) {
-    // ungauged point: no precomputed prediction — route upstream gauges' flow
-    // to it on demand; gauged points serve their instant precomputed nowcast
+    // ungauged point: serve its precomputed routed nowcast from the store;
+    // gauged points serve their instant precomputed DI-LSTM nowcast
     if (gaugeData[id] && gaugeData[id].virtual) {
       if (selected.has(id)) runRoutedNowcast(id);
       return;
@@ -2245,29 +2245,37 @@ function scheduleNowcast() {
 // their DI-LSTM nowcast) to it via EF5. Streams like a hindcast; the panel
 // hydrograph splits at t0 into routed-from-observed and routed-from-prediction.
 async function runRoutedNowcast(id) {
+  // Ungauged routed nowcasts are precomputed hourly by the keep-warm Space and
+  // published to CREST_data; serve the point instantly from that store (no live
+  // EF5 run). The line is the routed model itself: ~7 days of history from
+  // observed upstream flow (solid) then the 12-h prediction from the upstream
+  // AI nowcasts (dashed), split at t0.
   try {
-    const r = await fetch("/api/nowcast_route", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ gauge_id: id, prev_sim_id: currentSim }),
-    });
+    const r = await fetch(`/api/ungauged_now?w=0&s=0&e=0&n=0&ids=${encodeURIComponent(id)}`);
     const d = await r.json();
-    if (!d.ok) {
-      addMsg(`⚠️ Routed nowcast unavailable: ${escapeHtml(d.reason || "no data")}`, "status");
+    const p = d.ok && (d.points || []).find((x) => x.id === id);
+    if (!p) {
+      addMsg(`⚠️ No routed nowcast for <b>${escapeHtml(id)}</b> yet — it has no upstream ` +
+        "USGS gauge to route from, or the hourly keep-warm run hasn’t produced it. " +
+        "Switch to 🕘 Hindcast to simulate this point.", "status");
       selected.delete(id); refreshSelection();
       return;
     }
-    routedNowcast[id] = { t0: d.t0 };
-    simHydro[id] = []; gaugeState[id] = "running"; delete gaugeResult[id];
-    lastSim = { tStart: d.t_start, tEnd: d.t_end, hours: NOWCAST_WINDOW_H,
-                expectedSteps: NOWCAST_WINDOW_H + 1 };
-    addMsg(`🔮 <b>${id}</b> — routing upstream gauges' flow (observed + AI nowcast) ` +
-      "to this ungauged point. There are no observations here, so the line is the " +
-      "routed model itself: <b>7 days</b> of history (solid, from observed upstream " +
-      "flow) then the 12-hour prediction (dashed orange past “now”, from the upstream " +
-      "nowcasts).", "status");
+    const t0disp = String(d.t0 || "").replace(/ UTC$/, "");
+    const rows = [];
+    (p.history || []).forEach(([t, q]) => rows.push({ time: t, sim_q: q }));
+    (p.forecast || []).forEach(([t, q]) => rows.push({ time: t, sim_q: q }));
+    simHydro[id] = rows;
+    routedNowcast[id] = { t0: t0disp };
+    gaugeState[id] = "done";
+    delete gaugeResult[id];
+    addMsg(`🔮 <b>${id}</b> — routed nowcast issued <b>${t0disp} UTC</b> (refreshed hourly): ` +
+      "<b>7 days</b> of routed history (solid, from observed upstream flow) then the " +
+      "12-hour prediction (dashed orange past “now”, from the upstream AI nowcasts). " +
+      "There are no observations here, so the line is the routed model itself.", "status");
     renderTabs();
     focusGauge(id);
-    openStream(d.sim_id);
+    renderHydro(id);
   } catch (err) {
     addMsg("⚠️ " + escapeHtml(String(err.message || err)), "status");
   }

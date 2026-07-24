@@ -628,51 +628,6 @@ def api_nowcast(sim_id: str, gauge_id: str):
     return _nc.for_job(job, gauge_id)
 
 
-# ungauged-point nowcast window. An ungauged point has no observations to show
-# as historical context the way a gauged point does (its nowcast panel plots 7
-# days of observed flow before the prediction), so the routed line itself spans
-# that 7-day context: 168 h of routed-from-observed history before t0, then the
-# 12 h routed-from-prediction tail (the DI-LSTM horizon)
-NOWCAST_PAST_H = 168
-NOWCAST_FWD_H = 12
-
-
-class NowcastRouteReq(BaseModel):
-    gauge_id: str                       # a virtual ("V…") point
-    prev_sim_id: str | None = None
-
-
-@app.post("/api/nowcast_route")
-def api_nowcast_route(req: NowcastRouteReq, request: Request):
-    """Nowcast for an UNGAUGED point by routing upstream gauges' flow to it:
-    each upstream cut gauge is injected with its observed discharge up to t0
-    and its DI-LSTM prediction beyond t0, and EF5 routes the combined inflow
-    (plus local runoff) to the point. Streams like a simulation via
-    /api/stream/{sim_id}; the window is [t0-12h, t0+12h] with t0 the current
-    precomputed nowcast issue time."""
-    from hf_data import virtualpoints, nowcaststore
-    if not virtualpoints.is_virtual(req.gauge_id):
-        return JSONResponse({"ok": False, "reason": "not an ungauged point"},
-                            status_code=422)
-    t0 = nowcaststore.issue_t0()
-    if t0 is None:
-        return JSONResponse({"ok": False,
-                             "reason": "no precomputed nowcast is available yet"},
-                            status_code=503)
-    if req.prev_sim_id:                               # supersede a stale run
-        prev = simjobs.get_job(req.prev_sim_id)
-        if prev and not prev.done.is_set():
-            prev.cancel.set()
-    t_start = t0 - timedelta(hours=NOWCAST_PAST_H)
-    t_end = t0 + timedelta(hours=NOWCAST_FWD_H)
-    opts = {"model": "auto", "scheme": "speed", "snow": "auto", "timestep": "1h",
-            "warmup_days": 10, "nowcast_t0": t0}
-    job = simjobs.start_job([req.gauge_id], t_start, t_end, opts)
-    return {"ok": True, "sim_id": job.id, "gauge_id": req.gauge_id,
-            "t0": t0.strftime("%Y-%m-%dT%H:%M:%S"),
-            "t_start": t_start.isoformat(), "t_end": t_end.isoformat()}
-
-
 @app.get("/api/nowcast_risk")
 def api_nowcast_risk():
     """CONUS-wide flood-risk snapshot for Nowcast mode: which gauges' AI
@@ -680,26 +635,6 @@ def api_nowcast_risk():
     red pins)."""
     from hf_data import nowcaststore
     return nowcaststore.all_risk()
-
-
-@app.get("/api/_rn_test")
-def api_rn_test(gid: str, key: str = ""):
-    """TEMP (V24 dev): run the two-phase incremental routed nowcast for one
-    ungauged point and report phase status + timing, to verify the state
-    hand-off (Phase B should warm-start from Phase A's t0 state). Removed once
-    the keep-warm Space + store serving land."""
-    if key != os.environ.get("CREST_DEV_KEY", "rn-dev"):
-        return JSONResponse({"error": "forbidden"}, status_code=403)
-    import time as _t
-    from hf_data import routednow, nowcaststore
-    t0 = nowcaststore.issue_t0()
-    if t0 is None:
-        return {"ok": False, "reason": "no nowcast t0"}
-    a = _t.time()
-    r = routednow.compute(gid, t0)
-    return {"ok": r["ok"], "gid": gid, "t0": r["t0"], "elapsed_s": round(_t.time() - a, 1),
-            "n_history": len(r["history"]), "n_forecast": len(r["forecast"]),
-            "q": r["q"][:6], "status": r.get("status", []), "reason": r.get("reason")}
 
 
 @app.get("/api/nowcast_now")
@@ -711,6 +646,18 @@ def api_nowcast_now(w: float, s: float, e: float, n: float, limit: int = 100,
     series (<=25 gauges) for plotting."""
     from hf_data import nowcaststore
     return nowcaststore.for_bbox(w, s, e, n, limit, obs_hours, ids)
+
+
+@app.get("/api/ungauged_now")
+def api_ungauged_now(w: float, s: float, e: float, n: float, limit: int = 200,
+                     ids: str = ""):
+    """Precomputed ungauged routed nowcasts for the viewport/rectangle (or an
+    explicit `ids` comma list) — served instantly from the keep-warm Space's
+    hourly parquet, no live EF5 run. Each point carries its ~7-day routed
+    history + 12-h forecast so the panel plots the split hydrograph directly."""
+    from hf_data import ungaugednow_store
+    return (ungaugednow_store.by_ids(ids) if ids
+            else ungaugednow_store.for_bbox(w, s, e, n, limit))
 
 
 @app.get("/api/nowcast_hotspots")

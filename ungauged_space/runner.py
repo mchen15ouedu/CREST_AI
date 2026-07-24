@@ -290,12 +290,23 @@ def run_pass(t0):
     t_start = time.time()
     rows, ok, fail, up, new_headwater = [], 0, 0, 0, 0
     t0_iso = t0.isoformat()
+    PUBLISH_EVERY = 250          # publish partial parquet during the pass so the
+
+    def _publish():              # map populates progressively (esp. the ~7h first pass)
+        try:
+            ungaugednow_store.upload_latest(
+                ungaugednow_store.build_table(rows, t0), tag=_shard_tag())
+            _log(f"  published ungauged_latest{_shard_tag()}.parquet ({len(rows)} routed)")
+        except Exception as e:
+            _log(f"  PARQUET UPLOAD FAILED: {type(e).__name__}: {e}")
+
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futs = {}
         for p in pts:
             k_spd, k_base = _keys_for(p["id"], p["lon"])
             force = k_spd not in _uploaded_keys and k_base not in _uploaded_keys
             futs[pool.submit(run_one, p["id"], t0_iso, force)] = p["id"]
+        last_pub = 0
         for i, fu in enumerate(as_completed(futs), 1):
             try:
                 r = fu.result()
@@ -317,14 +328,16 @@ def run_pass(t0):
             if i % 200 == 0:
                 _log(f"  {i}/{len(pts)} done ({ok} ok, {fail} fail, {up} up, "
                      f"{len(rows)} routed, {new_headwater} new headwater)")
+            if len(rows) - last_pub >= PUBLISH_EVERY:
+                _publish()
+                last_pub = len(rows)
 
-    if rows:
-        try:
-            tbl = ungaugednow_store.build_table(rows, t0)
-            ungaugednow_store.upload_latest(tbl, tag=_shard_tag())
-            _log(f"  uploaded ungauged_latest{_shard_tag()}.parquet ({len(rows)} routed points)")
-        except Exception as e:
-            _log(f"  PARQUET UPLOAD FAILED: {type(e).__name__}: {e}")
+    if rows and len(rows) != last_pub:
+        _publish()                                  # final publish for this pass
+    if new_headwater:
+        _save_ineligible()
+        _log(f"  {new_headwater} new headwater points -> no-upstream list "
+             f"({len(_ineligible)} total, skipped next pass)")
     if new_headwater:
         _save_ineligible()
         _log(f"  {new_headwater} new headwater points -> no-upstream list "
