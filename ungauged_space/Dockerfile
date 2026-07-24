@@ -18,11 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgeos-dev libproj-dev libgdal-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# Apache Arrow C++ + Parquet (EF5 fork's PQF reader)
+# Apache Arrow C++ + Parquet (EF5 fork's PQF reader). Acquire::Retries rides
+# out the intermittent 503s from the Arrow jfrog/S3 mirror that otherwise fail
+# the build outright.
 RUN wget -q https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb \
- && apt-get install -y -V ./apache-arrow-apt-source-latest-jammy.deb \
- && apt-get update \
- && apt-get install -y -V libarrow-dev libparquet-dev \
+ && apt-get install -y -V -o Acquire::Retries=8 ./apache-arrow-apt-source-latest-jammy.deb \
+ && apt-get update -o Acquire::Retries=8 \
+ && apt-get install -y -V -o Acquire::Retries=8 libarrow-dev libparquet-dev \
  && rm -rf /var/lib/apt/lists/* apache-arrow-apt-source-latest-jammy.deb
 
 # EF5 fork (CRESTPHYS + lake + native Parquet forcing) — same commit as the fleet
