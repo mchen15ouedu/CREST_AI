@@ -214,7 +214,33 @@ async function loadViewportGauges() {
     }
     addGaugePins(pins);
     addVpPins(vps);
+    pruneMarkers();                 // bound live marker count (browser RAM)
   } catch (_) { /* offline / transient */ }
+}
+
+// Panning across CONUS accumulates markers unboundedly (~9k gauges + ~2.7k
+// ungauged points), each a live Leaflet object — that climbs browser RAM until
+// the tab janks. Cap the live set to the markers nearest the current view,
+// never dropping ones the user is working with (selected / open panel / has
+// results). Pruned markers reload from /api/gauges when panned back into view.
+const MAX_MARKERS = 1000;
+function pruneMarkers() {
+  const ids = Object.keys(gaugeMarkers);
+  if (ids.length <= MAX_MARKERS) return;
+  const c = map.getCenter();
+  const keep = (id) => selected.has(id) || id === panelGauge ||
+    simHydro[id] || gaugeResult[id] || routedNowcast[id];
+  const removable = ids.filter((id) => !keep(id)).map((id) => {
+    const ll = gaugeMarkers[id].getLatLng();
+    return { id, d: (ll.lat - c.lat) ** 2 + (ll.lng - c.lng) ** 2 };
+  }).sort((a, b) => b.d - a.d);       // farthest from view center first
+  const nRemove = ids.length - MAX_MARKERS;
+  for (let i = 0; i < nRemove && i < removable.length; i++) {
+    const id = removable[i].id, m = gaugeMarkers[id];
+    ((gaugeData[id] && gaugeData[id].virtual) ? vpLayer : gaugeLayer).removeLayer(m);
+    delete gaugeMarkers[id];
+    delete gaugeData[id];
+  }
 }
 map.on("moveend zoomend", () => {
   updateMapMode();
