@@ -472,7 +472,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     if pl["run_start"] is None:                       # fully cached -> no simulation
         # no wb/kw here on purpose: the frames-cache key must be scheme-aware,
         # but an empty param set must never reach the param store
-        yield ("params", {"model": ef5_model, "cache_model": cache_model})
+        yield ("params", {"model": ef5_model, "cache_model": cache_model,
+                          "n_upstream": len(bc_gauges)})
         yield ("status", "✓ served entirely from cache")
         yield ("done", {"returncode": 0, "cached": True,
                         "window": [t_start.strftime(statecache.TS_FMT),
@@ -514,6 +515,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         kw = {**kw, **{k: v for k, v in overrides.items() if k in kw}}
     yield ("params", {"wb": wb, "kw": kw, "model": ef5_model,
                       "cache_model": cache_model,      # frames-cache key (scheme-aware)
+                      "n_upstream": len(bc_gauges),    # 0 => headwater (no injection possible)
                       "source": ("override" if overrides else
                                  stored.get("source", "stored") if stored else "a-priori")})
     pgrids = params.clip_param_grids(bbox, param_dir)

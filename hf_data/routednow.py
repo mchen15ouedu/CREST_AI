@@ -79,24 +79,28 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
     def _drain(gen, tag):
         rows: list[dict] = []
         model = None
+        n_up = None
         for kind, ev in gen:
             if kind == "hydro":
                 rows += ev.get("rows", [])
             elif kind == "status":
                 status.append(f"[{tag}] {ev}")
-            elif kind == "params" and ev.get("cache_model"):
-                model = ev["cache_model"]          # the key EF5 actually saved state under
-        return rows, model
+            elif kind == "params":
+                if ev.get("cache_model"):
+                    model = ev["cache_model"]       # the key EF5 actually saved state under
+                if ev.get("n_upstream") is not None:
+                    n_up = ev["n_upstream"]
+        return rows, model, n_up
 
     # Phase A: cached hindcast to t0 (advances + saves state; observed only).
     # Its reported cache_model is the one the end-of-window state is stored under.
-    hist, cache_model = _drain(pipeline.run_gauge(
+    hist, cache_model, n_upstream = _drain(pipeline.run_gauge(
         gid, hist_start, t0, use_mock=False, scheme="speed", grids=False,
         warmup_days=10), "A")
     cache_model = cache_model or spd_model
 
     # Phase B: 12-h forecast warm-started from the t0 state (no cold warm-up)
-    fcst, _ = _drain(pipeline.run_gauge(
+    fcst, _, _ = _drain(pipeline.run_gauge(
         gid, t0, t_end, use_mock=False, scheme="speed", grids=False,
         warmup_days=0, nowcast_t0=t0), "B")
 
@@ -108,9 +112,16 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
 
     q = [round(float(r["sim_q"]), 3) for r in fcst
          if isinstance(r.get("sim_q"), (int, float))][:horizon_h]
+    # injected: the truncated speed domain ran, so upstream flow was actually
+    # routed to this point (a real routed nowcast). has_upstream: at least one
+    # upstream USGS gauge exists at all — False means a headwater with nothing to
+    # route, which is nowcast-ineligible by design (still valid for hindcast).
+    injected = str(cache_model).endswith("-spd")
+    has_upstream = bool(injected or (n_upstream or 0) > 0)
     return {"ok": bool(fcst), "gid": str(gid), "t0": t0.strftime("%Y-%m-%d %H:%M"),
             "history": hist, "forecast": fcst, "q": q, "status": status,
-            "cache_model": cache_model, "lat": info["lat"], "lon": info["lon"],
+            "cache_model": cache_model, "injected": injected,
+            "has_upstream": has_upstream, "lat": info["lat"], "lon": info["lon"],
             "area_km2": info.get("area"),
             "reason": None if fcst else "no forecast rows (no upstream inflow?)"}
 

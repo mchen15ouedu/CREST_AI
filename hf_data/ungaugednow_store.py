@@ -30,7 +30,9 @@ from datetime import datetime, timedelta
 import numpy as np
 
 REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")
-LATEST_PATH = "nowcast/ungauged_latest.parquet"
+# One writer (a shard of the keep-warm fleet) publishes ungauged_latest<tag>.parquet;
+# the reader concatenates every shard file. tag="" for a single unsharded writer.
+LATEST_PREFIX = "nowcast/ungauged_latest"
 TTL_S = 240
 HORIZON_H = 12
 TS_FMT = "%Y-%m-%d %H:%M"
@@ -93,8 +95,10 @@ def build_table(records: list[dict], t0: datetime, horizon: int = HORIZON_H):
     return tbl.replace_schema_metadata(meta)
 
 
-def upload_latest(table, token: str | None = None) -> bool:
-    """Write `table` to nowcast/ungauged_latest.parquet in CREST_data."""
+def upload_latest(table, tag: str = "", token: str | None = None) -> bool:
+    """Write `table` to nowcast/ungauged_latest<tag>.parquet in CREST_data.
+    Each keep-warm shard passes its own tag (e.g. "__0of3") so shards don't
+    clobber each other; the reader concatenates them."""
     import io
 
     import pyarrow.parquet as pq
@@ -108,8 +112,8 @@ def upload_latest(table, token: str | None = None) -> bool:
     buf.seek(0)
     HfApi(token=token).create_commit(
         repo_id=REPO, repo_type="dataset",
-        operations=[CommitOperationAdd(LATEST_PATH, buf)],
-        commit_message=f"ungauged nowcast {table.schema.metadata.get(b't0', b'').decode()}")
+        operations=[CommitOperationAdd(f"{LATEST_PREFIX}{tag}.parquet", buf)],
+        commit_message=f"ungauged nowcast{tag} {table.schema.metadata.get(b't0', b'').decode()}")
     return True
 
 
@@ -121,15 +125,26 @@ _cache: dict = {"at": 0.0, "meta": None, "cols": None}
 
 
 def _load():
+    import pyarrow as pa
     import pyarrow.parquet as pq
-    from huggingface_hub import hf_hub_download
-    p = hf_hub_download(REPO, LATEST_PATH, repo_type="dataset",
-                        token=os.environ.get("HF_TOKEN"))
-    t = pq.read_table(p)
-    meta = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()
-            if not k.startswith(b"ARROW")}
-    cols = {name: t.column(name).to_numpy(zero_copy_only=False)
-            for name in t.schema.names}
+    from huggingface_hub import HfApi, hf_hub_download
+    token = os.environ.get("HF_TOKEN")
+    files = sorted(f for f in HfApi(token=token).list_repo_files(REPO, repo_type="dataset")
+                   if f.startswith(LATEST_PREFIX) and f.endswith(".parquet"))
+    if not files:
+        raise FileNotFoundError("no ungauged nowcast parquet yet")
+    tables, meta = [], {}
+    for f in files:
+        p = hf_hub_download(REPO, f, repo_type="dataset", token=token)
+        t = pq.read_table(p)
+        tables.append(t)
+        m = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()
+             if not k.startswith(b"ARROW")}
+        if not meta or m.get("generated", "") > meta.get("generated", ""):
+            meta = m                         # report the freshest shard's issue time
+    big = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+    cols = {name: big.column(name).to_numpy(zero_copy_only=False)
+            for name in big.schema.names}
     return meta, cols
 
 

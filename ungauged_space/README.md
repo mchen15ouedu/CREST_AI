@@ -10,9 +10,15 @@ pinned: false
 
 # CREST_ungauged — keep-warm Space
 
-Advances the routed nowcast for all **2,676 ungauged HydroBASINS points** every
-hour and publishes one parquet the dashboard serves instantly
-(`nowcast/ungauged_latest.parquet` in `vincewin/CREST_data`).
+Advances the routed nowcast for the **ungauged HydroBASINS points that have an
+upstream USGS gauge to route from** every hour and publishes a parquet the
+dashboard serves instantly (`nowcast/ungauged_latest<shard>.parquet` in
+`vincewin/CREST_data`).
+
+Headwater points with **no upstream gauge** can't be served by the
+routed-injection design, so they're detected on first run, recorded in
+`nowcast/ungauged_no_upstream<shard>.json`, and skipped thereafter — they remain
+available on the **hindcast** side (served on demand, not here).
 
 Each point is advanced by **one new hour from a warm state** (never a cold
 17-day run): `hf_data.routednow.compute` runs a cached hindcast to `t0` (saving

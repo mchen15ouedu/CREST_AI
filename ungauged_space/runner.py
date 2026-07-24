@@ -46,6 +46,7 @@ from datetime import datetime, timezone
 SRC = "/app/src"
 CACHE = "/tmp/crest_cache"
 LOG = "/tmp/ungauged.log"
+REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")   # nowcast parquet + no-upstream list
 CONUS = (-125.5, 24.0, -66.5, 50.0)          # (w, s, e, n)
 started = time.time()
 state = {"phase": "booting", "passes": 0, "t0": None, "ok": 0, "fail": 0,
@@ -120,8 +121,12 @@ def run_one(vp: str, t0_iso: str, force_upload: bool = False) -> dict:
 
     model = r.get("cache_model") or model
     key = f"{str(vp).zfill(8)}_{model}" if model else None
+    injected = bool(r.get("injected"))          # truncated speed domain -> real routed nowcast
+    has_upstream = bool(r.get("has_upstream"))  # any upstream USGS gauge exists at all
     after = _checkpoints(vp, model) if model else set()
-    new_ckpt = bool(after - before) or force_upload      # 10-day event, or (re)bootstrap
+    # only persist checkpoints for injected (nowcast-relevant) runs; a transient
+    # full-basin hour warm-starts from local disk and needs no fleet copy
+    new_ckpt = injected and (bool(after - before) or force_upload)
     uploaded = False
     if new_ckpt and model and os.environ.get("HF_TOKEN"):
         try:
@@ -130,6 +135,7 @@ def run_one(vp: str, t0_iso: str, force_upload: bool = False) -> dict:
             _safe_note(vp, f"fleet upload failed: {type(e).__name__}: {e}")
 
     return {"vp": vp, "ok": True, "uploaded": uploaded, "key": key,
+            "injected": injected, "has_upstream": has_upstream,
             "lat": r.get("lat"), "lon": r.get("lon"), "area_km2": r.get("area_km2"),
             "q": r.get("q"), "history": r.get("history")}
 
@@ -186,6 +192,7 @@ def _all_points() -> list[dict]:
     if shard:
         k, nn = map(int, shard.split("/"))
         pts = [p for i, p in enumerate(pts) if i % nn == k]
+    pts = [p for p in pts if p["id"] not in _ineligible]   # skip known headwaters
     lim = int(os.environ.get("UNGAUGED_LIMIT", "0") or 0)
     return pts[:lim] if lim else pts
 
@@ -208,6 +215,48 @@ def _seed_uploaded_keys():
         _log(f"seeded {len(_uploaded_keys)} existing ungauged checkpoints from CREST_fleet")
     except Exception as e:
         _log(f"could not seed fleet keys: {type(e).__name__}: {e}")
+
+
+_ineligible: set = set()             # ungauged ids with NO upstream gauge (headwaters)
+
+
+def _shard_tag() -> str:
+    sh = os.environ.get("UNGAUGED_SHARD", "")
+    return ("__" + sh.replace("/", "of")) if sh else ""    # "0/3" -> "__0of3"
+
+
+def _no_upstream_path() -> str:
+    return f"nowcast/ungauged_no_upstream{_shard_tag()}.json"
+
+
+def _seed_ineligible():
+    """Load this shard's known headwater (no-upstream) ids from CREST_data so
+    they're skipped from the start — the routed-injection design can't serve
+    them, so they're nowcast-ineligible (they remain valid on the hindcast
+    side, which is served on demand, not here)."""
+    try:
+        import json
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(REPO, _no_upstream_path(), repo_type="dataset",
+                            token=os.environ.get("HF_TOKEN"))
+        _ineligible.update(json.load(open(p)))
+        _log(f"seeded {len(_ineligible)} nowcast-ineligible (no-upstream) points")
+    except Exception:
+        _log("no prior no-upstream list (first run)")
+
+
+def _save_ineligible():
+    try:
+        import io
+        import json
+        from huggingface_hub import CommitOperationAdd, HfApi
+        buf = io.BytesIO(json.dumps(sorted(_ineligible)).encode())
+        HfApi(token=os.environ["HF_TOKEN"]).create_commit(
+            repo_id=REPO, repo_type="dataset",
+            operations=[CommitOperationAdd(_no_upstream_path(), buf)],
+            commit_message=f"no-upstream list {_shard_tag() or 'all'} ({len(_ineligible)})")
+    except Exception as e:
+        _log(f"could not save no-upstream list: {type(e).__name__}: {e}")
 
 
 def _keys_for(vp, lon):
@@ -239,7 +288,7 @@ def run_pass(t0):
     _log(f"pass {state['passes'] + 1}: {len(pts)} points @ t0={t0} "
          f"| {workers} workers | {len(_uploaded_keys)} checkpoints already in fleet")
     t_start = time.time()
-    rows, ok, fail, up = [], 0, 0, 0
+    rows, ok, fail, up, new_headwater = [], 0, 0, 0, 0
     t0_iso = t0.isoformat()
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futs = {}
@@ -258,24 +307,34 @@ def run_pass(t0):
                     up += 1
                     if r.get("key"):
                         _uploaded_keys.add(r["key"])
-                rows.append(r)
+                if r.get("injected"):
+                    rows.append(r)                  # nowcast parquet: routed points only
+                if not r.get("has_upstream") and r["vp"] not in _ineligible:
+                    _ineligible.add(r["vp"])         # headwater: drop from nowcast for good
+                    new_headwater += 1
             else:
                 fail += 1
             if i % 200 == 0:
-                _log(f"  {i}/{len(pts)} done ({ok} ok, {fail} fail, {up} uploaded)")
+                _log(f"  {i}/{len(pts)} done ({ok} ok, {fail} fail, {up} up, "
+                     f"{len(rows)} routed, {new_headwater} new headwater)")
 
     if rows:
         try:
             tbl = ungaugednow_store.build_table(rows, t0)
-            ungaugednow_store.upload_latest(tbl)
-            _log(f"  uploaded ungauged_latest.parquet ({len(rows)} points)")
+            ungaugednow_store.upload_latest(tbl, tag=_shard_tag())
+            _log(f"  uploaded ungauged_latest{_shard_tag()}.parquet ({len(rows)} routed points)")
         except Exception as e:
             _log(f"  PARQUET UPLOAD FAILED: {type(e).__name__}: {e}")
+    if new_headwater:
+        _save_ineligible()
+        _log(f"  {new_headwater} new headwater points -> no-upstream list "
+             f"({len(_ineligible)} total, skipped next pass)")
 
     mins = (time.time() - t_start) / 60
     state.update(passes=state["passes"] + 1, ok=ok, fail=fail, uploaded=up,
                  last_min=round(mins, 1), t0=t0.strftime("%Y-%m-%d %H:%M"))
-    _log(f"pass done: {ok} ok, {fail} fail, {up} checkpoints uploaded, {mins:.1f} min")
+    _log(f"pass done: {ok} ok, {fail} fail, {up} checkpoints, {len(rows)} routed nowcasts, "
+         f"{len(_ineligible)} headwaters skipped, {mins:.1f} min")
 
 
 def warm_loop():
@@ -291,6 +350,7 @@ def warm_loop():
     import sys
     sys.path.insert(0, SRC)
     _seed_uploaded_keys()                       # so we don't re-upload what's already there
+    _seed_ineligible()                          # skip known headwaters from the start
     last_t0 = None
     while True:
         try:
