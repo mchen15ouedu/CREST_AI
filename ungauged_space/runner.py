@@ -1,0 +1,297 @@
+"""CREST_ungauged — keep-warm Space for the 2,676 ungauged routed nowcasts.
+
+Every hour, for each HydroBASINS ungauged point, this advances the routed
+nowcast by ONE new hour from a warm state (never a cold 17-day run) and writes
+the whole set to one parquet the dashboard serves instantly:
+
+  per point  ->  hf_data.routednow.compute(vp, t0)
+                    Phase A: cached hindcast to t0 (advances + saves state)
+                    Phase B: 12-h forecast warm-started from the t0 state
+  all points ->  ungaugednow_store.build_table + upload_latest
+                    -> nowcast/ungauged_latest.parquet in CREST_data
+
+State bookkeeping (matches the gauge fleet exactly, so the two coexist in one
+long-term store):
+  * on cold boot each point refetches its last 10-day checkpoint from
+    CREST_fleet (routednow.compute -> fleetstore.ensure_local), so a Space
+    restart short-warms instead of cold-starting;
+  * routednow.compute -> statecache.prune_states keeps the newest state (next
+    hour's warm start) + one checkpoint per 10 days locally, deletes the rest;
+  * when a NEW 10-day checkpoint is minted, this uploads the point's state
+    bundle + record to vincewin/CREST_fleet as states/<key>.pqf +
+    results/<key>.json (key "V..._crestphys-spd") — right beside the gauge keys.
+
+t0 is the issue time of the current gauged DI-LSTM nowcast (nowcaststore), so
+the upstream cut-gauge injection has nowcast values to route downstream. A pass
+runs only once per issue time.
+
+Space variables (Settings -> Variables):
+  UNGAUGED_WORKERS   parallel points (default 8 — sized for cpu-upgrade)
+  UNGAUGED_SHARD     "K/N": run only points with catalog-index %% N == K, so N
+                     sibling Spaces split the 2,676 disjointly
+  UNGAUGED_LIMIT     cap points (0 = all) — for smoke tests
+Secret: HF_TOKEN (write access — uploads to CREST_data and CREST_fleet).
+"""
+import http.server
+import json
+import os
+import shutil
+import threading
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+SRC = "/app/src"
+CACHE = "/tmp/crest_cache"
+LOG = "/tmp/ungauged.log"
+CONUS = (-125.5, 24.0, -66.5, 50.0)          # (w, s, e, n)
+started = time.time()
+state = {"phase": "booting", "passes": 0, "t0": None, "ok": 0, "fail": 0,
+         "uploaded": 0, "last_min": 0.0}
+
+PEERS = [u.strip() for u in os.environ.get("UNGAUGED_PEERS", "").split(",") if u.strip()]
+SELF_HOST = (os.environ.get("SPACE_ID", "").replace("/", "-").replace("_", "-")
+             .lower() + ".hf.space")
+
+
+def _log(msg: str):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())} {msg}"
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+    print(line, flush=True)
+
+
+def keepalive_loop():
+    while True:
+        for u in PEERS:
+            if urllib.parse.urlparse(u).hostname == SELF_HOST:
+                continue
+            try:
+                urllib.request.urlopen(u, timeout=20).read(100)
+            except Exception:
+                pass
+        time.sleep(1200)
+
+
+def sh(cmd):
+    import subprocess
+    subprocess.run(cmd, shell=True, check=True)
+
+
+def boot_sources():
+    shutil.rmtree(SRC, ignore_errors=True)
+    sh(f"git clone --depth 1 https://github.com/mchen15ouedu/CREST_AI.git {SRC}")
+    if not os.path.exists(os.path.join(SRC, "EF5")):
+        os.symlink("/EF5", os.path.join(SRC, "EF5"))
+
+
+# --------------------------------------------------------------------------- #
+# per-point work (child process)
+# --------------------------------------------------------------------------- #
+def _checkpoints(vp, model) -> set:
+    """Non-head state times = the 10-day checkpoints (all but the newest)."""
+    from hf_data import statecache
+    rec = statecache.load_record(vp, model) or {}
+    st = sorted(rec.get("state_times", []))
+    return set(st[:-1])                        # drop the newest (warm-start head)
+
+
+def run_one(vp: str, t0_iso: str) -> dict:
+    """Advance one ungauged point and, when a new checkpoint appears, persist it
+    to CREST_fleet. Returns the compact row for the nowcast parquet."""
+    from hf_data import routednow
+    t0 = datetime.fromisoformat(t0_iso)
+    model = None
+    try:
+        from hf_data import virtualpoints
+        info = virtualpoints.info(vp)
+        model = routednow._cache_model(info["lon"]) if info else None
+    except Exception:
+        info = None
+
+    before = _checkpoints(vp, model) if model else set()
+    had_fleet = False
+    if model:
+        try:
+            from hf_data import fleetstore
+            had_fleet = fleetstore.ensure_local(vp, model) is not None
+        except Exception:
+            pass
+
+    r = routednow.compute(vp, t0)              # ensure_local (again, cached) + both phases + prune
+    if not r.get("ok"):
+        return {"vp": vp, "ok": False, "reason": r.get("reason")}
+
+    model = r.get("cache_model") or model
+    after = _checkpoints(vp, model) if model else set()
+    new_ckpt = bool(after - before) or not had_fleet     # 10-day event, or bootstrap
+    uploaded = False
+    if new_ckpt and model and os.environ.get("HF_TOKEN"):
+        try:
+            uploaded = _upload_fleet(vp, model)
+        except Exception as e:
+            _safe_note(vp, f"fleet upload failed: {type(e).__name__}: {e}")
+
+    return {"vp": vp, "ok": True, "uploaded": uploaded,
+            "lat": r.get("lat"), "lon": r.get("lon"), "area_km2": r.get("area_km2"),
+            "q": r.get("q"), "history": r.get("history")}
+
+
+def _upload_fleet(vp, model) -> bool:
+    """Pack the (pruned) state dir + record and commit to CREST_fleet, keeping
+    the local copies for next hour's warm start."""
+    from hf_data import statebundle, statecache, fleetstore
+    from huggingface_hub import CommitOperationAdd, HfApi
+    key = f"{str(vp).zfill(8)}_{model}"
+    sdir = statecache.state_dir(vp, model)
+    blob = statebundle.pack_dir(sdir)
+    if blob is None:
+        return False
+    rec_path = statecache.results_path(vp, model)
+    ops = [CommitOperationAdd(f"states/{key}.pqf", blob)]
+    if os.path.exists(rec_path):
+        ops.append(CommitOperationAdd(f"results/{key}.json", rec_path))
+    HfApi(token=os.environ["HF_TOKEN"]).create_commit(
+        repo_id=fleetstore.REPO, repo_type="dataset", operations=ops,
+        commit_message=f"ungauged checkpoint {key}")
+    return True
+
+
+def _safe_note(vp, msg):
+    try:
+        _log(f"  [{vp}] {msg}")
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# hourly pass (parent)
+# --------------------------------------------------------------------------- #
+def _all_points() -> list[str]:
+    from hf_data import virtualpoints
+    w, s, e, n = CONUS
+    pts = virtualpoints.for_bbox(w, s, e, n, limit=100000)
+    ids = [p["id"] for p in pts]
+    shard = os.environ.get("UNGAUGED_SHARD", "")
+    if shard:
+        k, nn = map(int, shard.split("/"))
+        ids = [g for i, g in enumerate(ids) if i % nn == k]
+    lim = int(os.environ.get("UNGAUGED_LIMIT", "0") or 0)
+    return ids[:lim] if lim else ids
+
+
+def _current_t0():
+    """Issue time of the gauged nowcast (so upstream injection has predictions),
+    or the current hour if the gauged store isn't reachable."""
+    from hf_data import nowcaststore
+    t0 = nowcaststore.issue_t0()
+    if t0 is None:
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        return now.replace(tzinfo=None)
+    return t0.replace(tzinfo=None) if t0.tzinfo else t0
+
+
+def run_pass(t0):
+    from hf_data import ungaugednow_store
+    ids = _all_points()
+    workers = int(os.environ.get("UNGAUGED_WORKERS", "8"))
+    _log(f"pass {state['passes'] + 1}: {len(ids)} points @ t0={t0} "
+         f"| {workers} workers")
+    t_start = time.time()
+    rows, ok, fail, up = [], 0, 0, 0
+    t0_iso = t0.isoformat()
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(run_one, g, t0_iso): g for g in ids}
+        for i, fu in enumerate(as_completed(futs), 1):
+            try:
+                r = fu.result()
+            except Exception as e:
+                r = {"vp": futs[fu], "ok": False, "reason": f"{type(e).__name__}: {e}"}
+            if r.get("ok"):
+                ok += 1
+                up += 1 if r.get("uploaded") else 0
+                rows.append(r)
+            else:
+                fail += 1
+            if i % 200 == 0:
+                _log(f"  {i}/{len(ids)} done ({ok} ok, {fail} fail, {up} uploaded)")
+
+    if rows:
+        try:
+            tbl = ungaugednow_store.build_table(rows, t0)
+            ungaugednow_store.upload_latest(tbl)
+            _log(f"  uploaded ungauged_latest.parquet ({len(rows)} points)")
+        except Exception as e:
+            _log(f"  PARQUET UPLOAD FAILED: {type(e).__name__}: {e}")
+
+    mins = (time.time() - t_start) / 60
+    state.update(passes=state["passes"] + 1, ok=ok, fail=fail, uploaded=up,
+                 last_min=round(mins, 1), t0=t0.strftime("%Y-%m-%d %H:%M"))
+    _log(f"pass done: {ok} ok, {fail} fail, {up} checkpoints uploaded, {mins:.1f} min")
+
+
+def warm_loop():
+    if not os.environ.get("HF_TOKEN"):
+        state["phase"] = "NO HF_TOKEN — add the secret in Space settings"
+        _log(state["phase"])
+        return
+    os.environ.update(CREST_DEMO_MOCK="0", CREST_CACHE_DIR=CACHE,
+                      HF_HOME=os.path.join(CACHE, "hub"),
+                      GDAL_HTTP_MAX_RETRY="5", GDAL_HTTP_RETRY_DELAY="2",
+                      PYTHONUNBUFFERED="1")
+    os.chdir(SRC)                              # EF5 runs relative to ./EF5/bin/ef5
+    import sys
+    sys.path.insert(0, SRC)
+    last_t0 = None
+    while True:
+        try:
+            t0 = _current_t0()
+            if t0 == last_t0:
+                state["phase"] = f"idle — waiting for a new issue time (last {t0})"
+                time.sleep(300)
+                continue
+            state["phase"] = "running"
+            run_pass(t0)
+            last_t0 = t0
+        except Exception as e:
+            _log(f"PASS ERROR: {type(e).__name__}: {e}")
+            time.sleep(120)
+        state["phase"] = "sleeping until next issue time"
+        time.sleep(300)
+
+
+# --------------------------------------------------------------------------- #
+# status page
+# --------------------------------------------------------------------------- #
+class Status(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            with open(LOG) as f:
+                tail = f.readlines()[-60:]
+        except OSError:
+            tail = ["(no log yet)\n"]
+        du = shutil.disk_usage("/tmp")
+        body = (f"CREST_ungauged (keep-warm) — {state['phase']}\n"
+                f"up {(time.time() - started) / 3600:.1f} h | pass {state['passes']} "
+                f"@ t0={state['t0']} | {state['ok']} ok, {state['fail']} fail, "
+                f"{state['uploaded']} checkpoints | last pass {state['last_min']} min | "
+                f"disk /tmp {du.used / 1e9:.0f}/{du.total / 1e9:.0f} GB\n"
+                + "=" * 72 + "\n" + "".join(tail))
+        data = body.encode("utf-8", "replace")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *a):
+        pass
+
+
+if __name__ == "__main__":
+    boot_sources()
+    threading.Thread(target=warm_loop, daemon=True).start()
+    threading.Thread(target=keepalive_loop, daemon=True).start()
+    http.server.ThreadingHTTPServer(("0.0.0.0", 7860), Status).serve_forever()

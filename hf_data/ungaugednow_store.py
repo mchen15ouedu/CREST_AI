@@ -1,0 +1,220 @@
+"""Precomputed ungauged routed nowcasts — the ungauged analog of nowcaststore.
+
+The keep-warm Space (ungauged_space/runner.py) advances all 2,676 ungauged
+HydroBASINS points every hour with hf_data.routednow.compute and writes the
+result set to nowcast/ungauged_latest.parquet in vincewin/CREST_data:
+
+  vp                str    ungauged point id ("V" + HYRIV_ID)
+  lat, lon          f32
+  area_km2          f32
+  q1..qH            f32    routed forecast at t0+1h .. t0+H (H = HORIZON_H)
+  hist              str    JSON [[ "YYYY-MM-DD HH:MM", q ], ...] — the ~7-day
+                           routed history (observed upstream inflow, no future)
+
+Schema metadata carries the issue time t0 and generation timestamp. Unlike the
+gauged DI-LSTM nowcast (a millisecond forward pass), each ungauged point needs
+an EF5 run, so it is NOT computed on demand — the app reads this file and serves
+every ungauged nowcast instantly, exactly as nowcaststore serves the gauged one.
+
+WRITE side (keep-warm Space): build_table() + upload_latest().
+READ side (dashboard): for_bbox() / by_ids() / series(), TTL-cached.
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from datetime import datetime, timedelta
+
+import numpy as np
+
+REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")
+LATEST_PATH = "nowcast/ungauged_latest.parquet"
+TTL_S = 240
+HORIZON_H = 12
+TS_FMT = "%Y-%m-%d %H:%M"
+META_T0_FMT = "%Y-%m-%d %H:%M UTC"
+
+
+# --------------------------------------------------------------------------- #
+# WRITE side — called by the keep-warm Space
+# --------------------------------------------------------------------------- #
+def _qcols(horizon: int = HORIZON_H) -> list[str]:
+    return [f"q{k}" for k in range(1, horizon + 1)]
+
+
+def build_table(records: list[dict], t0: datetime, horizon: int = HORIZON_H):
+    """Assemble the pyarrow table from routednow.compute() results.
+
+    Each record: {"gid"/"vp", "lat", "lon", "area_km2", "q": [..], "history":
+    [rows]} where a history row has "time" and "sim_q". Points with no forecast
+    are skipped. Returns a pyarrow.Table with t0/generated schema metadata."""
+    import pyarrow as pa
+
+    qcols = _qcols(horizon)
+    vp, lat, lon, area = [], [], [], []
+    qarr = {c: [] for c in qcols}
+    hist = []
+    for r in records:
+        if not r or not r.get("q"):
+            continue
+        vp.append(str(r.get("gid") or r.get("vp")))
+        lat.append(float(r.get("lat", np.nan)))
+        lon.append(float(r.get("lon", np.nan)))
+        area.append(float(r.get("area_km2") or np.nan))
+        q = list(r.get("q") or [])
+        for k, c in enumerate(qcols):
+            qarr[c].append(float(q[k]) if k < len(q) and q[k] is not None else np.nan)
+        rows = r.get("history") or []
+        hist.append(json.dumps([[row["time"], round(float(row["sim_q"]), 3)]
+                                for row in rows
+                                if row.get("sim_q") is not None
+                                and isinstance(row.get("sim_q"), (int, float))],
+                               separators=(",", ":")))
+
+    arrays = {
+        "vp": pa.array(vp, pa.string()),
+        "lat": pa.array(lat, pa.float32()),
+        "lon": pa.array(lon, pa.float32()),
+        "area_km2": pa.array(area, pa.float32()),
+    }
+    for c in qcols:
+        arrays[c] = pa.array(qarr[c], pa.float32())
+    arrays["hist"] = pa.array(hist, pa.string())
+
+    tbl = pa.table(arrays)
+    meta = {
+        "t0": t0.strftime(META_T0_FMT),
+        "generated": datetime.utcnow().strftime(META_T0_FMT),
+        "horizon": str(horizon),
+        "n_points": str(len(vp)),
+    }
+    return tbl.replace_schema_metadata(meta)
+
+
+def upload_latest(table, token: str | None = None) -> bool:
+    """Write `table` to nowcast/ungauged_latest.parquet in CREST_data."""
+    import io
+
+    import pyarrow.parquet as pq
+    from huggingface_hub import CommitOperationAdd, HfApi
+
+    token = token or os.environ.get("HF_TOKEN")
+    if not token:
+        return False
+    buf = io.BytesIO()
+    pq.write_table(table, buf, compression="zstd")
+    buf.seek(0)
+    HfApi(token=token).create_commit(
+        repo_id=REPO, repo_type="dataset",
+        operations=[CommitOperationAdd(LATEST_PATH, buf)],
+        commit_message=f"ungauged nowcast {table.schema.metadata.get(b't0', b'').decode()}")
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# READ side — served by the dashboard
+# --------------------------------------------------------------------------- #
+_lock = threading.Lock()
+_cache: dict = {"at": 0.0, "meta": None, "cols": None}
+
+
+def _load():
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    p = hf_hub_download(REPO, LATEST_PATH, repo_type="dataset",
+                        token=os.environ.get("HF_TOKEN"))
+    t = pq.read_table(p)
+    meta = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()
+            if not k.startswith(b"ARROW")}
+    cols = {name: t.column(name).to_numpy(zero_copy_only=False)
+            for name in t.schema.names}
+    return meta, cols
+
+
+def _fresh():
+    now = time.time()
+    with _lock:
+        if _cache["cols"] is not None and now - _cache["at"] < TTL_S:
+            return _cache["meta"], _cache["cols"]
+    try:
+        meta, cols = _load()
+        with _lock:
+            _cache.update(at=now, meta=meta, cols=cols)
+        return meta, cols
+    except Exception:
+        with _lock:                       # serve stale rather than nothing
+            return _cache["meta"], _cache["cols"]
+
+
+def _qkeys(cols) -> list[str]:
+    return sorted((n for n in cols if n and n[0] == "q" and n[1:].isdigit()),
+                  key=lambda n: int(n[1:]))
+
+
+def issue_t0() -> datetime | None:
+    meta, cols = _fresh()
+    if cols is None:
+        return None
+    try:
+        return datetime.strptime(meta.get("t0", ""), META_T0_FMT)
+    except ValueError:
+        return None
+
+
+def _pack(cols, i, qk, t0):
+    """One ungauged point: id/lat/lon/area, forecast q[] with times, history."""
+    q = [round(float(cols[n][i]), 3) for n in qk]
+    fcst = ([[(t0 + timedelta(hours=k + 1)).strftime(TS_FMT), q[k]]
+             for k in range(len(q)) if np.isfinite(q[k])] if t0 else [])
+    try:
+        hist = json.loads(cols["hist"][i]) if "hist" in cols else []
+    except Exception:
+        hist = []
+    return {"id": str(cols["vp"][i]),
+            "lat": round(float(cols["lat"][i]), 5),
+            "lon": round(float(cols["lon"][i]), 5),
+            "area_km2": round(float(cols["area_km2"][i]), 1),
+            "q": q, "forecast": fcst, "history": hist, "virtual": True}
+
+
+def _select(cols, idx, t0):
+    qk = _qkeys(cols)
+    return [_pack(cols, int(i), qk, t0) for i in idx]
+
+
+def for_bbox(w: float, s: float, e: float, n: float, limit: int = 200) -> dict:
+    """Every ungauged nowcast inside the bbox (largest basins first)."""
+    meta, cols = _fresh()
+    if cols is None:
+        return {"ok": False, "reason": "no precomputed ungauged nowcast yet"}
+    m = ((cols["lon"] >= w) & (cols["lon"] <= e)
+         & (cols["lat"] >= s) & (cols["lat"] <= n))
+    idx = np.nonzero(m)[0]
+    total = int(len(idx))
+    idx = idx[np.argsort(-cols["area_km2"][idx])][:max(1, limit)]
+    t0 = issue_t0()
+    return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
+            "n_in_view": total, "truncated": total > len(idx),
+            "points": _select(cols, idx, t0)}
+
+
+def by_ids(ids) -> dict:
+    """Nowcasts for exactly these ungauged ids (comma string or list)."""
+    meta, cols = _fresh()
+    if cols is None:
+        return {"ok": False, "reason": "no precomputed ungauged nowcast yet"}
+    want = ([s.strip() for s in ids.split(",") if s.strip()]
+            if isinstance(ids, str) else [str(i) for i in ids])
+    idx = np.nonzero(np.isin(cols["vp"], want))[0]
+    t0 = issue_t0()
+    return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
+            "points": _select(cols, idx, t0)}
+
+
+def series(vp: str) -> dict | None:
+    """A single ungauged point's nowcast, or None if absent."""
+    r = by_ids([str(vp)])
+    pts = r.get("points") or []
+    return pts[0] if pts else None

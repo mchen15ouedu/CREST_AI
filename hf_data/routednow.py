@@ -55,6 +55,20 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
 
     status: list[str] = []
 
+    # Cold-boot warm-start: the app's pipeline skips the fleet fetch for virtual
+    # points (it serves them from the parquet store, not EF5), so pull our own
+    # last checkpoint from CREST_fleet HERE. On a warm container the state is
+    # already on local disk and this is a cheap no-op; after a Space restart it
+    # refetches the newest 10-day checkpoint so Phase A short-warms instead of
+    # doing a full 3-month cold start.
+    cache_model = _cache_model(info["lon"])
+    try:
+        from hf_data import fleetstore
+        if fleetstore.ensure_local(gid, cache_model) == "fetched":
+            status.append("[boot] 🚚 fetched last checkpoint from CREST_fleet")
+    except Exception:
+        pass
+
     def _drain(gen, tag) -> list[dict]:
         rows: list[dict] = []
         for kind, ev in gen:
@@ -76,7 +90,7 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
 
     # retention: keep newest + 10-day checkpoints, delete intermediate hourly states
     try:
-        statecache.prune_states(gid, _cache_model(info["lon"]))
+        statecache.prune_states(gid, cache_model)
     except Exception:
         pass
 
@@ -84,6 +98,8 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
          if isinstance(r.get("sim_q"), (int, float))][:horizon_h]
     return {"ok": bool(fcst), "gid": str(gid), "t0": t0.strftime("%Y-%m-%d %H:%M"),
             "history": hist, "forecast": fcst, "q": q, "status": status,
+            "cache_model": cache_model, "lat": info["lat"], "lon": info["lon"],
+            "area_km2": info.get("area"),
             "reason": None if fcst else "no forecast rows (no upstream inflow?)"}
 
 
