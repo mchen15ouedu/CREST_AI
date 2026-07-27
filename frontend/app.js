@@ -26,6 +26,32 @@ window.addEventListener("unhandledrejection", (e) =>
       ((e.reason && (e.reason.message || e.reason)) || "?"),
     "", 0, e.reason && e.reason.stack));
 
+// ---- safe storage ------------------------------------------------------
+// localStorage throws SecurityError when storage is partitioned/blocked (e.g.
+// the Space embedded in an iframe, or third-party storage disabled). Touching
+// it unguarded at load halts the whole script. Wrap it so a blocked store
+// degrades to an in-memory fallback instead of breaking the app. (client:js
+// crashlog 2026-07-25: "Access is denied for this document." at app.js:86)
+const safeStore = (() => {
+  let ls = null;
+  try { ls = window.localStorage; ls.getItem("__probe__"); } catch (e) { ls = null; }
+  const mem = {};
+  return {
+    getItem(k) {
+      try { return ls ? ls.getItem(k) : (k in mem ? mem[k] : null); }
+      catch (e) { return k in mem ? mem[k] : null; }
+    },
+    setItem(k, v) {
+      try { if (ls) ls.setItem(k, v); else mem[k] = String(v); }
+      catch (e) { mem[k] = String(v); }
+    },
+    removeItem(k) {
+      try { if (ls) ls.removeItem(k); else delete mem[k]; }
+      catch (e) { delete mem[k]; }
+    },
+  };
+})();
+
 // ---- map ---------------------------------------------------------------
 const esriImg = L.tileLayer(
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -83,7 +109,7 @@ let animIdx = 0;
 let animTimer = null;
 
 // AI info mode (default ON, persisted)
-let aiInfo = localStorage.getItem("aiInfo") !== "off";
+let aiInfo = safeStore.getItem("aiInfo") !== "off";
 
 // nowcast-mode state lives here (var: gaugeStyle runs before the nowcast block)
 var nowcastMode = false;
@@ -517,7 +543,7 @@ async function simulate() {
                              scheme: document.getElementById("run-scheme").value,
                              // a still-running previous job would hold the per-gauge
                              // lock — the server stops it so this run starts now
-                             prev_sim_id: localStorage.getItem("lastSimId") || null,
+                             prev_sim_id: safeStore.getItem("lastSimId") || null,
                              ...opt }),
     });
     d = await r.json();
@@ -528,7 +554,7 @@ async function simulate() {
     return;
   }
   if (d.warning) addMsg("⚠️ " + d.warning, "status");
-  localStorage.setItem("lastSimId", d.sim_id);   // reattach after closing the app
+  safeStore.setItem("lastSimId", d.sim_id);   // reattach after closing the app
   resetAnim();
   zoomedToOverlay = false;
   const tS = d.t_start || win.tStart, tE = d.t_end || win.tEnd;   // server may clamp
@@ -1088,7 +1114,7 @@ function _hydroMarker(t) {
 // ---- hydrograph time zone: gauge-local by default, UTC on toggle ----------
 // Data timestamps stay UTC everywhere; only the plotted axis strings are
 // converted (Intl with the gauge's IANA zone — the browser handles DST).
-let hydroUTC = localStorage.getItem("crest_hydro_tz") === "utc";
+let hydroUTC = safeStore.getItem("crest_hydro_tz") === "utc";
 function curTz() {
   const g = gaugeData[panelGauge] || (nowcastRes && nowcastRes.gauges[panelGauge]);
   return (g && g.tz) || null;
@@ -1138,7 +1164,7 @@ function updateTzBtns() {
 }
 function setHydroTz(utc) {
   hydroUTC = utc;
-  localStorage.setItem("crest_hydro_tz", utc ? "utc" : "local");
+  safeStore.setItem("crest_hydro_tz", utc ? "utc" : "local");
   updateTzBtns();
   if (panelGauge) {
     if (nowcastPanelActive) renderNowcastHydro(panelGauge);
@@ -1779,7 +1805,7 @@ function restoreFromHistory(h) {
     simulate();
   } else {
     addMsg(`🔁 Reopening <b>${escapeHtml(h.label || h.gauge_ids.join(", "))}</b>…`, "status");
-    localStorage.setItem("lastSimId", h.sim_id);
+    safeStore.setItem("lastSimId", h.sim_id);
     reattach(h.sim_id);
   }
 }
@@ -1842,13 +1868,13 @@ window.addEventListener("pagehide", () => {
 // ---- display font size (everything except the top bar) ---------------------
 const FONT_MODES = [["", "🔠 A", "normal"], ["font-lg", "🔠 A+", "bigger"],
                     ["font-xl", "🔠 A++", "much bigger"]];
-let fontIdx = Math.max(0, FONT_MODES.findIndex(([c]) => c === (localStorage.getItem("fontSize") || "")));
+let fontIdx = Math.max(0, FONT_MODES.findIndex(([c]) => c === (safeStore.getItem("fontSize") || "")));
 function applyFont() {
   document.body.classList.remove("font-lg", "font-xl");
   const [cls, label] = FONT_MODES[fontIdx];
   if (cls) document.body.classList.add(cls);
   document.getElementById("font-btn").textContent = label;
-  localStorage.setItem("fontSize", cls);
+  safeStore.setItem("fontSize", cls);
 }
 document.getElementById("font-btn").onclick = () => {
   fontIdx = (fontIdx + 1) % FONT_MODES.length;
@@ -1864,7 +1890,7 @@ function renderAiBtn() {
 }
 aiBtn.onclick = () => {
   aiInfo = !aiInfo;
-  localStorage.setItem("aiInfo", aiInfo ? "on" : "off");
+  safeStore.setItem("aiInfo", aiInfo ? "on" : "off");
   renderAiBtn();
   addMsg(aiInfo
     ? "🤖 AI info ON — you'll see progress bars, plain-word stages and event background instead of raw logs."
@@ -1884,9 +1910,9 @@ document.getElementById("btn-sim").onclick = simulate;
 
 // run scheme (🏞 full / ⚡ speed) — persisted; changing it makes a new run differ
 const schemeSel = document.getElementById("run-scheme");
-schemeSel.value = localStorage.getItem("runScheme") || "full";
+schemeSel.value = safeStore.getItem("runScheme") || "full";
 schemeSel.onchange = () => {
-  localStorage.setItem("runScheme", schemeSel.value);
+  safeStore.setItem("runScheme", schemeSel.value);
   addMsg(schemeSel.value === "speed"
     ? "⚡ <b>Speed run</b> — the basin is cut at upstream USGS gauges and their observed " +
       "flow is injected as boundary conditions. Much faster on big rivers; needs " +
@@ -2119,13 +2145,13 @@ document.getElementById("fb-send").onclick = async () => {
 
 // ---- reattach: a run keeps going in the backend even if the app is closed --
 async function reattach(explicitId) {
-  const simId = explicitId || localStorage.getItem("lastSimId");
+  const simId = explicitId || safeStore.getItem("lastSimId");
   if (!simId) return;
   try {
     const r = await fetch(`/api/job/${simId}`);
-    if (!r.ok) { if (!explicitId) localStorage.removeItem("lastSimId"); return; }
+    if (!r.ok) { if (!explicitId) safeStore.removeItem("lastSimId"); return; }
     const j = await r.json();
-    if (!explicitId && j.done && j.age_s > 24 * 3600) { localStorage.removeItem("lastSimId"); return; }
+    if (!explicitId && j.done && j.age_s > 24 * 3600) { safeStore.removeItem("lastSimId"); return; }
     zoomedToOverlay = false;               // zoom to the 2-D layer on first frame
     const tS = j.t_start.slice(0, 19), tE = j.t_end.slice(0, 19);
     const H = windowHours(tS, tE);
