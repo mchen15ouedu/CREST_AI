@@ -24,6 +24,17 @@ jobs:
         # A timeout still triggers the wake; the Space auto-runs mrms_recent ~20 s after boot.
         run: curl -sk -m 60 https://vincewin-crest-updater.hf.space/ -o /dev/null || true
 
+      - name: Wake the worker Spaces (fleet runners + ungauged keep-warm)
+        # These otherwise rely only on their mutual keepalive ring, which
+        # deadlocks if a platform restart puts them all to sleep at once
+        # (Jul 29 - Aug 3 2026: all six slept for 6 days). An external ping
+        # from this cron breaks the deadlock; a GET wakes a sleeping Space.
+        run: |
+          for s in crest-fleet-runner crest-fleet-runner2 crest-fleet-runner3 \
+                   crest-ungauged crest-ungauged2 crest-ungauged3; do
+            curl -sk -m 60 "https://vincewin-${s}.hf.space/" -o /dev/null || true
+          done
+
       - name: Ensure a run is going
         # If the Space was already awake, no auto-run fires — trigger one explicitly.
         # 409 = a run is already in progress, which is fine.
