@@ -53,6 +53,18 @@ const safeStore = (() => {
 })();
 
 // ---- map ---------------------------------------------------------------
+// Both CDNs down/blocked -> L is still missing here. Show a banner instead of
+// dying on a raw ReferenceError with a blank page. (client:js crashlog
+// 2026-08-04: "L is not defined" at app.js:56 — unpkg unreachable for a user)
+if (typeof L === "undefined") {
+  reportClientError("Leaflet failed to load from both CDNs", "app.js", 0, "");
+  document.body.insertAdjacentHTML("beforeend",
+    '<div style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;' +
+    'justify-content:center;background:#111;color:#eee;font:16px sans-serif;text-align:center;padding:2em">' +
+    'The map library could not be loaded (CDN unreachable — a firewall or ad-blocker ' +
+    'may be blocking unpkg.com / jsdelivr.net).<br/>Please check your connection and reload.</div>');
+  throw new Error("Leaflet missing — app init aborted");
+}
 const esriImg = L.tileLayer(
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
   { attribution: "Imagery © Esri", maxZoom: 19 });

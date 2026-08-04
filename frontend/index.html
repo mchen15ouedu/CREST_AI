@@ -4,8 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>CREST-AI — agentic water intelligence</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <!-- onerror swaps to jsdelivr when unpkg is blocked (see JS fallbacks below) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css'" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"
+        onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/npm/leaflet-draw@1.0.4/dist/leaflet.draw.css'" />
   <link rel="stylesheet" href="/static/style.css?v=__V__" />
 </head>
 <body>
@@ -248,8 +251,14 @@
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- unpkg is blocked/flaky for some users (client:js crashlog 2026-08-04:
+       "L is not defined" at app.js:56) — fall back to jsdelivr before app.js runs.
+       document.write keeps the load synchronous so script order is preserved. -->
+  <script>window.L || document.write('<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"><\/script>');</script>
   <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script>(window.L && L.Draw) || document.write('<script src="https://cdn.jsdelivr.net/npm/leaflet-draw@1.0.4/dist/leaflet.draw.js"><\/script>');</script>
   <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+  <script>(window.L && L.heatLayer) || document.write('<script src="https://cdn.jsdelivr.net/npm/leaflet.heat@0.2.0/dist/leaflet-heat.js"><\/script>');</script>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <script src="/static/app.js?v=__V__"></script>
 </body>
