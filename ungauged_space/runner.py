@@ -99,10 +99,31 @@ def _checkpoints(vp, model) -> set:
     return set(st[:-1])                        # drop the newest (warm-start head)
 
 
+def _new_decade(before: set, after: set) -> bool:
+    """True only when a genuinely NEW 10-day checkpoint appeared — i.e. a time
+    ≥8 days past the newest previous checkpoint. The hourly head advance churns
+    the non-head set (yesterday's head appears, gets pruned…) and must NOT
+    trigger an upload: per-point commits at that rate blow HF's 256-commits/hr
+    account limit (which then 429-blocks the parquet publishes too)."""
+    added = after - before
+    if not added:
+        return False
+    if not before:
+        return True
+    try:
+        newest_prev = max(datetime.strptime(s, "%Y-%m-%d %H:%M") for s in before)
+        return any((datetime.strptime(s, "%Y-%m-%d %H:%M") - newest_prev)
+                   .total_seconds() >= 8 * 86400 for s in added)
+    except ValueError:
+        return bool(added)
+
+
 def run_one(vp: str, t0_iso: str, force_upload: bool = False) -> dict:
-    """Advance one ungauged point and, when a new checkpoint appears (or the
-    parent flags it as not-yet-in-fleet), persist it to CREST_fleet. Returns the
-    compact row for the nowcast parquet."""
+    """Advance one ungauged point. When a new 10-day checkpoint appears (or the
+    parent flags the point as not-yet-in-fleet), PACK the state bundle and
+    return it — the parent batches many points into ONE CREST_fleet commit
+    (per-point commits hit HF's hourly commit rate limit). Returns the compact
+    row for the nowcast parquet."""
     from hf_data import routednow
     t0 = datetime.fromisoformat(t0_iso)
     model = None
@@ -126,52 +147,65 @@ def run_one(vp: str, t0_iso: str, force_upload: bool = False) -> dict:
     after = _checkpoints(vp, model) if model else set()
     # only persist checkpoints for injected (nowcast-relevant) runs; a transient
     # full-basin hour warm-starts from local disk and needs no fleet copy
-    new_ckpt = injected and (bool(after - before) or force_upload)
-    uploaded = False
-    if new_ckpt and model and os.environ.get("HF_TOKEN"):
+    fleet = None
+    if injected and model and (force_upload or _new_decade(before, after)):
         try:
-            uploaded = _upload_fleet(vp, model)
+            fleet = _pack_fleet(vp, model)
         except Exception as e:
-            _safe_note(vp, f"fleet upload failed: {type(e).__name__}: {e}")
+            _safe_note(vp, f"fleet pack failed: {type(e).__name__}: {e}")
 
-    return {"vp": vp, "ok": True, "uploaded": uploaded, "key": key,
+    return {"vp": vp, "ok": True, "fleet": fleet, "key": key,
             "injected": injected, "has_upstream": has_upstream,
             "lat": r.get("lat"), "lon": r.get("lon"), "area_km2": r.get("area_km2"),
             "q": r.get("q"), "history": r.get("history")}
 
 
-def _upload_fleet(vp, model, attempts: int = 6) -> bool:
-    """Pack the (pruned) state dir + record and commit to CREST_fleet, keeping
-    the local copies for next hour's warm start.
-
-    Many workers commit to the same repo ref, so a racing commit loses the
-    parent-oid check (HTTP 412 / "reference update failed"). Retry with a
-    pid-jittered backoff so the burst serializes instead of dropping states."""
-    import random
-    import time as _t
-    from hf_data import statebundle, statecache, fleetstore
-    from huggingface_hub import CommitOperationAdd, HfApi
+def _pack_fleet(vp, model):
+    """Child process: pack the (pruned) state dir + record into bytes for the
+    parent's batched commit. Local copies stay for next hour's warm start."""
+    from hf_data import statebundle, statecache
     key = f"{str(vp).zfill(8)}_{model}"
     sdir = statecache.state_dir(vp, model)
     blob = statebundle.pack_dir(sdir)
     if blob is None:
-        return False
+        return None
     rec_path = statecache.results_path(vp, model)
-    ops = [CommitOperationAdd(f"states/{key}.pqf", blob)]
-    if os.path.exists(rec_path):
-        ops.append(CommitOperationAdd(f"results/{key}.json", rec_path))
-    api = HfApi(token=os.environ["HF_TOKEN"])
-    for i in range(attempts):
-        try:
-            api.create_commit(repo_id=fleetstore.REPO, repo_type="dataset",
-                              operations=ops,
-                              commit_message=f"ungauged checkpoint {key}")
-            return True
-        except Exception:
-            if i == attempts - 1:
-                raise
-            _t.sleep(min(30.0, 1.5 ** i + random.uniform(0, 1.5)))
-    return False
+    rec = open(rec_path, "rb").read() if os.path.exists(rec_path) else None
+    return {"key": key, "blob": blob, "rec": rec}
+
+
+_pending_fleet: list = []            # packed checkpoints awaiting the batched commit
+
+
+def _flush_fleet() -> int:
+    """ONE create_commit for every pending checkpoint (vs one commit per point,
+    which blows HF's 256 commits/hour account limit and 429-starves the parquet
+    publishes as collateral). On failure the batch stays queued for the next
+    flush — the ledger only records keys after a successful commit. Returns the
+    number of checkpoints committed."""
+    if not _pending_fleet or not os.environ.get("HF_TOKEN"):
+        return 0
+    from hf_data import fleetstore
+    from huggingface_hub import CommitOperationAdd, HfApi
+    import io
+    ops, keys = [], []
+    for f in _pending_fleet:
+        ops.append(CommitOperationAdd(f"states/{f['key']}.pqf", io.BytesIO(f["blob"])))
+        if f.get("rec"):
+            ops.append(CommitOperationAdd(f"results/{f['key']}.json", io.BytesIO(f["rec"])))
+        keys.append(f["key"])
+    try:
+        HfApi(token=os.environ["HF_TOKEN"]).create_commit(
+            repo_id=fleetstore.REPO, repo_type="dataset", operations=ops,
+            commit_message=f"ungauged checkpoints x{len(keys)} {_shard_tag() or ''}")
+    except Exception as e:
+        _log(f"  fleet batch commit failed ({len(keys)} ckpts, retrying next "
+             f"flush): {type(e).__name__}: {str(e)[:160]}")
+        del _pending_fleet[400:]         # bound RAM if failures persist
+        return 0
+    _uploaded_keys.update(keys)
+    _pending_fleet.clear()
+    return len(keys)
 
 
 def _safe_note(vp, msg):
@@ -358,10 +392,8 @@ def run_pass(t0):
                 r = {"vp": futs[fu], "ok": False, "reason": f"{type(e).__name__}: {e}"}
             if r.get("ok"):
                 ok += 1
-                if r.get("uploaded"):
-                    up += 1
-                    if r.get("key"):
-                        _uploaded_keys.add(r["key"])
+                if r.get("fleet"):
+                    _pending_fleet.append(r["fleet"])   # batched: 1 commit per flush
                 if r.get("injected"):
                     rows.append(r)                  # nowcast parquet: routed points only
                     _carry[str(r["vp"])] = {        # fresh entry supersedes carried one
@@ -376,8 +408,10 @@ def run_pass(t0):
             if i % 200 == 0:
                 _log(f"  {i}/{len(pts)} done ({ok} ok, {fail} fail, {up} up, "
                      f"{len(rows)} routed, {new_headwater} new headwater)")
-            if len(rows) - last_pub >= PUBLISH_EVERY:
+            if (len(rows) - last_pub >= PUBLISH_EVERY
+                    or sum(len(f["blob"]) for f in _pending_fleet) > 150e6):
                 _publish()
+                up += _flush_fleet()
                 last_pub = len(rows)
                 if new_headwater and new_headwater != last_hw_saved:
                     _save_ineligible()          # persist through mid-pass restarts
@@ -385,6 +419,7 @@ def run_pass(t0):
 
     if rows and len(rows) != last_pub:
         _publish()                                  # final publish for this pass
+    up += _flush_fleet()
     if new_headwater:
         _save_ineligible()
         _log(f"  {new_headwater} new headwater points -> no-upstream list "
