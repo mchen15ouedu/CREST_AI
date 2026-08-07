@@ -218,6 +218,36 @@ def _seed_uploaded_keys():
 
 
 _ineligible: set = set()             # ungauged ids with NO upstream gauge (headwaters)
+_carry: dict = {}                    # vp -> build_table-ready record incl. its own t0;
+CARRY_TTL_H = 26                     # the published parquet = all carry entries, so
+                                     # coverage never SHRINKS mid-pass (rows from the
+                                     # previous hour persist until recomputed/expired)
+
+
+def _seed_carry():
+    """Rebuild the carry ledger from this shard's last published parquet so a
+    container restart doesn't collapse the served coverage to zero."""
+    try:
+        import pyarrow.parquet as pq
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(REPO, f"nowcast/ungauged_latest{_shard_tag()}.parquet",
+                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
+        t = pq.read_table(p)
+        meta = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()}
+        default_t0 = meta.get("t0", "").replace(" UTC", "")
+        cols = {n: t.column(n).to_pylist() for n in t.schema.names}
+        qk = sorted((n for n in cols if n[0] == "q" and n[1:].isdigit()),
+                    key=lambda n: int(n[1:]))
+        for i, vp in enumerate(cols["vp"]):
+            _carry[str(vp)] = {
+                "vp": str(vp), "lat": cols["lat"][i], "lon": cols["lon"][i],
+                "area_km2": cols["area_km2"][i],
+                "q": [cols[n][i] for n in qk],
+                "hist_json": (cols["hist"][i] if "hist" in cols else "[]"),
+                "t0": (cols["t0"][i] if "t0" in cols else default_t0)}
+        _log(f"carried {len(_carry)} previously published rows")
+    except Exception:
+        _log("no previous shard parquet to carry (first publish)")
 
 
 def _shard_tag() -> str:
@@ -290,13 +320,26 @@ def run_pass(t0):
     t_start = time.time()
     rows, ok, fail, up, new_headwater = [], 0, 0, 0, 0
     t0_iso = t0.isoformat()
-    PUBLISH_EVERY = 250          # publish partial parquet during the pass so the
+    PUBLISH_EVERY = 100          # publish during the pass so the map fills progressively
+    t0_str = t0.strftime("%Y-%m-%d %H:%M")
 
-    def _publish():              # map populates progressively (esp. the ~7h first pass)
+    def _publish():
+        # publish the whole carry ledger (this pass's fresh rows + last pass's
+        # rows not yet recomputed, within TTL) — coverage never shrinks mid-pass
+        recs = []
+        for rec in _carry.values():
+            try:
+                age_h = (t0 - datetime.strptime(rec["t0"], "%Y-%m-%d %H:%M")
+                         ).total_seconds() / 3600.0
+            except (ValueError, TypeError, KeyError):
+                continue
+            if -1.0 <= age_h <= CARRY_TTL_H:
+                recs.append(rec)
         try:
             ungaugednow_store.upload_latest(
-                ungaugednow_store.build_table(rows, t0), tag=_shard_tag())
-            _log(f"  published ungauged_latest{_shard_tag()}.parquet ({len(rows)} routed)")
+                ungaugednow_store.build_table(recs, t0), tag=_shard_tag())
+            _log(f"  published ungauged_latest{_shard_tag()}.parquet "
+                 f"({len(rows)} fresh this pass, {len(recs)} total served)")
         except Exception as e:
             _log(f"  PARQUET UPLOAD FAILED: {type(e).__name__}: {e}")
 
@@ -307,6 +350,7 @@ def run_pass(t0):
             force = k_spd not in _uploaded_keys and k_base not in _uploaded_keys
             futs[pool.submit(run_one, p["id"], t0_iso, force)] = p["id"]
         last_pub = 0
+        last_hw_saved = 0
         for i, fu in enumerate(as_completed(futs), 1):
             try:
                 r = fu.result()
@@ -320,6 +364,10 @@ def run_pass(t0):
                         _uploaded_keys.add(r["key"])
                 if r.get("injected"):
                     rows.append(r)                  # nowcast parquet: routed points only
+                    _carry[str(r["vp"])] = {        # fresh entry supersedes carried one
+                        "vp": str(r["vp"]), "lat": r.get("lat"), "lon": r.get("lon"),
+                        "area_km2": r.get("area_km2"), "q": r.get("q"),
+                        "history": r.get("history"), "t0": t0_str}
                 if not r.get("has_upstream") and r["vp"] not in _ineligible:
                     _ineligible.add(r["vp"])         # headwater: drop from nowcast for good
                     new_headwater += 1
@@ -331,6 +379,9 @@ def run_pass(t0):
             if len(rows) - last_pub >= PUBLISH_EVERY:
                 _publish()
                 last_pub = len(rows)
+                if new_headwater and new_headwater != last_hw_saved:
+                    _save_ineligible()          # persist through mid-pass restarts
+                    last_hw_saved = new_headwater
 
     if rows and len(rows) != last_pub:
         _publish()                                  # final publish for this pass
@@ -364,6 +415,7 @@ def warm_loop():
     sys.path.insert(0, SRC)
     _seed_uploaded_keys()                       # so we don't re-upload what's already there
     _seed_ineligible()                          # skip known headwaters from the start
+    _seed_carry()                               # restart must not shrink served coverage
     last_t0 = None
     while True:
         try:

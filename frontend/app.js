@@ -2293,9 +2293,16 @@ async function runRoutedNowcast(id) {
     const d = await r.json();
     const p = d.ok && (d.points || []).find((x) => x.id === id);
     if (!p) {
-      addMsg(`⚠️ No routed nowcast for <b>${escapeHtml(id)}</b> yet — it has no upstream ` +
-        "USGS gauge to route from, or the hourly keep-warm run hasn’t produced it. " +
-        "Switch to 🕘 Hindcast to simulate this point.", "status");
+      // "missing" tells us WHY: only claim a hydrologic cause when the
+      // keep-warm fleet has actually confirmed there is no upstream gauge
+      const why = d.ok && d.missing && d.missing[id];
+      addMsg(why === "no_upstream"
+        ? `⚠️ <b>${escapeHtml(id)}</b> has no upstream USGS gauge draining to it, so ` +
+          "there is no observed flow to route — the routed-nowcast design can’t serve " +
+          "this point. Switch to 🕘 Hindcast to simulate it from rainfall."
+        : `⏳ <b>${escapeHtml(id)}</b>’s routed nowcast isn’t published yet — the hourly ` +
+          "precompute is still catching up on this point. Try again in a few minutes, " +
+          "or switch to 🕘 Hindcast to simulate it now.", "status");
       selected.delete(id); refreshSelection();
       return;
     }
