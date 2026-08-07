@@ -348,8 +348,13 @@ def _current_t0():
 def run_pass(t0):
     from hf_data import ungaugednow_store
     pts = _all_points()
+    # gaps first: points not yet in the served parquet are computed before
+    # refreshing already-served ones, so map coverage grows at full speed
+    # instead of spending the first hours re-treading the covered prefix
+    pts.sort(key=lambda p: str(p["id"]) in _carry)
     workers = int(os.environ.get("UNGAUGED_WORKERS", "8"))
-    _log(f"pass {state['passes'] + 1}: {len(pts)} points @ t0={t0} "
+    n_gap = sum(1 for p in pts if str(p["id"]) not in _carry)
+    _log(f"pass {state['passes'] + 1}: {len(pts)} points ({n_gap} gaps first) @ t0={t0} "
          f"| {workers} workers | {len(_uploaded_keys)} checkpoints already in fleet")
     t_start = time.time()
     rows, ok, fail, up, new_headwater = [], 0, 0, 0, 0
