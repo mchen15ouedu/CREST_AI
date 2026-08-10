@@ -668,6 +668,42 @@ def api_nowcast_hotspots():
     return nowcaststore.hotspots()
 
 
+@app.get("/api/events")
+def api_events():
+    """V25: published 2-D inundation events (CREST-iMAP v2) + runner state.
+    Frame/manifest files resolve at {base}/<event_id>/<file>."""
+    from hf_data import eventsim, eventstore
+    return {"events": eventstore.load_index(), "runner": eventsim.status(),
+            "base": (f"https://huggingface.co/datasets/{eventstore.REPO}/"
+                     f"resolve/main/{eventstore.PREFIX}")}
+
+
+@app.post("/api/event_run")
+def api_event_run(gid: str = ""):
+    """V25 manual/agent trigger: 2-D inundation event for `gid`, or
+    auto-detect from the nowcast flood tier when gid is empty. The run takes
+    minutes (EF5 + hydrodynamic solver) and executes in a worker thread;
+    poll /api/events for progress."""
+    try:
+        import crestimap  # noqa: F401  (installed from the CREST-iMAP fork, v2)
+    except ImportError:
+        return JSONResponse({"ok": False, "reason":
+                             "crestimap not installed on this Space build"},
+                            status_code=501)
+    from hf_data import eventsim
+    st = eventsim.status()
+    if st["running"]:
+        return {"ok": False, "reason": "an event simulation is already running",
+                **st}
+    import threading
+    if gid:
+        threading.Thread(target=eventsim.run_one, args=(gid,),
+                         daemon=True).start()
+    else:
+        threading.Thread(target=eventsim.run_detected, daemon=True).start()
+    return {"ok": True, "started": gid or "auto-detect"}
+
+
 @app.get("/api/upstream")
 def api_upstream(gid: str):
     """River network upstream of a gauge (HydroRIVERS topology walk) — drawn

@@ -268,9 +268,12 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
         # the future half of a nowcast window carries injected/zero-precip values
         # that must never be written into the shared row cache (a later hindcast
         # of the same window would be served the fabricated future); warm-start
-        # from saved state is still allowed. Hydrograph only — no 2-D maps.
+        # from saved state is still allowed. Hydrograph only — no 2-D maps —
+        # EXCEPT event runs, which pass an explicit output_grids token string
+        # (streamflow|runoff|subrunoff) to feed the CREST-iMAP v2 solver.
         no_cache = True
-        grids = False
+        if not isinstance(grids, str):
+            grids = False
     yield ("meta", {**g, "model": model})        # for the report + right panel
 
     lock = _run_lock(g["id"], ef5_model)
