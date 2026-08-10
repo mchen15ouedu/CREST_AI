@@ -101,6 +101,32 @@ def _thresholds() -> dict:
             return _thr["map"] or {}
 
 
+OBS_AGE_MAX_H = float(os.environ.get("RISK_OBS_AGE_MAX_H", "6"))
+OBS_GATE_FRAC = float(os.environ.get("RISK_OBS_GATE_FRAC", "0.3"))
+
+
+def _gate_tier(tr: int, age_h: float, last_q: float, thr: tuple) -> int:
+    """Tier-1 hallucination gates: a flood tier (2/3) must be backed by a
+    REPORTING gauge whose observed flow is already responding.
+
+    The DI-LSTM integrates the latest observation; fed a stale/absent one it
+    extrapolates freely (live false alarms 2026-08-10: tier-3 flags at
+    data-dead gauges with ~0 simulated flow). A red/orange claim therefore
+    requires: last obs within OBS_AGE_MAX_H, and observed flow already >=
+    OBS_GATE_FRAC x Q2 (bankfull fraction). Unsupported flood tiers demote
+    to 1 ("elevated" hint) rather than vanishing entirely.
+    """
+    if tr < 2:
+        return tr
+    if not (age_h == age_h) or age_h > OBS_AGE_MAX_H:
+        return 1
+    q2 = thr[1]
+    gate = max(OBS_GATE_FRAC * q2, NOISE_Q) if q2 == q2 else NOISE_Q
+    if not (last_q == last_q) or last_q < gate:
+        return 1
+    return tr
+
+
 def _tier(qmax: float, thr: tuple) -> int:
     """0 quiet · 1 elevated · 2 minor flood (>= Q2) · 3 flood (>= Q5).
 
@@ -135,14 +161,22 @@ def all_risk() -> dict:
     if not thr:
         return {"ok": False, "reason": "no flood thresholds computed yet"}
     qmax = np.max(np.stack([cols[n] for n in _qcols(cols)[:RISK_H]], 1), 1)
+    has_obs = "obs_age_h" in cols and "obs_last_q" in cols
     tiers, flagged = {}, []
     counts = [0, 0, 0]
+    n_gated = 0
     for i in range(len(cols["gid"])):
         gid = str(cols["gid"][i])
         th = thr.get(gid)
         if th is None:
             continue
         tr = _tier(float(qmax[i]), th)
+        if has_obs and tr >= 2:
+            gated = _gate_tier(tr, float(cols["obs_age_h"][i]),
+                               float(cols["obs_last_q"][i]), th)
+            if gated != tr:
+                n_gated += 1
+                tr = gated
         tiers[gid] = tr
         if tr > 0:
             counts[tr - 1] += 1
@@ -150,7 +184,8 @@ def all_risk() -> dict:
                             round(float(cols["lon"][i]), 4), tr, gid])
     return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
             "n_elevated": counts[0], "n_minor": counts[1], "n_flood": counts[2],
-            "n_rated": len(tiers), "flagged": flagged, "tiers": tiers}
+            "n_rated": len(tiers), "n_obs_gated": n_gated,
+            "obs_gated": has_obs, "flagged": flagged, "tiers": tiers}
 
 
 _hs: dict = {"t0": None, "val": None}
