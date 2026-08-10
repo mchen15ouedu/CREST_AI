@@ -19,12 +19,14 @@ Output: next H=6 hourly log1p(Q).
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
 
 L = 72          # lookback hours
-H = 6           # forecast horizon hours
+H = int(os.environ.get("NOWCAST_HORIZON", "6"))   # forecast horizon hours
 N_FEAT = 4
 
 

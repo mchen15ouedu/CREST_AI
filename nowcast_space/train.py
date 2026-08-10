@@ -9,12 +9,13 @@ import os
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 
 from model import DILSTM, H, L, N_FEAT, build_features, make_windows, nse, itq
 
 MODEL_REPO = os.environ.get("NOWCAST_MODEL_REPO", "vincewin/CREST_nowcast_model")
-CKPT = "dilstm.pt"
+CKPT = os.environ.get("NOWCAST_CKPT", "dilstm.pt")
 
 
 def _token():
@@ -45,13 +46,16 @@ def save_ckpt(ck: dict):
 def build_dataset(gauges: list[dict], months: list[str], val_months: list[str],
                   log=print):
     """Assemble train/val tensors from the prepared per-month series."""
-    from data import load_series
+    from data import load_series_bulk
     la = [np.log10(max(g["area_km2"], 1.0)) for g in gauges]
     stats = {"la_mean": float(np.mean(la)), "la_std": float(np.std(la) or 1.0)}
     rng = np.random.default_rng(42)
 
-    def one(gid_g, mlist, stride):
-        df = load_series(gid_g["id"], mlist)
+    gids = [g["id"] for g in gauges]
+    tr_frames = load_series_bulk(gids, months, log=log)
+    va_frames = load_series_bulk(gids, val_months, log=log)
+
+    def one(gid_g, df, stride):
         if df.empty or df["q"].notna().sum() < 500:
             return None
         q = df["q"].to_numpy()
@@ -59,22 +63,24 @@ def build_dataset(gauges: list[dict], months: list[str], val_months: list[str],
         # random staleness augmentation: the "last known obs" the model sees
         # lags truth by 1..12 h (teaches the obs_age channel)
         lag = int(rng.integers(1, 13))
-        obs_ff = np.full_like(q, np.nan)
-        age = np.zeros_like(q)
-        last, last_t = np.nan, -1
-        for t in range(len(q)):
-            if t - lag >= 0 and np.isfinite(q[t - lag]):
-                last, last_t = q[t - lag], t - lag
-            obs_ff[t] = last
-            age[t] = t - last_t if last_t >= 0 else 999
+        n = len(q)
+        # last_t[t] = index of most recent finite q at or before t-lag
+        vidx = np.where(np.isfinite(q), np.arange(n, dtype="float64"), np.nan)
+        shifted = np.full(n, np.nan)
+        if lag < n:
+            shifted[lag:] = vidx[:n - lag]
+        last_t = pd.Series(shifted).ffill().to_numpy()
+        fin = np.isfinite(last_t)
+        obs_ff = np.where(fin, q[np.where(fin, last_t, 0).astype(np.int64)], np.nan)
+        age = np.where(fin, np.arange(n) - last_t, 999.0)
         feat = build_features(p, np.nan_to_num(obs_ff, nan=0.0), age,
                               gid_g["area_km2"], stats)
         return make_windows(feat, q, stride=stride)
 
     Xtr, Ytr, Xva, Yva = [], [], [], []
     for g in gauges:
-        tr = one(g, months, stride=3)
-        va = one(g, val_months, stride=6)
+        tr = one(g, tr_frames[g["id"]], stride=3)
+        va = one(g, va_frames[g["id"]], stride=6)
         if tr is not None and len(tr[0]):
             Xtr.append(tr[0]); Ytr.append(tr[1])
         if va is not None and len(va[0]):

@@ -88,6 +88,8 @@ def cpu_ckpt(model, opt, epoch, stats, val_nse_v, n_train) -> dict:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gauges", default=DEFAULT_GAUGES)
+    ap.add_argument("--gauges-file", default=None,
+                    help="file of gauge IDs (comma/newline separated); overrides --gauges")
     ap.add_argument("--months", default=DEFAULT_MONTHS)
     ap.add_argument("--max-epochs", type=int, default=5000)
     ap.add_argument("--patience", type=int, default=300,
@@ -105,6 +107,8 @@ def main():
     if not os.environ.get("HF_TOKEN"):
         sys.exit("HF_TOKEN env var not set (needed for the private data/model repos)")
 
+    if args.gauges_file:
+        args.gauges = open(args.gauges_file).read().replace("\n", ",")
     gauges = gauge_meta(args.gauges)
     months = months_range(args.months)
     if not gauges:
@@ -127,6 +131,10 @@ def main():
 
     model = DILSTM().to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    # halve the LR when val NSE stalls — the V19.2 full-gauge run diverged at
+    # a flat 1e-3 after epoch 6 and never recovered its early best
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="max", factor=0.5, patience=20, min_lr=1e-5)
     epoch = 0
     if not args.fresh:
         ck = T.load_ckpt()
@@ -185,6 +193,10 @@ def main():
             tot += float(loss.detach()) * len(idx)
         epoch += 1
         v = val_nse()
+        lr_before = opt.param_groups[0]["lr"]
+        sched.step(v)
+        if opt.param_groups[0]["lr"] < lr_before:
+            print(f"epoch {epoch}: LR reduced to {opt.param_groups[0]['lr']:.2e}")
         if v > best + 1e-4:
             best, since_best = v, 0
             best_ck = cpu_ckpt(model, opt, epoch, stats, v, n)

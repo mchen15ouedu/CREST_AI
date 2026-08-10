@@ -8,5 +8,5 @@ export HF_TOKEN=$(tr -d ' \r\n' < ~/huggingface.txt)
 export SCRATCH=${SCRATCH:-/media/scratch/$USER}
 export HF_HOME=${HF_HOME:-$SCRATCH/hf_cache}
 
-nohup python prep_hpc.py "$@" > prep.log 2>&1 &
+nohup python -u prep_hpc.py "$@" > prep.log 2>&1 &
 echo "prep started, PID $!  —  watch with:  tail -f prep.log"
