@@ -40,9 +40,10 @@ _running: dict = {"id": None, "status": None, "log": [], "last": None}
 _lock = threading.Lock()
 
 
-def status() -> dict:
+def status(full: bool = False) -> dict:
     return {"running": _running["id"], "status": _running["status"],
-            "log": _running["log"][-30:], "last": _running["last"]}
+            "log": _running["log"][-(400 if full else 30):],
+            "last": _running["last"]}
 
 
 def detect(max_events: int = 1) -> list[dict]:

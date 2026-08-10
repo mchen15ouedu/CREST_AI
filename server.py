@@ -669,11 +669,11 @@ def api_nowcast_hotspots():
 
 
 @app.get("/api/events")
-def api_events():
+def api_events(full: int = 0):
     """V25: published 2-D inundation events (CREST-iMAP v2) + runner state.
     Frame/manifest files resolve at {base}/<event_id>/<file>."""
     from hf_data import eventsim, eventstore
-    return {"events": eventstore.load_index(), "runner": eventsim.status(),
+    return {"events": eventstore.load_index(), "runner": eventsim.status(bool(full)),
             "base": (f"https://huggingface.co/datasets/{eventstore.REPO}/"
                      f"resolve/main/{eventstore.PREFIX}")}
 
