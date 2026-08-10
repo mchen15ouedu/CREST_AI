@@ -107,6 +107,21 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         model = (meta.get("model") or "crest").lower()
         wb_model = "crest" if model in ("crest", "hp") else "crestphys"
 
+        # diagnostics: what did EF5 actually write, and what did we ask for?
+        ctl = os.path.join(work, "control.txt")
+        if os.path.exists(ctl):
+            for line in open(ctl, encoding="utf-8", errors="replace"):
+                if line.lower().startswith("output_grids"):
+                    log(f"control: {line.strip()}")
+        for root in sorted(os.listdir(work)):
+            rp = os.path.join(work, root)
+            if os.path.isdir(rp):
+                kinds = {}
+                for n in os.listdir(rp):
+                    kinds[n.split(".")[0]] = kinds.get(n.split(".")[0], 0) + 1
+                if kinds:
+                    log(f"workdir {root}/: {dict(sorted(kinds.items())[:8])}")
+
         with _lock:
             _running["status"] = "solver"
         cfg = EventConfig(
