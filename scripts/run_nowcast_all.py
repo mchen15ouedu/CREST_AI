@@ -49,17 +49,22 @@ truststore.inject_into_ssl()
 from forcing_update_common import HF_REPO, hf_token                             # noqa: E402
 
 MODEL_REPO = "vincewin/CREST_nowcast_model"
-MODEL_FILES = ("dilstm.pt", "dilstm_h12.pt")   # 6-h (risk basis) + 12-h; both run
+# each slot lists candidates, first found wins: v2 (obs-robust, feat_version 2)
+# preferred over the legacy v1 file. Delete the v2 files from the model repo
+# to roll back — nothing else to redeploy.
+MODEL_FILES = (("dilstm_v2.pt", "dilstm.pt"),           # 6-h (risk basis)
+               ("dilstm_h12_v2.pt", "dilstm_h12.pt"))   # 12-h
 RECENT_PREFIX = "mrms_recent/"
 MRMS_GRID = (-130.0, 20.0, 0.01, 3500, 7000, -9999.0)   # xll, yll, cell, nr, nc, nodata
 L, H = 72, 6                      # lookback; H is only the horizon fallback
+AGE_CAP_H = 240.0                 # feat_version 2: older obs counts as missing
 CFS_TO_CMS = 0.0283168
 CACHE_PATH = "nowcast/precip_cache.parquet"
 LATEST_PATH = "nowcast/latest.parquet"
 
 
 # ---- model (minimal copy of nowcast_space/model.py — KEEP IN SYNC) -----------
-def _model_and_stats(token, fname):
+def _model_and_stats(token, fnames):
     import torch
     import torch.nn as nn
 
@@ -68,19 +73,29 @@ def _model_and_stats(token, fname):
             super().__init__()
             self.lstm = nn.LSTM(n_feat, hidden, num_layers=layers,
                                 batch_first=True, dropout=0.1 if layers > 1 else 0.0)
+            self.drop = nn.Dropout(0.1)          # parameter-free; MC-dropout hook
             self.head = nn.Linear(hidden, horizon)
 
         def forward(self, x):
             out, _ = self.lstm(x)
-            return self.head(out[:, -1])
+            return self.head(self.drop(out[:, -1]))
 
     from huggingface_hub import hf_hub_download
-    p = hf_hub_download(MODEL_REPO, fname, repo_type="model", token=token)
+    p, fname = None, None
+    for cand in fnames:
+        try:
+            p = hf_hub_download(MODEL_REPO, cand, repo_type="model", token=token)
+            fname = cand
+            break
+        except Exception:
+            continue
+    if p is None:
+        raise FileNotFoundError(f"none of {fnames} in {MODEL_REPO}")
     ck = torch.load(p, map_location="cpu", weights_only=False)
-    m = DILSTM(horizon=int(ck.get("horizon", H)))
+    m = DILSTM(n_feat=int(ck.get("n_feat", 4)), horizon=int(ck.get("horizon", H)))
     m.load_state_dict(ck["state_dict"])
     m.eval()
-    return m, ck
+    return m, ck, fname
 
 
 # ---- precip: summed-area-table box means -------------------------------------
@@ -270,39 +285,54 @@ def main() -> int:
             obs.update(got)
 
     # -- features + batched inference ------------------------------------------
-    model, ck = _model_and_stats(token, MODEL_FILES[0])
-    model12, ck12 = _model_and_stats(token, MODEL_FILES[1])
-    stats = ck["stats"]                        # identical in both checkpoints
-    la = ((np.log10(np.maximum(area, 1.0)) - stats["la_mean"])
-          / max(stats["la_std"], 1e-6)).astype("float32")
-    feat = np.zeros((len(gid), L, 4), "float32")
-    feat[:, :, 0] = np.log1p(np.nan_to_num(np.maximum(pmat, 0.0)))
-    feat[:, :, 3] = la[:, None]
+    model, ck, mfile = _model_and_stats(token, MODEL_FILES[0])
+    model12, ck12, mfile12 = _model_and_stats(token, MODEL_FILES[1])
+
+    # raw obs arrays once; per-checkpoint feature layouts assembled from them
+    # (during the v1->v2 transition the two checkpoints can differ in
+    # feat_version AND stats)
+    obs_val = np.zeros((len(gid), L), "float32")         # last-known Q, m3/s
+    age_h = np.full((len(gid), L), 999.0, "float32")     # hours since that obs
     obs_last_q = np.full(len(gid), np.nan, "float32")
     obs_age = np.full(len(gid), 999.0, "float32")
     obs_last_t = [""] * len(gid)
     for g in range(len(gid)):
         rows = obs.get(gid[g])
         if not rows:
-            feat[g, :, 2] = 999.0 / 24.0
             continue
         j = -1
         for i, t in enumerate(hours):
             while j + 1 < len(rows) and rows[j + 1][0] <= t:
                 j += 1
             if j >= 0:
-                feat[g, i, 1] = math.log1p(max(rows[j][1], 0.0))
-                feat[g, i, 2] = (t - rows[j][0]).total_seconds() / 3600.0 / 24.0
-            else:
-                feat[g, i, 2] = 999.0 / 24.0
+                obs_val[g, i] = max(rows[j][1], 0.0)
+                age_h[g, i] = (t - rows[j][0]).total_seconds() / 3600.0
         if j >= 0:
             obs_last_q[g] = rows[j][1]
             obs_age[g] = (t0 - rows[j][0]).total_seconds() / 3600.0
             obs_last_t[g] = rows[j][0].strftime("%Y-%m-%d %H:%M")
 
+    def _assemble(c):
+        stats = c["stats"]
+        la = ((np.log10(np.maximum(area, 1.0)) - stats["la_mean"])
+              / max(stats["la_std"], 1e-6)).astype("float32")
+        fv = int(c.get("feat_version", 1))
+        f = np.zeros((len(gid), L, 5 if fv >= 2 else 4), "float32")
+        f[:, :, 0] = np.log1p(np.nan_to_num(np.maximum(pmat, 0.0)))
+        f[:, :, 3] = la[:, None]
+        if fv >= 2:
+            miss = age_h > AGE_CAP_H
+            f[:, :, 1] = np.where(miss, 0.0, np.log1p(obs_val))
+            f[:, :, 2] = np.minimum(age_h, AGE_CAP_H) / 24.0
+            f[:, :, 4] = miss.astype("float32")
+        else:
+            f[:, :, 1] = np.log1p(obs_val)
+            f[:, :, 2] = age_h / 24.0
+        return f
+
     import torch
 
-    def _infer(m, hor):
+    def _infer(m, feat, hor):
         out = np.zeros((len(gid), hor), "float32")
         with torch.no_grad():
             for i in range(0, len(gid), 2048):
@@ -312,24 +342,67 @@ def main() -> int:
 
     hor = int(ck.get("horizon", H))
     hor12 = int(ck12.get("horizon", 12))
-    preds = _infer(model, hor)
-    preds12 = _infer(model12, hor12)
+    feat6 = _assemble(ck)
+    preds = _infer(model, feat6, hor)
+    preds12 = _infer(model12, _assemble(ck12), hor12)
+
+    # optional MC-dropout spread on the risk-basis model: per-gauge mean CV of
+    # the stochastic predictions — hallucinated peaks come with a huge spread
+    mc_n = int(os.environ.get("NOWCAST_MC_N", "0"))
+    mc_cv = None
+    if mc_n > 1:
+        model.train()                              # activates dropout
+        stack = np.stack([_infer(model, feat6, hor) for _ in range(mc_n)])
+        model.eval()
+        with np.errstate(invalid="ignore"):
+            mc_cv = (stack.std(0) / np.maximum(stack.mean(0), 0.1)).mean(1) \
+                .astype("float32")
+
+    # per-gauge validation skill (uploaded by train_hpc.py next to the ckpt)
+    def _skill(fname):
+        try:
+            p = hf_hub_download(MODEL_REPO, f"skill_{os.path.splitext(fname)[0]}.parquet",
+                                repo_type="model", token=token)
+            t = pq.read_table(p)
+            g2i = {g: i for i, g in enumerate(t.column("gid").to_pylist())}
+            v = t.column("val_nse").to_numpy()
+            vn = t.column("val_nse_noobs").to_numpy()
+            a = np.full(len(gid), np.nan, "float32")
+            b = np.full(len(gid), np.nan, "float32")
+            for i, g in enumerate(gid):
+                if g in g2i:
+                    a[i], b[i] = v[g2i[g]], vn[g2i[g]]
+            return a, b
+        except Exception:
+            return None, None
+
+    skill_nse, skill_nse_noobs = _skill(mfile)
 
     # -- outputs ---------------------------------------------------------------
     md = {b"t0": t0.strftime("%Y-%m-%d %H:00 UTC").encode(),
           b"generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC").encode(),
+          b"model_file": mfile.encode(),
+          b"model_feat_version": str(ck.get("feat_version", 1)).encode(),
           b"model_epoch": str(ck.get("epoch")).encode(),
           b"model_val_nse": str(ck.get("val_nse")).encode(),
           b"model_when": str(ck.get("when")).encode(),
           b"horizon": str(hor).encode(),
+          b"model12_file": mfile12.encode(),
           b"model12_epoch": str(ck12.get("epoch")).encode(),
           b"model12_val_nse": str(ck12.get("val_nse")).encode(),
           b"model12_when": str(ck12.get("when")).encode(),
-          b"horizon12": str(hor12).encode()}
+          b"horizon12": str(hor12).encode(),
+          b"skill_table": (b"1" if skill_nse is not None else b"0"),
+          b"mc_n": str(mc_n).encode()}
     cols = {"gid": gid.tolist(), "lat": lat.astype("float32"),
             "lon": lon.astype("float32"), "area_km2": area.astype("float32"),
             "obs_last_time": obs_last_t, "obs_last_q": obs_last_q,
             "obs_age_h": obs_age}
+    if skill_nse is not None:
+        cols["val_nse_gauge"] = skill_nse
+        cols["val_nse_noobs_gauge"] = skill_nse_noobs
+    if mc_cv is not None:
+        cols["mc_cv"] = mc_cv
     for k in range(hor):
         cols[f"q{k + 1}"] = preds[:, k]
     for k in range(hor12):                     # 12-h model, own column family
@@ -346,8 +419,10 @@ def main() -> int:
                f"({n_obs_fresh} with obs <=6 h old) | precip hours: "
                f"{sum(1 for t in hours if f'h{t:%Y%m%d%H}' in cached)}/{L} "
                f"({computed} new, {from_pass2} via Pass2, {len(missing)} missing) | "
-               f"models h{hor} e{ck.get('epoch')} nse {ck.get('val_nse')} + "
-               f"h{hor12} e{ck12.get('epoch')} nse {ck12.get('val_nse')}")
+               f"models {mfile} h{hor} e{ck.get('epoch')} nse {ck.get('val_nse')} + "
+               f"{mfile12} h{hor12} e{ck12.get('epoch')} nse {ck12.get('val_nse')}"
+               f"{' | skill table' if skill_nse is not None else ''}"
+               f"{f' | mc_n {mc_n}' if mc_cv is not None else ''}")
     if args.dry_run:
         print(summary + " [dry-run: no upload]")
         return 0

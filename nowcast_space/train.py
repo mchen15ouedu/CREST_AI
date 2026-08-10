@@ -11,7 +11,8 @@ import time
 import numpy as np
 import torch
 
-from model import DILSTM, H, L, N_FEAT, build_features, make_windows, nse, itq
+from model import (DILSTM, H, L, N_FEAT, AGE_CAP_H, blank_obs, build_features,
+                   make_windows, n_feat_for, nse, itq)
 
 MODEL_REPO = os.environ.get("NOWCAST_MODEL_REPO", "vincewin/CREST_nowcast_model")
 CKPT = "dilstm.pt"
@@ -21,25 +22,25 @@ def _token():
     return os.environ.get("HF_TOKEN")
 
 
-def load_ckpt(map_location="cpu"):
+def load_ckpt(map_location="cpu", name: str = CKPT):
     """Checkpoint from the model repo, or None."""
     try:
         from huggingface_hub import hf_hub_download
-        p = hf_hub_download(MODEL_REPO, CKPT, token=_token())
+        p = hf_hub_download(MODEL_REPO, name, token=_token())
         return torch.load(p, map_location=map_location, weights_only=False)
     except Exception:
         return None
 
 
-def save_ckpt(ck: dict):
+def save_ckpt(ck: dict, name: str = CKPT):
     from huggingface_hub import HfApi
     api = HfApi(token=_token())
     api.create_repo(MODEL_REPO, repo_type="model", private=True, exist_ok=True)
     buf = io.BytesIO()
     torch.save(ck, buf)
-    api.upload_file(path_or_fileobj=buf.getvalue(), path_in_repo=CKPT,
+    api.upload_file(path_or_fileobj=buf.getvalue(), path_in_repo=name,
                     repo_id=MODEL_REPO, repo_type="model",
-                    commit_message=f"epoch {ck['epoch']} val_nse={ck.get('val_nse')}")
+                    commit_message=f"{name}: epoch {ck['epoch']} val_nse={ck.get('val_nse')}")
 
 
 def build_dataset(gauges: list[dict], months: list[str], val_months: list[str],
@@ -86,6 +87,94 @@ def build_dataset(gauges: list[dict], months: list[str], val_months: list[str],
     return (np.concatenate(Xtr), np.concatenate(Ytr),
             np.concatenate(Xva) if Xva else np.zeros((0, L, N_FEAT), "float32"),
             np.concatenate(Yva) if Yva else np.zeros((0, H), "float32"), stats)
+
+
+def _obs_process(q: np.ndarray, rng, augment: bool):
+    """Simulate the observation stream the model sees at inference: a
+    reporting lag, and (when augment=True) random multi-hour OUTAGES during
+    which the last obs freezes and its age grows — the exact regime where the
+    v1 model hallucinated. Returns (obs_ff, age_h); age is huge before the
+    first obs (build_features maps that to the missing state)."""
+    T = len(q)
+    lag = int(rng.integers(1, 7)) if augment else 1
+    reporting = np.ones(T, bool)
+    if augment:
+        for _ in range(int(rng.poisson(max(T / 720.0, 0.5)))):   # ~1 per 30 d
+            s = int(rng.integers(0, T))
+            reporting[s:s + int(rng.integers(12, 97))] = False   # 12-96 h out
+    obs_ff = np.zeros(T)
+    age = np.full(T, 1e9)
+    last, last_t = 0.0, None
+    for t in range(T):
+        ts = t - lag
+        if ts >= 0 and np.isfinite(q[ts]) and reporting[ts]:
+            last, last_t = q[ts], ts
+        if last_t is not None:
+            obs_ff[t] = last
+            age[t] = t - last_t
+    return obs_ff, age
+
+
+def build_dataset_v2(gauges: list[dict], months: list[str], val_months: list[str],
+                     horizon: int = H, obs_dropout: float = 0.15, seed: int = 42,
+                     log=print):
+    """feat_version-2 dataset with per-window gauge indices.
+
+    Training windows get (a) the outage-augmented obs stream from
+    _obs_process and (b) window-level obs-channel dropout: a fraction
+    obs_dropout of windows is rewritten to the dead-gauge state (obs=0,
+    age=AGE_CAP, missing=1) with the TRUE discharge kept as target, teaching
+    a rainfall-driven fallback instead of free extrapolation.
+
+    Validation windows use a clean 1-h-lag obs stream (obs-fresh skill);
+    the no-obs diagnostic is computed by the caller via model.blank_obs.
+
+    Returns dict(Xtr, Ytr, Gtr, Xva, Yva, Gva, stats, gauge_ids) or None.
+    """
+    from data import load_series
+    la = [np.log10(max(g["area_km2"], 1.0)) for g in gauges]
+    stats = {"la_mean": float(np.mean(la)), "la_std": float(np.std(la) or 1.0)}
+    rng = np.random.default_rng(seed)
+
+    def one(g, mlist, stride, augment):
+        df = load_series(g["id"], mlist)
+        if df.empty or df["q"].notna().sum() < 500:
+            return None
+        q = df["q"].to_numpy()
+        p = np.nan_to_num(df["p"].to_numpy(), nan=0.0)
+        obs_ff, age = _obs_process(q, rng, augment)
+        feat = build_features(p, obs_ff, age, g["area_km2"], stats, feat_version=2)
+        X, Y, _ = make_windows(feat, q, stride=stride, horizon=horizon)
+        if augment and len(X) and obs_dropout > 0:
+            k = rng.random(len(X)) < obs_dropout
+            if k.any():
+                X[k] = blank_obs(X[k])
+        return X, Y
+
+    Xtr, Ytr, Gtr, Xva, Yva, Gva = [], [], [], [], [], []
+    gauge_ids = [g["id"] for g in gauges]
+    for gi, g in enumerate(gauges):
+        tr = one(g, months, stride=3, augment=True)
+        va = one(g, val_months, stride=6, augment=False)
+        if tr is not None and len(tr[0]):
+            Xtr.append(tr[0]); Ytr.append(tr[1])
+            Gtr.append(np.full(len(tr[0]), gi, "int32"))
+        if va is not None and len(va[0]):
+            Xva.append(va[0]); Yva.append(va[1])
+            Gva.append(np.full(len(va[0]), gi, "int32"))
+        log(f"  {g['id']}: train {0 if tr is None else len(tr[0])} / "
+            f"val {0 if va is None else len(va[0])} windows")
+    if not Xtr:
+        return None
+    nf = n_feat_for(2)
+    return {"Xtr": np.concatenate(Xtr), "Ytr": np.concatenate(Ytr),
+            "Gtr": np.concatenate(Gtr),
+            "Xva": (np.concatenate(Xva) if Xva
+                    else np.zeros((0, L, nf), "float32")),
+            "Yva": (np.concatenate(Yva) if Yva
+                    else np.zeros((0, horizon), "float32")),
+            "Gva": np.concatenate(Gva) if Gva else np.zeros(0, "int32"),
+            "stats": stats, "gauge_ids": gauge_ids}
 
 
 def train_burst(dataset, ck: dict | None, seconds: float = 200.0,

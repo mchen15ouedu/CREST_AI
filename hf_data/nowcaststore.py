@@ -103,6 +103,12 @@ def _thresholds() -> dict:
 
 OBS_AGE_MAX_H = float(os.environ.get("RISK_OBS_AGE_MAX_H", "6"))
 OBS_GATE_FRAC = float(os.environ.get("RISK_OBS_GATE_FRAC", "0.3"))
+# per-gauge skill gate: once the precompute joins the v2 model's per-gauge
+# validation NSE (val_nse_gauge column, from the HPC skill table), a flood
+# tier at a gauge the model demonstrably cannot predict (val NSE below this)
+# demotes to 1. Default 0.0 = gate only negative-skill gauges; raise to be
+# stricter. Gauges absent from the table (NaN) are never skill-gated.
+MIN_GAUGE_NSE = float(os.environ.get("RISK_MIN_GAUGE_NSE", "0.0"))
 
 
 def _gate_tier(tr: int, age_h: float, last_q: float, thr: tuple) -> int:
@@ -162,9 +168,11 @@ def all_risk() -> dict:
         return {"ok": False, "reason": "no flood thresholds computed yet"}
     qmax = np.max(np.stack([cols[n] for n in _qcols(cols)[:RISK_H]], 1), 1)
     has_obs = "obs_age_h" in cols and "obs_last_q" in cols
+    has_skill = "val_nse_gauge" in cols
     tiers, flagged = {}, []
     counts = [0, 0, 0]
     n_gated = 0
+    n_skill_gated = 0
     for i in range(len(cols["gid"])):
         gid = str(cols["gid"][i])
         th = thr.get(gid)
@@ -177,6 +185,11 @@ def all_risk() -> dict:
             if gated != tr:
                 n_gated += 1
                 tr = gated
+        if has_skill and tr >= 2:
+            vn = float(cols["val_nse_gauge"][i])
+            if vn == vn and vn < MIN_GAUGE_NSE:
+                n_skill_gated += 1
+                tr = 1
         tiers[gid] = tr
         if tr > 0:
             counts[tr - 1] += 1
@@ -185,7 +198,8 @@ def all_risk() -> dict:
     return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
             "n_elevated": counts[0], "n_minor": counts[1], "n_flood": counts[2],
             "n_rated": len(tiers), "n_obs_gated": n_gated,
-            "obs_gated": has_obs, "flagged": flagged, "tiers": tiers}
+            "obs_gated": has_obs, "n_skill_gated": n_skill_gated,
+            "skill_gated": has_skill, "flagged": flagged, "tiers": tiers}
 
 
 _hs: dict = {"t0": None, "val": None}

@@ -1,5 +1,9 @@
 # Migrating the DI-LSTM nowcaster pipeline to an HPC / GPU server
 
+> **Retraining the v2 (obs-robust) model?** The plan, acceptance criteria,
+> and upload rules are in `RETRAIN_V2_BRIEF.md` — this file covers only the
+> environment/SLURM mechanics it builds on.
+
 Two launch styles, same Python scripts:
 
 - **No scheduler (plain GPU server)** — use `./run_prep.sh` / `./run_train.sh`
