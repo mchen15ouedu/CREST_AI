@@ -2591,7 +2591,7 @@ function enterEventsMode() {
   document.getElementById("mode-now").classList.remove("on");
   document.getElementById("mode-evt").classList.add("on");
   if (!evtGroup) evtGroup = L.layerGroup().addTo(map);
-  addMsg("🌊 <b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
+  addMsg("<b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
          "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the basin " +
          "in 2-D: blue shading is simulated water depth (darker = deeper). Pick an " +
          "event to animate its depth frames or view the maximum-depth footprint; " +
@@ -2624,9 +2624,9 @@ async function loadEvents() {
     "color:#dfe9f5;border:1px solid #33475e;border-radius:10px;padding:10px 12px;" +
     "max-width:300px;max-height:60vh;overflow:auto;font-size:12.5px;line-height:1.45";
   const r = d.runner || {};
-  let html = "<b>🌊 Inundation events</b><br>";
+  let html = "<b>Inundation events</b><br>";
   if (r.running) {
-    html += `<div style="color:#ffd479">⏳ simulating <b>${r.running}</b> (${r.status})</div>`;
+    html += `<div style="color:#ffd479">simulating <b>${r.running}</b> (${r.status})</div>`;
   } else if (r.last && r.last.ok === false) {
     html += `<div style="color:#ff9d9d">last run failed: ${r.last.error || ""}</div>`;
   }
