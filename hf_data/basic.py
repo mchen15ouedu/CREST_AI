@@ -34,6 +34,39 @@ def _vsicurl(cog_path: str) -> str:
     return f"/vsicurl/{_RESOLVE}/{cog_path}"
 
 
+def _cog_src(cog: str, force_download: bool = False) -> str:
+    """Local whole-file copy when cached (or force_download) else /vsicurl.
+
+    Windowed /vsicurl reads are anonymous range requests — under fleet-scale
+    concurrency HF rate-limits them (RasterioIOError storms across every
+    runner), so a local copy (authenticated hf_hub download, shared across
+    processes via HF_HOME) is preferred whenever it exists."""
+    try:
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache
+        p = try_to_load_from_cache(HF_REPO, cog, repo_type="dataset")
+        if isinstance(p, str) and os.path.exists(p):
+            return p
+        if force_download:
+            return hf_hub_download(HF_REPO, cog, repo_type="dataset",
+                                   token=os.environ.get("HF_TOKEN"))
+    except Exception:
+        pass
+    return _vsicurl(cog)
+
+
+def prefetch() -> None:
+    """Best-effort download of the three CONUS COGs (~6.9 GB) into the HF
+    cache so every later clip reads locally. Bulk runners (the fleet) call
+    this once at startup; interactive use never needs it."""
+    from huggingface_hub import hf_hub_download
+    for cog in BASIC_GRIDS.values():
+        try:
+            hf_hub_download(HF_REPO, cog, repo_type="dataset",
+                            token=os.environ.get("HF_TOKEN"))
+        except Exception:
+            pass
+
+
 @dataclass
 class ClipResult:
     out_dir: str
@@ -139,9 +172,10 @@ def clip_basic_data(bbox, out_dir: str, unsafe_ssl: bool | None = None) -> ClipR
     fetch_failed: list[str] = []
     for out_name, cog in BASIC_GRIDS.items():
         err = None
-        for attempt in range(3):               # /vsicurl reads fail transiently
-            try:
-                _clip_one(cog, out_name, bbox, out_dir, files)
+        for attempt in range(4):               # /vsicurl reads fail transiently;
+            try:                               # final tries clip a local copy
+                _clip_one(_cog_src(cog, force_download=attempt >= 2),
+                          out_name, bbox, out_dir, files)
                 err = None
                 break
             except Exception as e:
@@ -184,9 +218,9 @@ def clip_basic_data(bbox, out_dir: str, unsafe_ssl: bool | None = None) -> ClipR
                       derived=derived)
 
 
-def _clip_one(cog: str, out_name: str, bbox, out_dir: str, files: dict) -> None:
+def _clip_one(src_path: str, out_name: str, bbox, out_dir: str, files: dict) -> None:
     W, S, E, N = bbox
-    with rasterio.open(_vsicurl(cog)) as src:
+    with rasterio.open(src_path) as src:
         win = from_bounds(W, S, E, N, src.transform).round_offsets().round_lengths()
         # standardized clip for EF5's TifGrid reader: single-band Float32,
         # strip-organized, nodata=-9999, WGS84

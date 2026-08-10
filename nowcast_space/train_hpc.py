@@ -5,17 +5,28 @@ data (private dataset repo vincewin/CREST_nowcast_data) and uploads the SAME
 checkpoint format to vincewin/CREST_nowcast_model — press "Reload model" on
 the CREST_nowcast Space (or call api_name=reload) to serve the new weights.
 
-Needs alongside it: model.py, train.py, data.py (this repo). See README_HPC.md
-for environment setup and a SLURM example.
+v2 (default): feat_version-2 model with an explicit obs-missing flag, obs
+outage augmentation and obs-channel dropout — the fix for DI-LSTM
+hallucination at data-dead gauges. v2 checkpoints upload under NEW names
+(dilstm_v2.pt / dilstm_h12_v2.pt) so the live v1 model is untouched until
+the serving side finds the v2 files; delete them from the model repo to
+roll back. Alongside the final checkpoint a per-gauge validation skill
+table (skill_<ckpt-stem>.parquet: gid, val_nse, val_nse_noobs, n_windows)
+uploads, enabling per-gauge skill gating in the dashboard risk tiers.
+
+Needs alongside it: model.py, train.py, data.py (this repo). See
+RETRAIN_V2_BRIEF.md for the retraining plan and README_HPC.md for the
+environment and SLURM setup.
 
     export HF_TOKEN=hf_...          # read/write on the two private repos
-    python train_hpc.py                                   # defaults below
-    python train_hpc.py --gauges "08167000, 08144500" \
-        --months 2023_01-2024_12 --max-epochs 5000 --patience 300
+    python train_hpc.py                                   # v2, 6-h horizon
+    python train_hpc.py --horizon 12                      # 12-h companion
+    python train_hpc.py --gauges-file gauges_v2.txt --months 2023_01-2025_06
 """
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
 import time
@@ -29,7 +40,7 @@ except Exception:
 import numpy as np
 import torch
 
-from model import DILSTM, H, L, itq, nse
+from model import DILSTM, H, L, blank_obs, itq, mc_predict, n_feat_for, nse
 import train as T
 
 DEFAULT_GAUGES = "01011000, 08166200, 08167000, 08144500"
@@ -71,7 +82,8 @@ def months_range(spec: str) -> list[str]:
     return out
 
 
-def cpu_ckpt(model, opt, epoch, stats, val_nse_v, n_train) -> dict:
+def cpu_ckpt(model, opt, epoch, stats, val_nse_v, n_train,
+             feat_version, horizon) -> dict:
     """Checkpoint with deep-copied CPU tensors (does not disturb live training)."""
     sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     osd = opt.state_dict()
@@ -81,25 +93,90 @@ def cpu_ckpt(model, opt, epoch, stats, val_nse_v, n_train) -> dict:
            "param_groups": [dict(pg) for pg in osd["param_groups"]]}
     return {"state_dict": sd, "opt": osd, "epoch": epoch, "stats": stats,
             "val_nse": round(float(val_nse_v), 3), "n_train": int(n_train),
-            "horizon": H, "lookback": L, "feat_version": 1,
+            "horizon": int(horizon), "lookback": L,
+            "feat_version": int(feat_version),
+            "n_feat": n_feat_for(feat_version),
             "when": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}
+
+
+def per_gauge_table(model, Xva, Yva, Gva, gauge_ids, dev, batch=4096):
+    """Per-gauge val NSE, obs-fresh AND no-obs, plus a hallucination score:
+    the 95th-percentile ratio of predicted to observed window-max flow under
+    no-obs (large = the model invents floods when the gauge goes dark)."""
+    def infer(X):
+        outs = []
+        model.eval()
+        with torch.no_grad():
+            for i in range(0, len(X), batch):
+                outs.append(model(torch.from_numpy(X[i:i + batch]).to(dev))
+                            .cpu().numpy())
+        return itq(np.concatenate(outs))                      # real space [N, hor]
+    y = itq(Yva)
+    p_obs = infer(Xva)
+    p_no = infer(blank_obs(Xva))
+    rows = []
+    for gi, gid in enumerate(gauge_ids):
+        m = Gva == gi
+        if not m.any():
+            continue
+        rows.append({"gid": gid,
+                     "val_nse": nse(p_obs[m].ravel(), y[m].ravel()),
+                     "val_nse_noobs": nse(p_no[m].ravel(), y[m].ravel()),
+                     "n_windows": int(m.sum())})
+    ratio = p_no.max(axis=1) / np.maximum(y.max(axis=1), 0.5)
+    diag = {"pooled_nse": nse(p_obs.ravel(), y.ravel()),
+            "pooled_nse_noobs": nse(p_no.ravel(), y.ravel()),
+            "noobs_peak_ratio_p95": float(np.percentile(ratio, 95)),
+            "noobs_peak_ratio_p99": float(np.percentile(ratio, 99))}
+    return rows, diag
+
+
+def upload_skill_table(rows: list[dict], name: str):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi
+    t = pa.table({"gid": [r["gid"] for r in rows],
+                  "val_nse": np.array([r["val_nse"] for r in rows], "float32"),
+                  "val_nse_noobs": np.array([r["val_nse_noobs"] for r in rows],
+                                            "float32"),
+                  "n_windows": np.array([r["n_windows"] for r in rows], "int32")})
+    buf = io.BytesIO()
+    pq.write_table(t, buf, compression="zstd")
+    HfApi(token=os.environ["HF_TOKEN"]).upload_file(
+        path_or_fileobj=buf.getvalue(), path_in_repo=name,
+        repo_id=T.MODEL_REPO, repo_type="model",
+        commit_message=f"{name}: per-gauge val skill, {len(rows)} gauges")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gauges", default=DEFAULT_GAUGES)
-    ap.add_argument("--gauges-file", default=None,
-                    help="file of gauge IDs (comma/newline separated); overrides --gauges")
+    ap.add_argument("--gauges-file", default="",
+                    help="file with gauge ids (comma/newline separated); "
+                         "overrides --gauges. See select_gauges.py")
     ap.add_argument("--months", default=DEFAULT_MONTHS)
+    ap.add_argument("--horizon", type=int, default=6, choices=(6, 12))
+    ap.add_argument("--feat-version", type=int, default=2, choices=(1, 2))
+    ap.add_argument("--obs-dropout", type=float, default=0.15,
+                    help="fraction of training windows rewritten to the "
+                         "dead-gauge obs state (feat_version 2)")
+    ap.add_argument("--ckpt-name", default="",
+                    help="checkpoint filename in the model repo; default "
+                         "dilstm_v2.pt (or dilstm_h12_v2.pt for --horizon 12); "
+                         "v1: dilstm.pt / dilstm_h12.pt")
     ap.add_argument("--max-epochs", type=int, default=5000)
     ap.add_argument("--patience", type=int, default=300,
                     help="stop after this many epochs without val-NSE improvement")
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--mc-eval", type=int, default=16,
+                    help="MC-dropout passes for the final spread diagnostic "
+                         "(0 = skip)")
     ap.add_argument("--fresh", action="store_true",
                     help="start from scratch instead of resuming the repo checkpoint")
     ap.add_argument("--no-upload", action="store_true",
-                    help="write dilstm_best.pt locally instead of uploading")
+                    help="write <ckpt-name> + skill table locally instead of uploading")
     ap.add_argument("--upload-every-min", type=float, default=15.0,
                     help="push the current best checkpoint at most this often")
     args = ap.parse_args()
@@ -107,20 +184,37 @@ def main():
     if not os.environ.get("HF_TOKEN"):
         sys.exit("HF_TOKEN env var not set (needed for the private data/model repos)")
 
+    fv, hor = args.feat_version, args.horizon
+    ckpt_name = args.ckpt_name or {
+        (1, 6): "dilstm.pt", (1, 12): "dilstm_h12.pt",
+        (2, 6): "dilstm_v2.pt", (2, 12): "dilstm_h12_v2.pt"}[(fv, hor)]
+    skill_name = f"skill_{os.path.splitext(ckpt_name)[0]}.parquet"
+
+    gauge_spec = args.gauges
     if args.gauges_file:
-        args.gauges = open(args.gauges_file).read().replace("\n", ",")
-    gauges = gauge_meta(args.gauges)
+        raw = open(args.gauges_file).read()
+        gauge_spec = ",".join(s for s in raw.replace("\n", ",").split(",") if s.strip())
+    gauges = gauge_meta(gauge_spec)
     months = months_range(args.months)
     if not gauges:
         sys.exit("no valid gauges")
-    print(f"gauges {[g['id'] for g in gauges]}  months {months[0]}..{months[-1]}"
+    print(f"feat_version {fv}  horizon {hor} h  ckpt {ckpt_name}\n"
+          f"{len(gauges)} gauges  months {months[0]}..{months[-1]}"
           f"  val {VAL_MONTHS[0]}..{VAL_MONTHS[-1]}")
 
-    ds = T.build_dataset(gauges, months, VAL_MONTHS)
-    if ds is None:
-        sys.exit("no training data — run Data prep on the Space first (prep_month "
-                 "fills the dataset repo; this script only reads it)")
-    Xtr, Ytr, Xva, Yva, stats = ds
+    if fv >= 2:
+        ds = T.build_dataset_v2(gauges, months, VAL_MONTHS, horizon=hor,
+                                obs_dropout=args.obs_dropout, seed=args.seed)
+        if ds is None:
+            sys.exit("no training data — run prep_hpc.py for these gauges/months first")
+        Xtr, Ytr, Xva, Yva = ds["Xtr"], ds["Ytr"], ds["Xva"], ds["Yva"]
+        Gva, gauge_ids, stats = ds["Gva"], ds["gauge_ids"], ds["stats"]
+    else:
+        legacy = T.build_dataset(gauges, months, VAL_MONTHS)
+        if legacy is None:
+            sys.exit("no training data — run prep_hpc.py for these gauges/months first")
+        Xtr, Ytr, Xva, Yva, stats = legacy
+        Gva, gauge_ids = np.zeros(len(Xva), "int32"), [g["id"] for g in gauges]
     if not len(Xva):
         sys.exit("no validation windows — early stopping needs the 2025 val months prepped")
     print(f"train {len(Xtr)} / val {len(Xva)} windows")
@@ -129,15 +223,16 @@ def main():
     print("device:", dev,
           torch.cuda.get_device_name(0) if dev.type == "cuda" else "(no GPU — slow)")
 
-    model = DILSTM().to(dev)
+    model = DILSTM(n_feat=n_feat_for(fv), horizon=hor).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    # halve the LR when val NSE stalls — the V19.2 full-gauge run diverged at
-    # a flat 1e-3 after epoch 6 and never recovered its early best
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="max", factor=0.5, patience=20, min_lr=1e-5)
     epoch = 0
     if not args.fresh:
-        ck = T.load_ckpt()
+        ck = T.load_ckpt(name=ckpt_name)
+        if ck and (int(ck.get("feat_version", 1)) != fv
+                   or int(ck.get("horizon", H)) != hor):
+            sys.exit(f"repo checkpoint {ckpt_name} has feat_version="
+                     f"{ck.get('feat_version', 1)} horizon={ck.get('horizon', H)} — "
+                     "mismatch with the requested run; use --fresh or --ckpt-name")
         if ck:
             model.load_state_dict(ck["state_dict"])
             opt.load_state_dict(ck["opt"])
@@ -154,7 +249,7 @@ def main():
 
     # persistence baseline: hold the last-known obs flat over the horizon —
     # the number the DI-LSTM has to beat for the skill to be real
-    pers = np.repeat(itq(Xva[:, -1, 1])[:, None], H, axis=1).ravel()
+    pers = np.repeat(itq(Xva[:, -1, 1])[:, None], hor, axis=1).ravel()
     print(f"persistence baseline val NSE: {nse(pers, yva_real):.4f}")
 
     def val_nse() -> float:
@@ -168,11 +263,11 @@ def main():
 
     def push(ckd, note):
         if args.no_upload:
-            torch.save(ckd, "dilstm_best.pt")
-            print(f"  >> saved dilstm_best.pt ({note})")
+            torch.save(ckd, ckpt_name)
+            print(f"  >> saved {ckpt_name} ({note})")
         else:
-            T.save_ckpt(ckd)
-            print(f"  >> uploaded checkpoint ({note})")
+            T.save_ckpt(ckd, name=ckpt_name)
+            print(f"  >> uploaded {ckpt_name} ({note})")
 
     n, bs = len(Xt), args.batch
     best, best_ck, since_best = -np.inf, None, 0
@@ -193,13 +288,9 @@ def main():
             tot += float(loss.detach()) * len(idx)
         epoch += 1
         v = val_nse()
-        lr_before = opt.param_groups[0]["lr"]
-        sched.step(v)
-        if opt.param_groups[0]["lr"] < lr_before:
-            print(f"epoch {epoch}: LR reduced to {opt.param_groups[0]['lr']:.2e}")
         if v > best + 1e-4:
             best, since_best = v, 0
-            best_ck = cpu_ckpt(model, opt, epoch, stats, v, n)
+            best_ck = cpu_ckpt(model, opt, epoch, stats, v, n, fv, hor)
             print(f"epoch {epoch}: train MSE {tot / n:.5f}, val NSE {v:.4f}  * new best")
         else:
             since_best += 1
@@ -218,6 +309,42 @@ def main():
         push(best_ck, f"final best, epoch {best_ck['epoch']}, val NSE {best:.4f}")
     print(f"done: {epoch} total epochs, best val NSE {best:.4f}, "
           f"{(time.time() - t0) / 60:.1f} min")
+
+    # -- final diagnostics on the BEST weights ---------------------------------
+    if best_ck is not None:
+        model.load_state_dict({k: v.to(dev) for k, v in best_ck["state_dict"].items()})
+    model.eval()
+    rows, diag = per_gauge_table(model, Xva, Yva, Gva, gauge_ids, dev)
+    print(f"\nval pooled NSE: obs-fresh {diag['pooled_nse']:.4f} | "
+          f"no-obs {diag['pooled_nse_noobs']:.4f}")
+    print(f"no-obs peak ratio (pred/true window max): "
+          f"p95 {diag['noobs_peak_ratio_p95']:.2f}, "
+          f"p99 {diag['noobs_peak_ratio_p99']:.2f}   "
+          f"(v1 hallucination shows up here as >>1)")
+    worst = sorted(rows, key=lambda r: (r["val_nse"] if r["val_nse"] == r["val_nse"]
+                                        else -9e9))[:5]
+    for r in worst:
+        print(f"  low-skill gauge {r['gid']}: NSE {r['val_nse']:.3f} "
+              f"(no-obs {r['val_nse_noobs']:.3f}, {r['n_windows']} windows)")
+    if args.mc_eval > 0:
+        mu, sd = mc_predict(model, Xv[:4096], n=args.mc_eval)
+        cv = np.expm1(sd).mean() / max(np.expm1(mu).mean(), 1e-6)
+        print(f"MC-dropout ({args.mc_eval} passes, first 4096 windows): "
+              f"mean log-space std {sd.mean():.4f} (rough CV ~{cv:.3f})")
+    if rows:
+        if args.no_upload:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            pq.write_table(pa.table(
+                {"gid": [r["gid"] for r in rows],
+                 "val_nse": np.array([r["val_nse"] for r in rows], "float32"),
+                 "val_nse_noobs": np.array([r["val_nse_noobs"] for r in rows], "float32"),
+                 "n_windows": np.array([r["n_windows"] for r in rows], "int32")}),
+                skill_name, compression="zstd")
+            print(f">> saved {skill_name} locally")
+        else:
+            upload_skill_table(rows, skill_name)
+            print(f">> uploaded {skill_name} ({len(rows)} gauges)")
 
 
 if __name__ == "__main__":

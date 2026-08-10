@@ -24,7 +24,7 @@ except Exception:                      # local dev fallback
             return fn
         return deco if not (a and callable(a[0])) else a[0]
 
-from model import DILSTM, H, L, build_features, itq
+from model import DILSTM, H, L, build_features, itq, n_feat_for
 import data as D
 import train as T
 
@@ -80,9 +80,11 @@ def _ensure_model():
     global _model, _ck
     with _lock:
         if _model is None:
-            _ck = T.load_ckpt()
+            # v2 (obs-robust) checkpoint preferred; legacy dilstm.pt fallback
+            _ck = T.load_ckpt(name="dilstm_v2.pt") or T.load_ckpt()
             if _ck:
-                _model = DILSTM()
+                _model = DILSTM(n_feat=n_feat_for(int(_ck.get("feat_version", 1))),
+                                horizon=int(_ck.get("horizon", H)))
                 _model.load_state_dict(_ck["state_dict"])
                 _model.eval()
     return _model, _ck
@@ -110,13 +112,15 @@ def nowcast(payload: str) -> str:
             if j >= 0:
                 obs_ff[i] = obs[j][1]
                 age[i] = (t - obs[j][0]).total_seconds() / 3600.0
-        feat = build_features(precip, obs_ff, age, float(req["area_km2"]), ck["stats"])
+        feat = build_features(precip, obs_ff, age, float(req["area_km2"]), ck["stats"],
+                              feat_version=int(ck.get("feat_version", 1)))
         with torch.no_grad():
             y = model(torch.from_numpy(feat[None]).float()).numpy()[0]
         q = np.maximum(itq(y), 0.0)
         return json.dumps({
             "ok": True,
-            "times": [(t0 + timedelta(hours=i + 1)).strftime("%Y-%m-%d %H:%M") for i in range(H)],
+            "times": [(t0 + timedelta(hours=i + 1)).strftime("%Y-%m-%d %H:%M")
+                      for i in range(len(q))],
             "q": [round(float(v), 3) for v in q],
             "model": {"epoch": ck.get("epoch"), "val_nse": ck.get("val_nse"),
                       "when": ck.get("when"), "experimental": True},

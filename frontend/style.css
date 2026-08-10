@@ -20,6 +20,32 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Se
   align-items: center; gap: 6px;
 }
 .tb-btn.on { border-color: #4cc9a0; color: #9fdcc0; }
+/* mode switch: as prominent as the Model-options panel header */
+#mode-seg { display: flex; border: 1px solid #2a3a49; border-radius: 10px; overflow: hidden; }
+#mode-seg .seg {
+  border: none; background: #142230; color: #8fa3b3; cursor: pointer;
+  padding: 9px 18px; font-size: 15px; font-weight: 600;
+}
+#mode-seg .seg.on { background: #1b2a3a; color: #ffd479; }
+#mode-seg #mode-now.on { background: #3a2413; color: #ff9f43; }
+/* nowcast flood-risk legend (bottom-left, above Leaflet attribution) */
+#risk-legend {
+  position: absolute; left: 12px; bottom: calc(var(--chat-h) + 46px); z-index: 640;
+  background: rgba(17,23,31,.92); border: 1px solid #4a2020; border-radius: 8px;
+  color: #f0d9d4; font-size: 12.5px; padding: 7px 11px;
+}
+#risk-legend .dot-red, #risk-legend .dot-orange, #risk-legend .dot-yellow {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  margin-right: 4px;
+}
+#risk-legend .dot-red { background: #ff4030; box-shadow: 0 0 8px #ff4030; }
+#risk-legend .dot-orange { background: #ff7a00; box-shadow: 0 0 6px #ff7a00; }
+#risk-legend .dot-yellow { background: #ffb300; box-shadow: 0 0 6px #ffb300; }
+#risk-legend .risk-rows { display: flex; flex-direction: column; gap: 2px; }
+#risk-legend #risk-count { color: #8fa3b3; display: block; margin-top: 4px; }
+/* gauge-tab close (unselect) button */
+.rp-tab .x { margin-left: 7px; color: #8fa3b3; font-weight: 400; }
+.rp-tab .x:hover { color: #ff6b6b; }
 #auth img { width: 22px; height: 22px; border-radius: 50%; }
 
 .panel {
@@ -29,7 +55,8 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Se
   box-shadow: 0 6px 24px rgba(0,0,0,.45); display: flex; flex-direction: column; overflow: hidden;
 }
 #left-panel { left: 12px; }
-#right-panel { right: 12px; width: 380px; }
+/* narrower bottom reach leaves the bottom-right Leaflet layers control uncovered */
+#right-panel { right: 12px; width: 380px; max-height: calc(100% - var(--chat-h) - 118px); }
 .panel-head {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 10px 12px; font-weight: 600; border-bottom: 1px solid #223; background: rgba(255,255,255,.03);
@@ -38,6 +65,15 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Se
 .panel.collapsed .panel-body, .panel.collapsed #rp-tabs { display: none; }
 .panel.hidden { display: none; }
 .panel-head .toggle, .panel-head .close { background: none; border: none; color: #8fa3b3; cursor: pointer; font-size: 15px; }
+
+/* chip to bring the results panel back after the ✕ closes it */
+#rp-reopen {
+  position: absolute; top: 52px; right: 12px; z-index: 601;
+  border: 1px solid #3a5a7a; background: rgba(27,42,58,.96); color: #ffd479;
+  border-radius: 8px; padding: 7px 12px; font-size: 13px; cursor: pointer;
+  box-shadow: 0 6px 24px rgba(0,0,0,.45);
+}
+#rp-reopen:hover { background: #24425c; }
 
 /* right-panel gauge tabs */
 #rp-tabs { display: flex; gap: 4px; padding: 6px 8px 0; flex-wrap: wrap; border-bottom: 1px solid #223; }
@@ -135,6 +171,8 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
   background: rgba(13,20,28,.85); border: 1px solid #2a3a49; border-radius: 6px;
   color: #9fc3dd; font-size: 14px; line-height: 1; padding: 4px 7px; cursor: pointer; }
 .plot-expand:hover { color: #fff; border-color: #4cc9a0; }
+.plot-tz { right: 32px; font-size: 10px; font-weight: 600; padding: 5px 7px; }
+.hm-zoom button.hm-tz { width: auto; padding: 0 8px; font-size: 11px; font-weight: 600; }
 /* clicked-timestep readout (small panel + modal share the style) */
 .readout { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
 .readout .ro { background: #0d141c; border: 1px solid #223; border-radius: 6px;
@@ -224,6 +262,8 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
   background: rgba(17,23,31,.92); border: 1px solid #223; border-radius: 8px; padding: 8px 10px; color: #cfe0ee;
   width: 160px;
 }
+/* slide right while the Model-options panel is expanded so they never overlap */
+#left-panel:not(.collapsed):not(.hidden) ~ #q-legend { left: 324px; }
 #q-legend .q-title { font-size: 11px; color: #8fa3b3; margin-bottom: 5px; }
 #q-legend .q-bar { height: 10px; border-radius: 4px;
   background: linear-gradient(90deg, #59626c 0%, #7e8a95 14%, #3fae5a 23%, #57c258 36%,
@@ -253,3 +293,14 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
 /* map pins */
 .pin { border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.5); }
 .leaflet-container { background: #0b0f14; }
+
+/* focused-gauge teardrop pin: white stroke reads on dark bases, dark shadow
+   reads on the bright topo base */
+.focus-pin { pointer-events: none; }
+.focus-pin svg { filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .75)); }
+.fp-bounce svg { animation: fpdrop .55s cubic-bezier(.3, .8, .4, 1.15); }
+@keyframes fpdrop {
+  0%   { transform: translateY(-16px); }
+  60%  { transform: translateY(2px); }
+  100% { transform: translateY(0); }
+}

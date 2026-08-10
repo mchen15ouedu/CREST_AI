@@ -81,11 +81,14 @@ class SimJob:
                     timestep=self.opts.get("timestep", "1h"),
                     warmup_days=int(self.opts.get("warmup_days", 90)),
                     scheme=self.opts.get("scheme", "full"),
+                    nowcast_t0=self.opts.get("nowcast_t0"),
                     cancel=self.cancel):
                 if kind == "meta":
                     self.meta[gid] = payload
                 elif kind == "params":
                     self.params[gid] = payload      # effective wb/kw for paramstore
+                    # also to the client: manual tuning pre-fills Model options
+                    self._emit({"kind": "params", "gauge_id": gid, **payload})
                 elif kind == "status":
                     self._emit({"kind": "status", "gauge_id": gid, "msg": payload})
                 elif kind == "hydro":

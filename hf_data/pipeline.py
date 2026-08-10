@@ -218,6 +218,9 @@ def _run_lock(gauge_id: str, model: str) -> threading.Lock:
 
 
 def gauge_info(gauge_id: str):
+    from hf_data import virtualpoints
+    if virtualpoints.is_virtual(gauge_id):        # ungauged pour-point outlet
+        return virtualpoints.info(str(gauge_id))
     df = gauges._catalog()
     sid = str(gauge_id).zfill(8)
     row = df.loc[df.STAID == sid]
@@ -232,7 +235,8 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
               use_mock: bool = True, hours: int = 48, overrides: dict | None = None,
               snow: str = "auto", timestep: str = "1h", warmup_days: int = WARMUP_DAYS,
               grids: bool = True, no_cache: bool = False,
-              workdir: str | None = None, cancel=None, scheme: str = "full"):
+              workdir: str | None = None, cancel=None, scheme: str = "full",
+              nowcast_t0: datetime | None = None):
     """Per-gauge streaming run (map flow: gauge already chosen). Yields events.
     `cancel` (threading.Event) stops the run: the EF5 process is killed and the
     (gauge, model) lock released, so a superseding run can start immediately."""
@@ -245,6 +249,31 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
         model = "crest" if g["lon"] < WEST_LON else "crestphys"
     ef5_model = model                            # MODEL= + EF5 output-file naming
     wb_model = "crest" if model in ("crest", "hp") else "crestphys"  # multiplier source
+    if g.get("virtual"):
+        if scheme != "speed":
+            # an ungauged point has no observations: injecting upstream USGS obs
+            # and simulating only the incremental area is the whole design —
+            # full-basin runs of a big ungauged outlet would also be uncacheable-slow
+            scheme = "speed"
+            yield ("status", "🛰 ungauged point — speed scheme forced: upstream USGS "
+                             "gauges (where present) feed the run as boundary inflow")
+        if warmup_days > 10:
+            # upstream injection carries the main river, so only the small
+            # incremental area needs spin-up — and with no observations to
+            # compare against, a long warm-up buys nothing
+            warmup_days = 10
+            yield ("status", "🕐 ungauged point — warm-up shortened to 10 days "
+                             "(injected upstream flow carries the river)")
+    if nowcast_t0:
+        # the future half of a nowcast window carries injected/zero-precip values
+        # that must never be written into the shared row cache (a later hindcast
+        # of the same window would be served the fabricated future); warm-start
+        # from saved state is still allowed. Hydrograph only — no 2-D maps —
+        # EXCEPT event runs, which pass an explicit output_grids token string
+        # (streamflow|runoff|subrunoff) to feed the CREST-iMAP v2 solver.
+        no_cache = True
+        if not isinstance(grids, str):
+            grids = False
     yield ("meta", {**g, "model": model})        # for the report + right panel
 
     lock = _run_lock(g["id"], ef5_model)
@@ -260,15 +289,21 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
         yield from _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end,
                                    use_mock, overrides, snow, timestep,
                                    warmup_days, grids, no_cache, workdir, cancel,
-                                   scheme)
+                                   scheme, nowcast_t0)
     finally:
         lock.release()
 
 
 def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                     overrides, snow, timestep, warmup_days, grids, no_cache, workdir,
-                    cancel=None, scheme="full"):
-    """The actual per-gauge run — called with the (gauge, model) lock held."""
+                    cancel=None, scheme="full", nowcast_t0=None):
+    """The actual per-gauge run — called with the (gauge, model) lock held.
+
+    nowcast_t0 (UTC): route a NOWCAST at an ungauged point. The window runs to
+    t0 + horizon; each upstream cut gauge is injected with observed flow up to
+    t0 and its DI-LSTM prediction beyond t0, and forcing stops at t0 (EF5 reads
+    a missing precip grid as zero, so the future is driven by routed upstream
+    inflow, not new rain)."""
     work = workdir or tempfile.mkdtemp(prefix=f"crest_{g['id']}_")
     out_dir = os.path.join(work, "CREST_output")
     bbox = basin_bbox(g)
@@ -336,18 +371,35 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                 qualified = []
                 bc_dir = os.path.join(work, "USGS_bc")
                 f0_est = t_start - timedelta(days=warmup_days)
+                # nowcast: coverage is judged on the OBSERVED past only; the
+                # future window is filled by each gauge's own DI-LSTM nowcast
+                cov_end = nowcast_t0 or t_end
                 for b_ in bc_gauges:
                     try:
-                        s = obs.get_series(b_["id"], f0_est, t_end)
+                        s = obs.get_series(b_["id"], f0_est, cov_end)
                     except Exception as e:        # gauge silently loses its BC role
                         from hf_data import crashlog
                         crashlog.capture("obs:bc", e, gauge=b_["id"])
                         s = []
-                    cov = _obs_coverage(s, f0_est, t_end) if s else 0.0
+                    cov = _obs_coverage(s, f0_est, cov_end) if s else 0.0
+                    nc_pts = 0
+                    if nowcast_t0 and (p_ok := cov >= BC_MIN_COVER):
+                        # inject this upstream gauge's prediction as future inflow
+                        from hf_data import nowcaststore
+                        ns = [(t, q) for t, q in nowcaststore.nowcast_series(b_["id"])
+                              if t > nowcast_t0]
+                        s = list(s) + ns
+                        nc_pts = len(ns)
                     p = obs.write_ef5_obs(b_["id"], s, bc_dir) if s else None
                     if p and cov >= BC_MIN_COVER:
                         bc_obs[b_["id"]] = (s, p)
                         qualified.append(b_)
+                        if nowcast_t0:
+                            yield ("status", f"🔮 upstream gauge {b_['id']}: "
+                                             f"{nc_pts} h of DI-LSTM nowcast appended "
+                                             "as future inflow" if nc_pts else
+                                             f"⚠️ upstream gauge {b_['id']}: no nowcast "
+                                             "available — future inflow held at last obs")
                     else:
                         yield ("status", f"gauge {b_['id']}: obs coverage {cov:.0%} "
                                          f"< {BC_MIN_COVER:.0%} — its area stays simulated")
@@ -380,6 +432,15 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         yield ("status", "⏹ stopped")
         yield ("done", {"returncode": -9, "cancelled": True})
         return
+
+    if timestep == "1h" and not no_cache and not use_mock and not g.get("virtual"):
+        try:      # fleet pre-runs (read-only repo): rows serve instantly below,
+            from hf_data import fleetstore     # states give 10-day warm starts
+            if fleetstore.ensure_local(g["id"], cache_model) == "fetched":
+                yield ("status", "🚚 pre-simulated by the background fleet — "
+                                 "loading saved results and model states")
+        except Exception:
+            pass
 
     # --- result cache: reuse overlap, simulate only the missing window (task #6) ---
     # the row cache is hourly; a sub-hourly run neither reuses nor writes it
@@ -414,7 +475,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     if pl["run_start"] is None:                       # fully cached -> no simulation
         # no wb/kw here on purpose: the frames-cache key must be scheme-aware,
         # but an empty param set must never reach the param store
-        yield ("params", {"model": ef5_model, "cache_model": cache_model})
+        yield ("params", {"model": ef5_model, "cache_model": cache_model,
+                          "n_upstream": len(bc_gauges)})
         yield ("status", "✓ served entirely from cache")
         yield ("done", {"returncode": 0, "cached": True,
                         "window": [t_start.strftime(statecache.TS_FMT),
@@ -426,6 +488,16 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                      f"{run_end:%Y-%m-%d %H:%M} ({run_hours} h @ {timestep})")
 
     wbkw = multipliers.to_control_params(g["id"], model=wb_model)
+    if wbkw is None and g.get("virtual"):
+        # ungauged point: borrow the nearest calibrated gauge's multiplier set
+        # (spatial-proximity regionalization — calibration here is impossible)
+        near = multipliers.nearest_station(g["lat"], g["lon"])
+        if near:
+            wbkw = multipliers.to_control_params(near[0], model=wb_model)
+            if wbkw:
+                yield ("status", f"🧭 ungauged point — borrowing calibrated "
+                                 f"parameters from the nearest gauge "
+                                 f"{near[0]} ({near[1]:.0f} km away)")
     if wbkw is None:
         yield ("status", "⚠️ no calibrated params for this gauge")
         yield ("done", {"returncode": -1})
@@ -446,6 +518,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         kw = {**kw, **{k: v for k, v in overrides.items() if k in kw}}
     yield ("params", {"wb": wb, "kw": kw, "model": ef5_model,
                       "cache_model": cache_model,      # frames-cache key (scheme-aware)
+                      "n_upstream": len(bc_gauges),    # 0 => headwater (no injection possible)
                       "source": ("override" if overrides else
                                  stored.get("source", "stored") if stored else "a-priori")})
     pgrids = params.clip_param_grids(bbox, param_dir)
@@ -499,7 +572,10 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         yield ("status", f"warm start from exact saved state @ {pl['load_state_time']:%Y-%m-%d %H:%M}")
 
     usgs_dir = ""
-    if not use_mock:                                  # real run: USGS observed discharge -> OBS=
+    if not use_mock and g.get("virtual"):
+        yield ("status", "🛰 no observations exist at an ungauged point — the "
+                         "hydrograph shows simulation only (no NSE)")
+    elif not use_mock:                                # real run: USGS observed discharge -> OBS=
         usgs_dir = os.path.join(work, "USGS")
         try:
             oinf: dict = {}
@@ -596,10 +672,17 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
 
     if not use_mock:                                  # real run: forcing over the full span
         f0 = warmup_start or run_start
-        n_days = max(1, int((run_end - f0).total_seconds() // 86400))
+        # nowcast: forcing exists only up to t0; the future window is left
+        # ungridded so EF5 reads zero precip there (the routed upstream inflow,
+        # not new rain, drives the forecast) — and prepare_forcing never has to
+        # reach into a not-yet-archived future month
+        force_end = min(run_end, nowcast_t0) if nowcast_t0 else run_end
+        n_days = max(1, int((force_end - f0).total_seconds() // 86400))
         yield ("status", f"🌧 preparing rainfall (MRMS) forcing from the archive — "
-                         f"{n_days} day(s) incl. warm-up…")
-        fr = forcing.prepare_forcing("mrms", bbox, f0, run_end, mrms_dir, cancel=cancel)
+                         f"{n_days} day(s) incl. warm-up…"
+                         + (" (future window unforced → routed inflow only)"
+                            if nowcast_t0 else ""))
+        fr = forcing.prepare_forcing("mrms", bbox, f0, force_end, mrms_dir, cancel=cancel)
         if fr.reused:
             yield ("status", f"♻️ forcing store: reused {fr.reused} MRMS timestep(s), "
                              f"prepared {len(fr.written)} new")
@@ -608,10 +691,10 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             yield ("done", {"returncode": -9, "cancelled": True})
             return
         yield ("status", "🌡 preparing PET forcing…")
-        forcing.prepare_forcing("pet", bbox, f0, run_end, pet_dir, cancel=cancel)
+        forcing.prepare_forcing("pet", bbox, f0, force_end, pet_dir, cancel=cancel)
         if snow_on and not _stopped():
             yield ("status", "❄ preparing temperature forcing (snow module)…")
-            forcing.prepare_forcing("temp", bbox, f0, run_end, temp_dir, cancel=cancel)
+            forcing.prepare_forcing("temp", bbox, f0, force_end, temp_dir, cancel=cancel)
         if _stopped():
             yield ("status", "⏹ stopped")
             yield ("done", {"returncode": -9, "cancelled": True})
@@ -649,7 +732,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     if use_mock:
         handle = MockEF5(out_dir, gauge_id=g["id"], model=ef5_model, bounds=bbox,
                          n_steps=run_hours + 1, t0=run_start, delay=0.15,   # inclusive of run_end
-                         write_grids=grids,
+                         write_grids=grids, has_obs=not g.get("virtual"),
                          facc_path=os.path.join(grid_dir, "facc_clip.tif")).start()
     else:
         handle = run_ef5(spec.control_path, out_dir, g["id"], model=ef5_model)
@@ -666,9 +749,13 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             try:
                 with open(os.path.join(out_dir, "ef5_run.log"),
                           encoding="utf-8", errors="replace") as fh:
-                    tail = fh.read()[-2500:]
-                yield ("status", f"⚠️ EF5 rc={ev['returncode']}, "
-                                 f"{len(new_rows)} new rows — log tail:\n{tail}")
+                    tail = fh.read()[-2000:]
+                # list what EF5 actually wrote — a name/case mismatch shows here
+                produced = sorted(os.path.basename(p) for p in
+                                  glob.glob(os.path.join(out_dir, "ts.*.csv")))
+                yield ("status", f"⚠️ EF5 rc={ev['returncode']}, {len(new_rows)} new "
+                                 f"rows; expected {os.path.basename(handle.ts_path)}; "
+                                 f"wrote {produced or '[no ts.*.csv]'} — log tail:\n{tail}")
             except Exception:
                 pass
         yield (ev["kind"], ev)

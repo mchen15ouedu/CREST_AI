@@ -24,6 +24,7 @@ huggingface_hub
 pyarrow
 truststore
 pysheds                # fallback: derive flow dir/acc from the clipped DEM
+baseflow               # Eckhardt separation: 2-D color-scale anchor + nowcast thresholds
 
 # --- Utilities ---
 tqdm

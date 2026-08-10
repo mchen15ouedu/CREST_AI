@@ -29,8 +29,9 @@ import data as D
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gauges", default=DEFAULT_GAUGES)
-    ap.add_argument("--gauges-file", default=None,
-                    help="file of gauge IDs (comma/newline separated); overrides --gauges")
+    ap.add_argument("--gauges-file", default="",
+                    help="file with gauge ids (comma/newline separated); "
+                         "overrides --gauges. See select_gauges.py")
     ap.add_argument("--months", default=DEFAULT_MONTHS,
                     help="YYYY_MM-YYYY_MM (remember the 2025 val months too)")
     args = ap.parse_args()
@@ -38,9 +39,11 @@ def main():
     if not os.environ.get("HF_TOKEN"):
         sys.exit("HF_TOKEN env var not set")
 
+    gauge_spec = args.gauges
     if args.gauges_file:
-        args.gauges = open(args.gauges_file).read().replace("\n", ",")
-    gauges = gauge_meta(args.gauges)
+        raw = open(args.gauges_file).read()
+        gauge_spec = ",".join(s for s in raw.replace("\n", ",").split(",") if s.strip())
+    gauges = gauge_meta(gauge_spec)
     if not gauges:
         sys.exit("no valid gauges")
     months = months_range(args.months)

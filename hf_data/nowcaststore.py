@@ -1,0 +1,388 @@
+"""Precomputed fleet nowcasts — read side of scripts/run_nowcast_all.py.
+
+The updater Space refreshes nowcast/latest.parquet in vincewin/CREST_data
+hourly (DI-LSTM hourly predictions q1..qN — currently N=12 — for every CONUS
+GAGES-II gauge, issue time t0 = newest MRMS Pass1 hour). This module serves
+it to the dashboard with a short in-process TTL cache; hf_hub_download's
+etag check makes the refresh a cheap no-op until the Space actually uploads
+a new file. Risk tiers (pins/heatmap) stay on the FIRST RISK_H hours so the
+map coloring is unchanged as the model horizon grows.
+"""
+from __future__ import annotations
+
+import os
+import threading
+import time
+from datetime import datetime, timedelta
+
+import numpy as np
+
+REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")
+TTL_S = 240
+RISK_H = 6           # tier window: pins/heatmap use the first 6 forecast hours
+
+
+def _qcols(cols) -> list:
+    """Ordered 6-h-model columns q1..qN (risk basis) in latest.parquet."""
+    return sorted((n for n in cols if n[0] == "q" and n[1:].isdigit()),
+                  key=lambda n: int(n[1:]))
+
+
+def _q12cols(cols) -> list:
+    """Ordered 12-h-model columns q12_1..q12_N (hydrograph-only, own trace)."""
+    return sorted((n for n in cols if n.startswith("q12_") and n[4:].isdigit()),
+                  key=lambda n: int(n[4:]))
+
+_lock = threading.Lock()
+_cache: dict = {"at": 0.0, "meta": None, "cols": None}
+_thr: dict = {"at": 0.0, "map": None}     # gid -> Q10 (m3/s); static file
+THR_TTL_S = 3600
+
+
+def _load():
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    p = hf_hub_download(REPO, "nowcast/latest.parquet", repo_type="dataset",
+                        token=os.environ.get("HF_TOKEN"))
+    t = pq.read_table(p)
+    meta = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()
+            if not k.startswith(b"ARROW")}
+    cols = {name: t.column(name).to_numpy(zero_copy_only=False)
+            for name in t.schema.names}
+    return meta, cols
+
+
+def _fresh():
+    now = time.time()
+    with _lock:
+        if _cache["cols"] is not None and now - _cache["at"] < TTL_S:
+            return _cache["meta"], _cache["cols"]
+    try:
+        meta, cols = _load()
+        with _lock:
+            _cache.update(at=now, meta=meta, cols=cols)
+        return meta, cols
+    except Exception:
+        with _lock:                      # serve stale rather than nothing
+            return _cache["meta"], _cache["cols"]
+
+
+BASE_RISE = 5.0                    # yellow tier: predicted >= 5 x baseflow
+NOISE_Q = 0.5                      # m3/s floor — below this nothing is flagged
+
+
+def _thresholds() -> dict:
+    """Per-gauge thresholds {gid: (qbase, q2, q5, q10)} — NaN where unknown.
+    From scripts/compute_flood_thresholds.py (annual-peak LP3 + 3-yr median)."""
+    now = time.time()
+    with _lock:
+        if _thr["map"] is not None and now - _thr["at"] < THR_TTL_S:
+            return _thr["map"]
+    try:
+        import pyarrow.parquet as pq
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(REPO, "nowcast/flood_thresholds.parquet",
+                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
+        t = pq.read_table(p)
+        names = set(t.schema.names)
+
+        def col(n):
+            return (t.column(n).to_numpy(zero_copy_only=False) if n in names
+                    else np.full(len(t), np.nan, "float32"))
+        m = {}
+        q2, q5, q10, qb = col("q2_cms"), col("q5_cms"), col("q10_cms"), col("qbase_cms")
+        for g, b, a2, a5, a10 in zip(t.column("gid").to_pylist(), qb, q2, q5, q10):
+            m[g] = (float(b), float(a2), float(a5), float(a10))
+        with _lock:
+            _thr.update(at=now, map=m)
+        return m
+    except Exception:
+        with _lock:
+            return _thr["map"] or {}
+
+
+OBS_AGE_MAX_H = float(os.environ.get("RISK_OBS_AGE_MAX_H", "6"))
+OBS_GATE_FRAC = float(os.environ.get("RISK_OBS_GATE_FRAC", "0.3"))
+# per-gauge skill gate: once the precompute joins the v2 model's per-gauge
+# validation NSE (val_nse_gauge column, from the HPC skill table), a flood
+# tier at a gauge the model demonstrably cannot predict (val NSE below this)
+# demotes to 1. Default 0.0 = gate only negative-skill gauges; raise to be
+# stricter. Gauges absent from the table (NaN) are never skill-gated.
+MIN_GAUGE_NSE = float(os.environ.get("RISK_MIN_GAUGE_NSE", "0.0"))
+
+
+def _gate_tier(tr: int, age_h: float, last_q: float, thr: tuple) -> int:
+    """Tier-1 hallucination gates: a flood tier (2/3) must be backed by a
+    REPORTING gauge whose observed flow is already responding.
+
+    The DI-LSTM integrates the latest observation; fed a stale/absent one it
+    extrapolates freely (live false alarms 2026-08-10: tier-3 flags at
+    data-dead gauges with ~0 simulated flow). A red/orange claim therefore
+    requires: last obs within OBS_AGE_MAX_H, and observed flow already >=
+    OBS_GATE_FRAC x Q2 (bankfull fraction). Unsupported flood tiers demote
+    to 1 ("elevated" hint) rather than vanishing entirely.
+    """
+    if tr < 2:
+        return tr
+    if not (age_h == age_h) or age_h > OBS_AGE_MAX_H:
+        return 1
+    q2 = thr[1]
+    gate = max(OBS_GATE_FRAC * q2, NOISE_Q) if q2 == q2 else NOISE_Q
+    if not (last_q == last_q) or last_q < gate:
+        return 1
+    return tr
+
+
+def _tier(qmax: float, thr: tuple) -> int:
+    """0 quiet · 1 elevated · 2 minor flood (>= Q2) · 3 flood (>= Q5).
+
+    Elevated needs BOTH >= BASE_RISE x baseflow AND >= 10% of bankfull (Q2):
+    arid/intermittent rivers have p25 baseflow near zero, so a bare multiple
+    would flag them yellow at a trickle. Sub-NOISE_Q flows never flag."""
+    qb, q2, q5, _ = thr
+    if qmax < NOISE_Q:
+        return 0
+    if np.isfinite(q5) and q5 >= NOISE_Q and qmax >= q5:
+        return 3
+    if np.isfinite(q2) and q2 >= NOISE_Q and qmax >= q2:
+        return 2
+    if np.isfinite(qb):
+        thr_y = max(BASE_RISE * qb, NOISE_Q)
+        if np.isfinite(q2):
+            thr_y = max(thr_y, 0.10 * q2)
+        if qmax >= thr_y:
+            return 1
+    return 0
+
+
+def all_risk() -> dict:
+    """CONUS-wide tiered risk: next-6-h AI peak vs baseflow / Q2 / Q5.
+
+    Feeds the Nowcast-mode map: `flagged` [[lat, lon, tier, gid], ...] draws
+    the density layers; `tiers` {gid: tier} colors the pins when zoomed in."""
+    meta, cols = _fresh()
+    if cols is None:
+        return {"ok": False, "reason": "no precomputed nowcast available yet"}
+    thr = _thresholds()
+    if not thr:
+        return {"ok": False, "reason": "no flood thresholds computed yet"}
+    qmax = np.max(np.stack([cols[n] for n in _qcols(cols)[:RISK_H]], 1), 1)
+    has_obs = "obs_age_h" in cols and "obs_last_q" in cols
+    has_skill = "val_nse_gauge" in cols
+    tiers, flagged = {}, []
+    counts = [0, 0, 0]
+    n_gated = 0
+    n_skill_gated = 0
+    for i in range(len(cols["gid"])):
+        gid = str(cols["gid"][i])
+        th = thr.get(gid)
+        if th is None:
+            continue
+        tr = _tier(float(qmax[i]), th)
+        if has_obs and tr >= 2:
+            gated = _gate_tier(tr, float(cols["obs_age_h"][i]),
+                               float(cols["obs_last_q"][i]), th)
+            if gated != tr:
+                n_gated += 1
+                tr = gated
+        if has_skill and tr >= 2:
+            vn = float(cols["val_nse_gauge"][i])
+            if vn == vn and vn < MIN_GAUGE_NSE:
+                n_skill_gated += 1
+                tr = 1
+        tiers[gid] = tr
+        if tr > 0:
+            counts[tr - 1] += 1
+            flagged.append([round(float(cols["lat"][i]), 4),
+                            round(float(cols["lon"][i]), 4), tr, gid])
+    return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
+            "n_elevated": counts[0], "n_minor": counts[1], "n_flood": counts[2],
+            "n_rated": len(tiers), "n_obs_gated": n_gated,
+            "obs_gated": has_obs, "n_skill_gated": n_skill_gated,
+            "skill_gated": has_skill, "flagged": flagged, "tiers": tiers}
+
+
+_hs: dict = {"t0": None, "val": None}
+_HS_W = {3: 9.0, 2: 3.0, 1: 1.0}       # tier weights for hotspot scoring
+_HS_CELL = 1.5                          # clustering grid (degrees)
+
+
+def hotspots(max_n: int | None = None) -> dict:
+    """Spatial clusters of flagged gauges, best first — lets the chat agent
+    answer "bring me to the flood risk hotspot" with no location given.
+
+    Greedy grid clustering: flagged gauges binned into 1.5-deg cells, the
+    best-scoring cell plus its 8 neighbours form one hotspot, repeat until the
+    cells are exhausted — the count is DYNAMIC (zero on a calm day, dozens in
+    a national outbreak; noise filter below drops lone-yellow specks). Cached
+    per issue time (all_risk already TTL-caches the underlying data)."""
+    r = all_risk()
+    if not r.get("ok"):
+        return {"ok": False, "reason": r.get("reason")}
+    with _lock:
+        if _hs["val"] is not None and _hs["t0"] == r.get("t0"):
+            return _hs["val"]
+    cells: dict = {}
+    for lat, lon, tier, gid in r["flagged"]:
+        cells.setdefault((int(lat // _HS_CELL), int(lon // _HS_CELL)),
+                         []).append((lat, lon, tier, gid))
+
+    def _score(ms):
+        return sum(_HS_W[m[2]] for m in ms)
+
+    used, out = set(), []
+    while max_n is None or len(out) < max_n:
+        best, bs = None, 0.0
+        for k, ms in cells.items():
+            if k not in used and _score(ms) > bs:
+                best, bs = k, _score(ms)
+        if best is None:
+            break
+        members = []
+        for di in (-1, 0, 1):                   # merge the 3x3 neighbourhood
+            for dj in (-1, 0, 1):
+                k2 = (best[0] + di, best[1] + dj)
+                if k2 in cells and k2 not in used:
+                    members += cells[k2]
+                    used.add(k2)
+        lats = [m[0] for m in members]
+        lons = [m[1] for m in members]
+        counts = [0, 0, 0]
+        for m in members:
+            counts[m[2] - 1] += 1
+        top = sorted(members, key=lambda m: -_HS_W[m[2]])[:5]
+        pad = 0.3
+        out.append({
+            "center": [round(float(np.mean(lats)), 3),
+                       round(float(np.mean(lons)), 3)],
+            "bbox": [round(min(lons) - pad, 3), round(min(lats) - pad, 3),
+                     round(max(lons) + pad, 3), round(max(lats) + pad, 3)],
+            "score": round(_score(members), 1), "n_gauges": len(members),
+            "n_flood": counts[2], "n_minor": counts[1], "n_elevated": counts[0],
+            "top_gauges": [{"id": m[3], "lat": m[0], "lon": m[1], "tier": m[2]}
+                           for m in top],
+        })
+    # a lone yellow gauge is noise, not a hotspot; one red/orange still counts
+    out = [h for h in out if h["score"] >= 3.0 or h["n_gauges"] >= 2]
+    out.sort(key=lambda h: -h["score"])   # greedy seeds by cell, rank by cluster
+    val = {"ok": True, "t0": r.get("t0"), "n_hotspots": len(out),
+           "hotspots": out}
+    with _lock:
+        _hs.update(t0=r.get("t0"), val=val)
+    return val
+
+
+def issue_t0() -> datetime | None:
+    """Issue time of the current precomputed nowcast (UTC), or None."""
+    meta, cols = _fresh()
+    if cols is None:
+        return None
+    try:
+        return datetime.strptime(meta.get("t0", ""), "%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return None
+
+
+def nowcast_series(gid: str) -> list[tuple[datetime, float]]:
+    """A single gauge's DI-LSTM prediction as [(datetime, cms), ...] starting
+    t0+1h — the future inflow injected at an upstream cut gauge when routing a
+    nowcast to an ungauged downstream point. Uses the 12-h model columns
+    (q12_1..q12_N); falls back to the 6-h columns. Empty if the gauge has no
+    precomputed nowcast (e.g. outside CONUS radar coverage)."""
+    meta, cols = _fresh()
+    if cols is None:
+        return []
+    t0 = issue_t0()
+    if t0 is None:
+        return []
+    sid = str(gid).zfill(8)
+    idx = np.nonzero(cols["gid"] == sid)[0]
+    if len(idx) == 0:
+        return []
+    i = int(idx[0])
+    qn = _q12cols(cols) or _qcols(cols)
+    out = []
+    for k, name in enumerate(qn):
+        v = float(cols[name][i])
+        if np.isfinite(v):
+            out.append((t0 + timedelta(hours=k + 1), max(0.0, v)))
+    return out
+
+
+def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
+             obs_hours: int = 0, ids: str = "") -> dict:
+    """Nowcasts for every gauge inside the bbox (largest basins first), or —
+    when `ids` (comma list) is given — exactly those gauges, bbox ignored.
+
+    obs_hours > 0 additionally attaches each gauge's recent observed series
+    (store-first via hf_data.obs, live NWIS fills the tail) so the frontend
+    can plot context + prediction in one request — only honored for <= 25
+    gauges to keep the response fast."""
+    meta, cols = _fresh()
+    if cols is None:
+        return {"ok": False, "reason": "no precomputed nowcast available yet"}
+    if ids:
+        want = [s2.strip().zfill(8) for s2 in ids.split(",") if s2.strip()]
+        m = np.isin(cols["gid"], want)
+    else:
+        m = ((cols["lon"] >= w) & (cols["lon"] <= e)
+             & (cols["lat"] >= s) & (cols["lat"] <= n))
+    idx = np.nonzero(m)[0]
+    total = int(len(idx))
+    idx = idx[np.argsort(-cols["area_km2"][idx])][:max(1, limit)]
+    from hf_data.gaugetz import tz_of as _tz
+    qs = _qcols(cols)
+    q12s = _q12cols(cols)
+    try:
+        t0 = datetime.strptime(meta.get("t0", ""), "%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        t0 = None
+    times = ([(t0 + timedelta(hours=k + 1)).strftime("%Y-%m-%d %H:%M")
+              for k in range(max(len(qs), len(q12s)))] if t0 else [])
+    thr = _thresholds()
+    gauges = []
+    for i in idx:
+        q = [round(float(cols[n][i]), 3) for n in qs]
+        q12 = [round(float(cols[n][i]), 3) for n in q12s]
+        age = float(cols["obs_age_h"][i])
+        lq = float(cols["obs_last_q"][i])
+        gid = str(cols["gid"][i])
+        th = thr.get(gid)
+
+        def _f(v):
+            return round(v, 2) if th is not None and np.isfinite(v) else None
+        gauges.append({
+            "id": gid, "lat": round(float(cols["lat"][i]), 5),
+            "lon": round(float(cols["lon"][i]), 5),
+            "area_km2": round(float(cols["area_km2"][i]), 1),
+            "q": q, "q12": q12 or None, "tz": _tz(gid),
+            "qbase": _f(th[0]) if th else None, "q2": _f(th[1]) if th else None,
+            "q5": _f(th[2]) if th else None, "q10": _f(th[3]) if th else None,
+            "tier": _tier(max(q[:RISK_H]), th) if th else 0,
+            "obs_last_time": str(cols["obs_last_time"][i]) or None,
+            "obs_last_q": None if np.isnan(lq) else round(lq, 3),
+            "obs_age_h": None if age >= 999 else round(age, 1),
+        })
+    if obs_hours > 0 and len(gauges) <= 25:
+        from concurrent.futures import ThreadPoolExecutor
+        from hf_data import obs as _obs
+        end = datetime.utcnow()
+        start = end - timedelta(hours=min(obs_hours, 168))
+
+        def _series(g):
+            try:
+                rows = _obs.get_series(g["id"], start, end)   # already windowed
+                step = max(1, len(rows) // 800)               # bound payload, keep
+                rows = rows[::step] if step > 1 else rows     # the full time span
+                g["obs"] = [[t.strftime("%Y-%m-%d %H:%M"), round(q, 3)]
+                            for t, q in rows]
+            except Exception:
+                g["obs"] = []
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_series, gauges))
+    return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
+            "times": times, "n_in_view": total, "truncated": total > len(gauges),
+            "model": {"epoch": meta.get("model_epoch"),
+                      "val_nse": meta.get("model_val_nse"),
+                      "when": meta.get("model_when"), "experimental": True},
+            "gauges": gauges}

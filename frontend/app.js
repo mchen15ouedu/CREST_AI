@@ -26,7 +26,45 @@ window.addEventListener("unhandledrejection", (e) =>
       ((e.reason && (e.reason.message || e.reason)) || "?"),
     "", 0, e.reason && e.reason.stack));
 
+// ---- safe storage ------------------------------------------------------
+// localStorage throws SecurityError when storage is partitioned/blocked (e.g.
+// the Space embedded in an iframe, or third-party storage disabled). Touching
+// it unguarded at load halts the whole script. Wrap it so a blocked store
+// degrades to an in-memory fallback instead of breaking the app. (client:js
+// crashlog 2026-07-25: "Access is denied for this document." at app.js:86)
+const safeStore = (() => {
+  let ls = null;
+  try { ls = window.localStorage; ls.getItem("__probe__"); } catch (e) { ls = null; }
+  const mem = {};
+  return {
+    getItem(k) {
+      try { return ls ? ls.getItem(k) : (k in mem ? mem[k] : null); }
+      catch (e) { return k in mem ? mem[k] : null; }
+    },
+    setItem(k, v) {
+      try { if (ls) ls.setItem(k, v); else mem[k] = String(v); }
+      catch (e) { mem[k] = String(v); }
+    },
+    removeItem(k) {
+      try { if (ls) ls.removeItem(k); else delete mem[k]; }
+      catch (e) { delete mem[k]; }
+    },
+  };
+})();
+
 // ---- map ---------------------------------------------------------------
+// Both CDNs down/blocked -> L is still missing here. Show a banner instead of
+// dying on a raw ReferenceError with a blank page. (client:js crashlog
+// 2026-08-04: "L is not defined" at app.js:56 — unpkg unreachable for a user)
+if (typeof L === "undefined") {
+  reportClientError("Leaflet failed to load from both CDNs", "app.js", 0, "");
+  document.body.insertAdjacentHTML("beforeend",
+    '<div style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;' +
+    'justify-content:center;background:#111;color:#eee;font:16px sans-serif;text-align:center;padding:2em">' +
+    'The map library could not be loaded (CDN unreachable — a firewall or ad-blocker ' +
+    'may be blocking unpkg.com / jsdelivr.net).<br/>Please check your connection and reload.</div>');
+  throw new Error("Leaflet missing — app init aborted");
+}
 const esriImg = L.tileLayer(
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
   { attribution: "Imagery © Esri", maxZoom: 19 });
@@ -41,8 +79,10 @@ const map = L.map("map", { zoomControl: true, layers: [esriTopo] }).setView([39,
 map.createPane("q2d");
 map.getPane("q2d").style.zIndex = 450;
 const q2dGroup = L.layerGroup().addTo(map);      // toggleable in the layers control
+// bottom-right keeps it clear of the right results panel (which owns the top-right
+// edge and used to cover this control — test-user feedback 2026-07-17)
 L.control.layers({ "Topographic": esriTopo, "Satellite": esriImg, "Dark": osm },
-  { "2-D streamflow": q2dGroup }, { position: "topright" }).addTo(map);
+  { "2-D streamflow": q2dGroup }, { position: "bottomright" }).addTo(map);
 
 // ---- state -------------------------------------------------------------
 const gaugeMarkers = {};          // id -> marker
@@ -50,6 +90,9 @@ const gaugeData = {};             // id -> {id,name,lat,lon,area_km2}
 const selected = new Set();
 let eventLayer = L.layerGroup().addTo(map);
 let gaugeLayer = L.layerGroup().addTo(map);
+// virtual points (ungauged HydroBASINS outlets) — hindcast-only layer:
+// simulated with upstream-gauge injection, no observations, no nowcast
+let vpLayer = L.layerGroup().addTo(map);
 let MAX_SIMS = 10;
 
 let queryCtx = null;              // {t_start, t_end, bbox, label}  (AI-defined window)
@@ -78,7 +121,11 @@ let animIdx = 0;
 let animTimer = null;
 
 // AI info mode (default ON, persisted)
-let aiInfo = localStorage.getItem("aiInfo") !== "off";
+let aiInfo = safeStore.getItem("aiInfo") !== "off";
+
+// nowcast-mode state lives here (var: gaugeStyle runs before the nowcast block)
+var nowcastMode = false;
+var riskData = null;              // /api/nowcast_risk {ratios, flood, n_flood, t0}
 
 // ---- drawing (rectangle select) ----------------------------------------
 const drawn = new L.FeatureGroup().addTo(map);
@@ -95,6 +142,7 @@ map.on(L.Draw.Event.CREATED, (e) => {
     if (b.contains([g.lat, g.lon])) selected.add(g.id);
   });
   refreshSelection();
+  if (nowcastMode) scheduleNowcast();
 });
 
 // ---- chat --------------------------------------------------------------
@@ -175,6 +223,10 @@ function updateMapMode() {
   const showPins = zoomedIn || !!queryCtx;
   if (showPins) { if (!map.hasLayer(gaugeLayer)) gaugeLayer.addTo(map); }
   else if (map.hasLayer(gaugeLayer)) map.removeLayer(gaugeLayer);
+  // virtual points show in both modes now: hindcast simulates them, nowcast
+  // routes upstream flow to them on click
+  if (showPins) { if (!map.hasLayer(vpLayer)) vpLayer.addTo(map); }
+  else if (map.hasLayer(vpLayer)) map.removeLayer(vpLayer);
 }
 
 // ---- map-first gauge pins (no AI needed) --------------------------------
@@ -188,17 +240,50 @@ async function loadViewportGauges() {
     const d = await r.json();
     MAX_SIMS = d.max_sims || MAX_SIMS;
     let pins = d.gauge_pins || [];
-    if (huc8Layer) {                          // only gauges inside visible HUC8s
+    let vps = d.vp_pins || [];
+    // hindcast: only gauges inside visible HUC8s (simulable basins);
+    // nowcast: every CONUS gauge has a precomputed prediction — no clip
+    if (huc8Layer && !nowcastMode) {
       const vis = visibleHucLayers();
-      pins = pins.filter((g) => vis.some((l) =>
-        l.getBounds().contains([g.lat, g.lon]) && pipGeom(l.feature.geometry, g.lat, g.lon)));
+      const inHuc = (g) => vis.some((l) =>
+        l.getBounds().contains([g.lat, g.lon]) && pipGeom(l.feature.geometry, g.lat, g.lon));
+      pins = pins.filter(inHuc);
+      vps = vps.filter(inHuc);
     }
     addGaugePins(pins);
+    addVpPins(vps);
+    pruneMarkers();                 // bound live marker count (browser RAM)
   } catch (_) { /* offline / transient */ }
+}
+
+// Panning across CONUS accumulates markers unboundedly (~9k gauges + ~2.7k
+// ungauged points), each a live Leaflet object — that climbs browser RAM until
+// the tab janks. Cap the live set to the markers nearest the current view,
+// never dropping ones the user is working with (selected / open panel / has
+// results). Pruned markers reload from /api/gauges when panned back into view.
+const MAX_MARKERS = 1000;
+function pruneMarkers() {
+  const ids = Object.keys(gaugeMarkers);
+  if (ids.length <= MAX_MARKERS) return;
+  const c = map.getCenter();
+  const keep = (id) => selected.has(id) || id === panelGauge ||
+    simHydro[id] || gaugeResult[id] || routedNowcast[id];
+  const removable = ids.filter((id) => !keep(id)).map((id) => {
+    const ll = gaugeMarkers[id].getLatLng();
+    return { id, d: (ll.lat - c.lat) ** 2 + (ll.lng - c.lng) ** 2 };
+  }).sort((a, b) => b.d - a.d);       // farthest from view center first
+  const nRemove = ids.length - MAX_MARKERS;
+  for (let i = 0; i < nRemove && i < removable.length; i++) {
+    const id = removable[i].id, m = gaugeMarkers[id];
+    ((gaugeData[id] && gaugeData[id].virtual) ? vpLayer : gaugeLayer).removeLayer(m);
+    delete gaugeMarkers[id];
+    delete gaugeData[id];
+  }
 }
 map.on("moveend zoomend", () => {
   updateMapMode();
   clearTimeout(vpTimer); vpTimer = setTimeout(loadViewportGauges, 400);
+  if (nowcastMode) { scheduleAutoView(); loadNowcastRisk(); }
 });
 
 function addGaugePins(pins) {
@@ -209,6 +294,19 @@ function addGaugePins(pins) {
       .bindTooltip(`${g.id} · ${g.name}<br>${Math.round(g.area_km2).toLocaleString()} km²`, { direction: "top" })
       .on("click", () => toggleGauge(g.id));
     m.addTo(gaugeLayer); gaugeMarkers[g.id] = m;
+  });
+}
+
+function addVpPins(pins) {
+  pins.forEach((g) => {
+    if (gaugeMarkers[g.id]) return;
+    gaugeData[g.id] = g;                              // g.virtual === true
+    const m = L.circleMarker([g.lat, g.lon], gaugeStyle(g.id))
+      .bindTooltip(`◇ Ungauged point · ${Math.round(g.area_km2).toLocaleString()} km²<br>` +
+        `simulated with upstream-gauge inflow injection — no observations`,
+        { direction: "top" })
+      .on("click", () => toggleGauge(g.id));
+    m.addTo(vpLayer); gaugeMarkers[g.id] = m;
   });
 }
 
@@ -279,6 +377,10 @@ function confirmDates(ud, d) {
 
 function renderResult(d) {
   eventLayer.clearLayers();
+  // a new location: drop the previous location's gauge selection so it can't
+  // pile up past the simulate cap (feedback 2026-07-17)
+  selected.clear();
+  selKeyAtRun = "";                 // and release any "already simulated" hold
   queryCtx = { t_start: d.t_start, t_end: d.t_end, bbox: d.bbox, label: d.label };
   (d.event_pins || []).forEach((e) => {
     L.circleMarker([e.lat, e.lon], { radius: 9, color: "#fff", weight: 2,
@@ -290,14 +392,38 @@ function renderResult(d) {
   refreshSelection();
 }
 
+const TIER_COLORS = { 1: "#ffb300", 2: "#ff7a00", 3: "#ff4030" };  // elevated/minor/flood
+
 function gaugeStyle(id) {
   const on = selected.has(id);
-  return { radius: on ? 8 : 5, color: on ? "#fff" : "#0b0f14", weight: on ? 2 : 1,
-    fillColor: on ? "#ffd479" : "#3aa3ff", fillOpacity: 0.95 };
+  if (gaugeData[id] && gaugeData[id].virtual) {
+    // ungauged virtual point: hollow dashed diamond-gray look so it can never
+    // be mistaken for a USGS gauge; selection turns it the usual amber
+    return { radius: on ? 8 : 5, color: on ? "#fff" : "#b9a7e6",
+      weight: on ? 2 : 1.4, dashArray: on ? null : "3,3",
+      fillColor: on ? "#ffd479" : "#6f5aa8", fillOpacity: on ? 0.95 : 0.55 };
+  }
+  // nowcast mode: pin colored by risk tier (yellow >=5x baseflow, orange >=Q2,
+  // red >=Q5) from the hourly precomputed predictions
+  const tier = (nowcastMode && riskData && riskData.tiers && riskData.tiers[id]) || 0;
+  return { radius: on ? 8 : tier ? 7 : 5,
+    color: on ? "#fff" : tier ? "#fff" : "#0b0f14",
+    weight: on ? 2 : tier ? 1.5 : 1,
+    fillColor: tier ? TIER_COLORS[tier] : on ? "#ffd479" : "#3aa3ff",
+    fillOpacity: 0.95 };
 }
 function toggleGauge(id) {
   selected.has(id) ? selected.delete(id) : selected.add(id);
   refreshSelection();
+  if (nowcastMode) {
+    // ungauged point: serve its precomputed routed nowcast from the store;
+    // gauged points serve their instant precomputed DI-LSTM nowcast
+    if (gaugeData[id] && gaugeData[id].virtual) {
+      if (selected.has(id)) runRoutedNowcast(id);
+      return;
+    }
+    scheduleNowcast(); return;             // instant precomputed nowcasts
+  }
   if (simHydro[id]) focusGauge(id);        // has results -> show them
 }
 function selKey() { return [...selected].sort().join(","); }
@@ -307,6 +433,12 @@ function refreshSelection() {
   const n = selected.size;
   document.getElementById("selinfo").textContent = n ? `${n} gauge${n > 1 ? "s" : ""} selected` : "";
   const b = document.getElementById("btn-sim");
+  if (nowcastMode) {                       // precomputed — no run to hold/grey
+    b.textContent = `⚡ Nowcast (${n})`;
+    b.disabled = n === 0 || n > 25;
+    if (n > 25) document.getElementById("selinfo").textContent += "  ⚠ max 25 in nowcast";
+    return;
+  }
   // greyed out for the selection that was already simulated (or is running) —
   // changing gauges, the time window, or any model option re-enables it
   const held = selKeyAtRun !== "" && selKey() === selKeyAtRun;
@@ -394,6 +526,7 @@ function windowHours(t0, t1) {
 }
 
 async function simulate() {
+  if (nowcastMode) { showNowcastsFor([...selected]); return; }
   if (simRunning && selKey() === selKeyAtRun) return;   // double-click guard
   const ids = [...selected];
   if (!manualOpts && panelDirty()) {
@@ -422,7 +555,7 @@ async function simulate() {
                              scheme: document.getElementById("run-scheme").value,
                              // a still-running previous job would hold the per-gauge
                              // lock — the server stops it so this run starts now
-                             prev_sim_id: localStorage.getItem("lastSimId") || null,
+                             prev_sim_id: safeStore.getItem("lastSimId") || null,
                              ...opt }),
     });
     d = await r.json();
@@ -433,7 +566,7 @@ async function simulate() {
     return;
   }
   if (d.warning) addMsg("⚠️ " + d.warning, "status");
-  localStorage.setItem("lastSimId", d.sim_id);   // reattach after closing the app
+  safeStore.setItem("lastSimId", d.sim_id);   // reattach after closing the app
   resetAnim();
   zoomedToOverlay = false;
   const tS = d.t_start || win.tStart, tE = d.t_end || win.tEnd;   // server may clamp
@@ -492,6 +625,9 @@ function handleSimEvent(simId, ev) {
     else addMsg(`✅ <b>${ev.gauge_id}</b> complete (${ev.n} steps)`, "status");
     if (ev.gauge_id === panelGauge) renderHydro(ev.gauge_id);
     if (ev.returncode === 0) fetchNowcast(ev.gauge_id);
+  } else if (ev.kind === "params") {
+    // effective run parameters — used to pre-fill Model options for manual tuning
+    (gaugeResult[ev.gauge_id] = gaugeResult[ev.gauge_id] || {}).runParams = ev;
   } else if (ev.kind === "result") {
     gaugeResult[ev.gauge_id] = { ...(gaugeResult[ev.gauge_id] || {}),
       meta: ev.meta, metrics: ev.metrics, report: ev.report };
@@ -680,9 +816,41 @@ function maybeOfferCalibration(gid, metrics) {
     lp.classList.remove("collapsed");
     document.getElementById("adv-body").classList.remove("hidden");
     document.getElementById("adv-arrow").textContent = "▾";
-    addMsg("🛠 Opened <b>Model options → Advanced parameters</b>. Adjust values and hit Simulate again — " +
+    const pf = prefillModelOptions(gid);
+    addMsg("🛠 Opened <b>Model options</b> pre-filled with this run's setup — " +
+      `window <b>${document.getElementById("k-start").value || "?"} → ` +
+      `${document.getElementById("k-end").value || "?"}</b>` +
+      (pf.model ? `, model <b>${pf.model.toUpperCase()}</b>` : "") +
+      (pf.n ? `, <b>${pf.n}</b> parameter values (${pf.src || "a-priori"})` : "") +
+      ". That's your starting point — adjust, hit <b>Set</b>, then Simulate again; " +
       "if your run beats the stored NSE, the parameters are saved for this basin automatically.", "bot");
   };
+}
+
+// pre-fill the Model options panel from the last run's effective setup, so
+// manual tuning starts from what the AI actually used (window, model, params)
+function prefillModelOptions(gid) {
+  const rp = (gaugeResult[gid] || {}).runParams || {};
+  if (lastSim && lastSim.tStart) {
+    document.getElementById("k-start").value = lastSim.tStart.slice(0, 10);
+    if (lastSim.tEnd) document.getElementById("k-end").value = lastSim.tEnd.slice(0, 10);
+    if (lastSim.hours) document.getElementById("k-hours").value = lastSim.hours;
+  }
+  const meta = (gaugeResult[gid] || {}).meta || {};
+  const model = rp.model || meta.model;
+  if (["crestphys", "crest", "hp"].includes(model))
+    document.getElementById("k-model").value = model;   // enables the param inputs
+  updateParamAvailability();
+  let n = 0;
+  const vals = { ...(rp.wb || {}), ...(rp.kw || {}) };
+  Object.entries(vals).forEach(([k, v]) => {
+    const inp = document.getElementById("adv-" + String(k).toLowerCase());
+    if (inp && typeof v === "number" && isFinite(v)) {
+      inp.value = +v.toPrecision(4);
+      n++;
+    }
+  });
+  return { n, model, src: rp.source };
 }
 
 async function startCalibration(gid) {
@@ -830,18 +998,40 @@ function renderTabs() {
     const t = document.createElement("button");
     t.className = "rp-tab" + (id === panelGauge ? " active" : "") +
                   (gaugeState[id] === "done" ? " done" : gaugeState[id] === "running" ? " running" : "");
-    t.innerHTML = `<span class="dot"></span>${id}`;
-    t.onclick = () => focusGauge(id);
+    t.innerHTML = `<span class="dot"></span>${id}<span class="x" title="Close & unselect this gauge">✕</span>`;
+    t.onclick = () => { panToGauge(id); focusGauge(id); popFocusHalo(); };
+    t.querySelector(".x").onclick = (e) => { e.stopPropagation(); closeSimTab(id); };
     bar.appendChild(t);
   });
+}
+
+function closeSimTab(id) {
+  selected.delete(id);
+  delete simHydro[id]; delete gaugeState[id]; delete gaugeResult[id];
+  if (overlays[id]) { try { q2dGroup.removeLayer(overlays[id]); } catch (_) {} delete overlays[id]; }
+  delete gaugeFrames[id];
+  refreshSelection();
+  const rest = Object.keys(simHydro);
+  if (panelGauge === id) {
+    if (rest.length) { focusGauge(rest[0]); return; }
+    panelGauge = null;
+    updateFocusHalo(null);
+    document.getElementById("right-panel").classList.add("hidden");
+    document.getElementById("rp-reopen").classList.add("hidden");
+    return;
+  }
+  renderTabs();
 }
 
 function focusGauge(id) {
   if (panelGauge !== id) clearTimestep();      // readout/marker belong to the old gauge
   panelGauge = id;
+  nowcastPanelActive = false;
   const g = gaugeData[id];
   document.getElementById("right-panel").classList.remove("hidden");
+  document.getElementById("rp-reopen").classList.add("hidden");
   document.getElementById("rp-title").textContent = `${id} · ${g ? g.name : ""}`;
+  updateFocusHalo(id);
   renderTabs();
   renderFavBtn();
   renderStats(id);
@@ -933,23 +1123,114 @@ function _hydroMarker(t) {
            line: { color: "#ffd23f", width: 1.4, dash: "dot" } };
 }
 
-function _hydroFig(rows, big, nc) {
-  const x = rows.map((r) => r.time), sim = rows.map((r) => r.sim_q),
+// ---- hydrograph time zone: gauge-local by default, UTC on toggle ----------
+// Data timestamps stay UTC everywhere; only the plotted axis strings are
+// converted (Intl with the gauge's IANA zone — the browser handles DST).
+let hydroUTC = safeStore.getItem("crest_hydro_tz") === "utc";
+function curTz() {
+  const g = gaugeData[panelGauge] || (nowcastRes && nowcastRes.gauges[panelGauge]);
+  return (g && g.tz) || null;
+}
+function axMs(ms) {                    // epoch ms -> axis string in display tz
+  const tz = hydroUTC ? null : curTz();
+  if (!tz) return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+  return new Intl.DateTimeFormat("sv-SE", { timeZone: tz, year: "numeric",
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+    hour12: false }).format(ms).replace("T", " ");
+}
+function tsDisp(s) {                   // UTC "YYYY-MM-DD HH:MM.." -> axis string
+  if ((hydroUTC || !curTz()) || !s) return s;
+  const ms = Date.parse(String(s).slice(0, 16).replace(" ", "T") + ":00Z");
+  return isFinite(ms) ? axMs(ms) : s;
+}
+function tsBack(s) {                   // axis string -> UTC (for row lookups)
+  const tz = hydroUTC ? null : curTz();
+  const m = String(s).match(/(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)/);
+  if (!tz || !m) return s;
+  const want = Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5]);
+  let ms = want;
+  for (let i = 0; i < 2; i++) {        // fixed-point on the (stable) tz offset
+    const d = axMs(ms).match(/(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)/);
+    ms += want - Date.UTC(+d[1], d[2] - 1, +d[3], +d[4], +d[5]);
+  }
+  return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+}
+function tzTag() {                     // short label for the toggle ("CDT"/"UTC")
+  if (hydroUTC) return "UTC";
+  const tz = curTz();
+  if (!tz) return "UTC";
+  try {
+    const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" })
+      .formatToParts(Date.now());
+    return (p.find((x) => x.type === "timeZoneName") || {}).value || tz;
+  } catch (_) { return tz; }
+}
+function updateTzBtns() {
+  const tip = hydroUTC
+    ? "Hydrograph times in UTC — click to switch to the gauge's local time"
+    : "Hydrograph times in the gauge's local zone — click to switch to UTC";
+  ["rp-tz", "hm-tz"].forEach((i) => {
+    const b = document.getElementById(i);
+    if (b) { b.textContent = "🕐 " + tzTag(); b.title = tip; }
+  });
+}
+function setHydroTz(utc) {
+  hydroUTC = utc;
+  safeStore.setItem("crest_hydro_tz", utc ? "utc" : "local");
+  updateTzBtns();
+  if (panelGauge) {
+    if (nowcastPanelActive) renderNowcastHydro(panelGauge);
+    else if (simHydro[panelGauge]) renderHydro(panelGauge);
+  }
+  if (hydroModalOpen) renderHydroBig();
+}
+
+// routedNowcast[id] = { t0 } — ungauged points whose panel hydrograph is a
+// routed nowcast: the Sim Q line splits at t0 into routed-from-observed (solid)
+// and routed-from-prediction (dashed), with a "now" divider
+const routedNowcast = {};
+
+function _utcMs(t) { return Date.parse(String(t).replace(" ", "T") + "Z"); }
+
+function _hydroFig(rows, big, nc, splitT0) {
+  const x = rows.map((r) => tsDisp(r.time)), sim = rows.map((r) => r.sim_q),
     obs = rows.map((r) => r.obs_q), pr = rows.map((r) => r.precip || 0);
   const maxp = Math.max(0.1, ...pr);
+  // ungauged points have no observations — plot simulation only, and drop the
+  // Obs Q trace so no empty "Obs Q" entry appears in the legend
+  const hasObs = obs.some((v) => typeof v === "number" && isFinite(v));
   const traces = [
     { x, y: pr, name: "Precip", type: "bar", marker: { color: "#5b9bd5" }, yaxis: "y2", opacity: 0.7 },
-    { x, y: obs, name: "Obs Q", mode: "lines",
-      line: { color: "#f4f4f4", width: big ? 1.6 : 1.3, shape: "spline", smoothing: 0.8 } },
-    { x, y: sim, name: "Sim Q", mode: "lines",
-      line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } },
   ];
-  if (nc && nc.ok && nc.times && nc.times.length) {
-    const last = rows[rows.length - 1];             // anchor for a continuous tail
-    traces.push({ x: [last.time, ...nc.times], y: [last.sim_q, ...nc.q],
-      name: "🔮 AI nowcast", mode: "lines",
-      line: { color: "#ff9f43", width: big ? 2.2 : 1.8, dash: "dot" } });
+  if (hasObs) {
+    traces.push({ x, y: obs, name: "Obs Q", mode: "lines",
+      line: { color: "#f4f4f4", width: big ? 1.6 : 1.3, shape: "spline", smoothing: 0.8 } });
   }
+  if (splitT0) {
+    // routed nowcast: one continuous line, solid up to t0, dashed after —
+    // build two y-arrays that share the t0 point so they join seamlessly
+    const t0ms = _utcMs(splitT0);
+    const past = rows.map((r) => (_utcMs(r.time) <= t0ms ? r.sim_q : null));
+    const fut = rows.map((r) => (_utcMs(r.time) >= t0ms ? r.sim_q : null));
+    traces.push({ x, y: past, name: "Routed (obs upstream)", mode: "lines",
+      connectgaps: false,
+      line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } });
+    traces.push({ x, y: fut, name: "🔮 Routed nowcast", mode: "lines",
+      connectgaps: false,
+      line: { color: "#ff9f43", width: big ? 2.4 : 2.0, dash: "dot", shape: "spline", smoothing: 0.8 } });
+  } else {
+    traces.push({ x, y: sim, name: "Sim Q", mode: "lines",
+      line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } });
+    if (nc && nc.ok && nc.times && nc.times.length) {
+      const last = rows[rows.length - 1];           // anchor for a continuous tail
+      traces.push({ x: [tsDisp(last.time), ...nc.times.map(tsDisp)],
+        y: [last.sim_q, ...nc.q],
+        name: "🔮 nowcast", mode: "lines",
+        line: { color: "#ff9f43", width: big ? 2.2 : 1.8, dash: "dot" } });
+    }
+  }
+  const shapes = hydroSelTime ? [_hydroMarker(tsDisp(hydroSelTime))] : [];
+  if (splitT0) shapes.push(_nowLine(tsDisp(splitT0)));
   const layout = {
     margin: big ? { l: 56, r: 56, t: 18, b: 40 } : { l: 46, r: 46, t: 12, b: 30 },
     bargap: 0, showlegend: true,
@@ -959,11 +1240,16 @@ function _hydroFig(rows, big, nc) {
     xaxis: { gridcolor: "rgba(255,255,255,.06)" },
     yaxis: { title: "Q m³/s", rangemode: "tozero", gridcolor: "rgba(255,255,255,.06)" },
     yaxis2: { overlaying: "y", side: "right", range: [maxp * 3.4, 0], showgrid: false },
-    shapes: hydroSelTime ? [_hydroMarker(hydroSelTime)] : [],
+    shapes,
     hovermode: "x",
   };
   if (!big) layout.height = 250;
   return { traces, layout };
+}
+
+function _nowLine(xstr) {
+  return { type: "line", x0: xstr, x1: xstr, yref: "paper", y0: 0, y1: 1,
+    line: { color: "#ff9f43", width: 1, dash: "dash" }, opacity: 0.55 };
 }
 
 function _bindHydroClick(el, id) {
@@ -971,7 +1257,7 @@ function _bindHydroClick(el, id) {
   if (el.removeAllListeners) el.removeAllListeners("plotly_click");
   el.on("plotly_click", (ev) => {
     const p = ev.points && ev.points[0];
-    if (p) selectTimestep(id, String(p.x));
+    if (p) selectTimestep(id, tsBack(String(p.x)));   // axis tz -> UTC key
   });
 }
 
@@ -1002,14 +1288,18 @@ function renderHydro(id) {
         'the model starts producing output (the warm-up runs first).</div>'
       : '<div class="muted">Select a gauge and run a simulation to see its hydrograph.</div>';
     xp.classList.add("hidden");
+    document.getElementById("rp-tz").classList.add("hidden");
     return;
   }
   if (el.querySelector(".muted")) el.innerHTML = "";     // drop placeholder before plotting
   const { traces, layout } = _hydroFig(rows, false,
-    gaugeResult[id] && gaugeResult[id].nowcast);
+    gaugeResult[id] && gaugeResult[id].nowcast,
+    routedNowcast[id] && routedNowcast[id].t0);
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
   _bindHydroClick(el, id);
   xp.classList.remove("hidden");
+  document.getElementById("rp-tz").classList.remove("hidden");
+  updateTzBtns();
   if (hydroModalOpen) renderHydroBig();                  // keep the big view live
 }
 
@@ -1039,7 +1329,7 @@ function renderReadout(id, t) {
   ["rp-readout", "hm-readout"].forEach((eid) => {
     const el = document.getElementById(eid);
     if (!row) { el.classList.add("hidden"); return; }
-    const cells = [`<span class="ro t">at<b>${row.time}</b></span>`];
+    const cells = [`<span class="ro t">at<b>${tsDisp(row.time)} ${tzTag()}</b></span>`];
     READOUT_FIELDS.forEach(([k, label, unit, dec]) => {
       const v = row[k];
       if (v == null || !isFinite(v)) return;
@@ -1051,7 +1341,7 @@ function renderReadout(id, t) {
 }
 
 function updateHydroMarker(t) {
-  const shapes = t ? [_hydroMarker(t)] : [];
+  const shapes = t ? [_hydroMarker(tsDisp(t))] : [];   // t is UTC; axis may not be
   ["rp-hydro", "hm-plot"].forEach((eid) => {
     const el = document.getElementById(eid);
     if (el && el.data) { try { Plotly.relayout(el, { shapes }); } catch (_) {} }
@@ -1110,28 +1400,32 @@ function hmZoomBy(delta) {
 }
 
 function renderHydroBig() {
+  const nc = nowcastPanelActive && nowcastRes && nowcastRes.gauges[panelGauge];
   const rows = simHydro[panelGauge] || [];
-  if (!rows.length) return;
+  if (!nc && !rows.length) return;
   const el = document.getElementById("hm-plot");
   if (!hmBaseW) hmBaseW = document.getElementById("hm-scroll").clientWidth - 2;
   el.style.width = Math.round(hmBaseW * hmZoom) + "px";
   el.style.height = Math.round(_hmBaseH() * Math.max(1, (hmZoom + 1) / 2)) + "px";
-  const { traces, layout } = _hydroFig(rows, true,
-    gaugeResult[panelGauge] && gaugeResult[panelGauge].nowcast);
-  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
-  _bindHydroClick(el, panelGauge);
+  const { traces, layout } = nc ? _nowcastFig(panelGauge, true)
+    : _hydroFig(rows, true, gaugeResult[panelGauge] && gaugeResult[panelGauge].nowcast,
+                routedNowcast[panelGauge] && routedNowcast[panelGauge].t0);
+  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true,
+                                     scrollZoom: true, doubleClick: "reset" });
+  if (!nc) _bindHydroClick(el, panelGauge);
   applyHmZoom();
-  if (hydroSelTime) renderReadout(panelGauge, hydroSelTime);
+  if (!nc && hydroSelTime) renderReadout(panelGauge, hydroSelTime);
 }
 
 function openHydroModal() {
-  if (!panelGauge || !(simHydro[panelGauge] || []).length) return;
+  const nc = nowcastPanelActive && nowcastRes && nowcastRes.gauges[panelGauge];
+  if (!panelGauge || (!nc && !(simHydro[panelGauge] || []).length)) return;
   hydroModalOpen = true;
   hmZoom = 1;                                   // start at 100% each time
   hmBaseW = 0;                                  // re-measure (window may have resized)
   const g = gaugeData[panelGauge];
   document.getElementById("hm-title").textContent =
-    `📈 ${panelGauge}${g ? " · " + g.name : ""}`;
+    `${nc ? "⚡" : "📈"} ${panelGauge}${g ? " · " + g.name : ""}`;
   document.getElementById("hydro-modal").classList.remove("hidden");
   renderHydroBig();
 }
@@ -1144,7 +1438,15 @@ function closeHydroModal() {
 document.getElementById("rp-expand").onclick = openHydroModal;
 document.getElementById("hm-zin").onclick = () => hmZoomBy(+HM_ZSTEP);
 document.getElementById("hm-zout").onclick = () => hmZoomBy(-HM_ZSTEP);
+document.getElementById("hm-reset").onclick = () => {
+  hmZoom = 1;                 // undo canvas magnification AND any axis drag/scroll zoom
+  renderHydroBig();           // fresh layout -> original full time range
+};
 document.getElementById("hm-close").onclick = closeHydroModal;
+document.getElementById("rp-tz").onclick = () => setHydroTz(!hydroUTC);
+document.getElementById("hm-tz").onclick = () => setHydroTz(!hydroUTC);
+// no eager updateTzBtns() here: curTz reads nowcastRes, declared later (TDZ);
+// every render path calls it before the buttons become visible anyway
 document.getElementById("hydro-modal").addEventListener("click", (e) => {
   if (e.target.id === "hydro-modal") closeHydroModal();
 });
@@ -1208,6 +1510,7 @@ function chatContext() {
     map_zoomed_in: map.getZoom() >= PIN_ZOOM,
     signed_in: userSignedIn,
     sim_running: simRunning,
+    nowcast_mode: nowcastMode,
     last_window: lastSim ? { start: lastSim.tStart, end: lastSim.tEnd } : null,
     results: Object.entries(gaugeResult).map(([id, r]) => ({
       gauge: id, name: gaugeData[id] ? gaugeData[id].name : null,
@@ -1278,6 +1581,8 @@ async function handleChat(text) {
   if (d.action === "locate" && d.location_query) {
     awaitingTime = false;
     runQuery(d.location_query, ud || (d.start ? { start: d.start, end: d.end || null } : null), false);
+  } else if (d.action === "hotspot") {
+    zoomToHotspot(d.hotspot_index || 0);
   } else if (d.event_info) {
     lastEventInfoLabel = null;            // user explicitly asked -> refresh the card
     fetchEventInfo();
@@ -1439,8 +1744,9 @@ function zoomToUserLocation() {
   if (!("geolocation" in navigator)) return;
   navigator.geolocation.getCurrentPosition((pos) => {
     const lat = pos.coords.latitude, lon = pos.coords.longitude;
-    // don't fight a restored/running simulation or a map the user already moved
-    if (currentSim || simRunning || !mapUntouched()) return;
+    // don't fight a restored/running simulation, a map the user already moved,
+    // or Nowcast mode (its risk overview always starts at the CONUS view)
+    if (currentSim || simRunning || !mapUntouched() || nowcastMode) return;
     if (lat < 24 || lat > 50 || lon < -125 || lon > -66) return;  // outside CONUS
     // no animation: at app open a direct jump beats a cross-country fly-in
     // (and animated zooms can stall in throttled/background tabs)
@@ -1511,7 +1817,7 @@ function restoreFromHistory(h) {
     simulate();
   } else {
     addMsg(`🔁 Reopening <b>${escapeHtml(h.label || h.gauge_ids.join(", "))}</b>…`, "status");
-    localStorage.setItem("lastSimId", h.sim_id);
+    safeStore.setItem("lastSimId", h.sim_id);
     reattach(h.sim_id);
   }
 }
@@ -1574,13 +1880,13 @@ window.addEventListener("pagehide", () => {
 // ---- display font size (everything except the top bar) ---------------------
 const FONT_MODES = [["", "🔠 A", "normal"], ["font-lg", "🔠 A+", "bigger"],
                     ["font-xl", "🔠 A++", "much bigger"]];
-let fontIdx = Math.max(0, FONT_MODES.findIndex(([c]) => c === (localStorage.getItem("fontSize") || "")));
+let fontIdx = Math.max(0, FONT_MODES.findIndex(([c]) => c === (safeStore.getItem("fontSize") || "")));
 function applyFont() {
   document.body.classList.remove("font-lg", "font-xl");
   const [cls, label] = FONT_MODES[fontIdx];
   if (cls) document.body.classList.add(cls);
   document.getElementById("font-btn").textContent = label;
-  localStorage.setItem("fontSize", cls);
+  safeStore.setItem("fontSize", cls);
 }
 document.getElementById("font-btn").onclick = () => {
   fontIdx = (fontIdx + 1) % FONT_MODES.length;
@@ -1596,7 +1902,7 @@ function renderAiBtn() {
 }
 aiBtn.onclick = () => {
   aiInfo = !aiInfo;
-  localStorage.setItem("aiInfo", aiInfo ? "on" : "off");
+  safeStore.setItem("aiInfo", aiInfo ? "on" : "off");
   renderAiBtn();
   addMsg(aiInfo
     ? "🤖 AI info ON — you'll see progress bars, plain-word stages and event background instead of raw logs."
@@ -1616,9 +1922,9 @@ document.getElementById("btn-sim").onclick = simulate;
 
 // run scheme (🏞 full / ⚡ speed) — persisted; changing it makes a new run differ
 const schemeSel = document.getElementById("run-scheme");
-schemeSel.value = localStorage.getItem("runScheme") || "full";
+schemeSel.value = safeStore.getItem("runScheme") || "full";
 schemeSel.onchange = () => {
-  localStorage.setItem("runScheme", schemeSel.value);
+  safeStore.setItem("runScheme", schemeSel.value);
   addMsg(schemeSel.value === "speed"
     ? "⚡ <b>Speed run</b> — the basin is cut at upstream USGS gauges and their observed " +
       "flow is injected as boundary conditions. Much faster on big rivers; needs " +
@@ -1650,7 +1956,13 @@ function openExpertGate(onYes) {
 document.querySelectorAll(".panel-head .toggle, .panel-head .close").forEach((btn) => {
   btn.onclick = () => {
     const p = document.getElementById(btn.dataset.target);
-    if (btn.classList.contains("close")) { p.classList.add("hidden"); return; }
+    if (btn.classList.contains("close")) {
+      p.classList.add("hidden");
+      // the right panel has no header toggle to bring it back — offer a reopen chip
+      if (p.id === "right-panel" && panelGauge)
+        document.getElementById("rp-reopen").classList.remove("hidden");
+      return;
+    }
     const opening = p.classList.contains("collapsed");
     if (p.id === "left-panel" && opening && !expertGateOk()) {
       openExpertGate(() => p.classList.remove("collapsed"));
@@ -1659,6 +1971,21 @@ document.querySelectorAll(".panel-head .toggle, .panel-head .close").forEach((bt
     p.classList.toggle("collapsed");
   };
 });
+document.getElementById("rp-reopen").onclick = () => {
+  document.getElementById("rp-reopen").classList.add("hidden");
+  if (nowcastMode) {                 // nowcast results are precomputed — always restorable
+    const have = nowcastRes ? Object.keys(nowcastRes.gauges) : [];
+    if (nowcastRes && nowcastRes.gauges[panelGauge]) focusNowcastGauge(panelGauge);
+    else if (have.length) focusNowcastGauge(have[0]);
+    else {
+      document.getElementById("right-panel").classList.remove("hidden");
+      if (selected.size) scheduleNowcast(); else scheduleAutoView();
+    }
+    return;
+  }
+  if (panelGauge) focusGauge(panelGauge);
+  else document.getElementById("right-panel").classList.remove("hidden");
+};
 // ---- advanced parameters (all model/routing/snow params) ---------------
 const PARAM_GROUPS = [
   { title: "Water balance — CREST / CRESTPHYS",
@@ -1682,7 +2009,7 @@ function buildAdvanced() {
       const l = document.createElement("label");
       l.textContent = k;
       const inp = document.createElement("input");
-      inp.type = "number"; inp.step = "any"; inp.placeholder = "auto";
+      inp.type = "number"; inp.step = "0.01"; inp.placeholder = "auto";
       inp.id = "adv-" + k; inp.dataset.param = k;
       l.appendChild(inp); grid.appendChild(l);
     });
@@ -1830,13 +2157,13 @@ document.getElementById("fb-send").onclick = async () => {
 
 // ---- reattach: a run keeps going in the backend even if the app is closed --
 async function reattach(explicitId) {
-  const simId = explicitId || localStorage.getItem("lastSimId");
+  const simId = explicitId || safeStore.getItem("lastSimId");
   if (!simId) return;
   try {
     const r = await fetch(`/api/job/${simId}`);
-    if (!r.ok) { if (!explicitId) localStorage.removeItem("lastSimId"); return; }
+    if (!r.ok) { if (!explicitId) safeStore.removeItem("lastSimId"); return; }
     const j = await r.json();
-    if (!explicitId && j.done && j.age_s > 24 * 3600) { localStorage.removeItem("lastSimId"); return; }
+    if (!explicitId && j.done && j.age_s > 24 * 3600) { safeStore.removeItem("lastSimId"); return; }
     zoomedToOverlay = false;               // zoom to the 2-D layer on first frame
     const tS = j.t_start.slice(0, 19), tE = j.t_end.slice(0, 19);
     const H = windowHours(tS, tE);
@@ -1860,8 +2187,584 @@ async function reattach(explicitId) {
   } catch (_) { /* server restarted; job registry is gone */ }
 }
 
+// ---- Nowcast mode: precomputed DI-LSTM +6 h predictions ------------------
+// The updater Space refreshes nowcast/latest.parquet hourly for every CONUS
+// gauge, so this mode never runs a simulation — selection -> instant plot.
+// Gauge-point predictions only: no 2-D streamflow in nowcast mode.
+let nowcastRes = null;              // {t0, times, generated, model, gauges: {id: g}}
+let nowcastPanelActive = false;     // right panel is currently showing a nowcast
+let ncTimer = null;
+let riskLayer = null;               // red density layer (flood-risk gauges)
+let riskAt = 0;                     // last risk fetch (ms)
+
+async function loadNowcastRisk(force) {
+  if (!force && riskData && Date.now() - riskAt < 5 * 60e3) { syncRiskLayer(); return; }
+  try {
+    const r = await fetch("/api/nowcast_risk");
+    const d = await r.json();
+    if (!d.ok) return;
+    riskData = d; riskAt = Date.now();
+    if (riskLayer) { try { map.removeLayer(riskLayer); } catch (_) {} riskLayer = null; }
+    // one density blob per tier color: draw yellow, then orange, then red on top
+    const byTier = { 1: [], 2: [], 3: [] };
+    (d.flagged || []).forEach((p) => { (byTier[p[2]] || byTier[1]).push([p[0], p[1], 1]); });
+    const GRAD = {
+      1: { 0.3: "#5c4a10", 0.7: "#c78f00", 1: "#ffd23f" },
+      2: { 0.3: "#5c3210", 0.7: "#cc5f00", 1: "#ff9a4d" },
+      3: { 0.3: "#5c1010", 0.7: "#e03526", 1: "#ff7a5c" },
+    };
+    const parts = [];
+    [1, 2, 3].forEach((tr) => {
+      if (!byTier[tr].length) return;
+      if (typeof L.heatLayer === "function") {
+        parts.push(L.heatLayer(byTier[tr], { radius: 32, blur: 22, max: 1,
+                                             minOpacity: 0.35, gradient: GRAD[tr] }));
+      } else {                            // CDN blocked -> translucent discs
+        parts.push(L.layerGroup(byTier[tr].map(([lat, lon]) =>
+          L.circleMarker([lat, lon], { radius: 16, stroke: false,
+            fillColor: TIER_COLORS[tr], fillOpacity: 0.35 }))));
+      }
+    });
+    riskLayer = parts.length ? L.layerGroup(parts) : null;
+    const n = (d.n_elevated || 0) + (d.n_minor || 0) + (d.n_flood || 0);
+    document.getElementById("risk-count").textContent = n
+      ? `🔴${d.n_flood || 0} 🟠${d.n_minor || 0} 🟡${d.n_elevated || 0} · issued ${d.t0 || ""}`
+      : `all quiet right now · issued ${d.t0 || ""}`;
+    refreshSelection();                   // recolor visible pins
+    syncRiskLayer();
+  } catch (_) { /* transient */ }
+}
+
+function syncRiskLayer() {                // density map out wide, pins when close
+  const showHeat = nowcastMode && riskLayer && map.getZoom() < PIN_ZOOM;
+  if (showHeat) { if (!map.hasLayer(riskLayer)) riskLayer.addTo(map); }
+  else if (riskLayer && map.hasLayer(riskLayer)) map.removeLayer(riskLayer);
+  document.getElementById("risk-legend").classList.toggle("hidden", !nowcastMode);
+}
+
+function setMode(nc) {
+  nowcastMode = nc;
+  document.getElementById("mode-hind").classList.toggle("on", !nc);
+  document.getElementById("mode-now").classList.toggle("on", nc);
+  updateFocusHalo(null);               // the mode's own refocus re-adds it
+  updateMapMode();                     // vpLayer shows in both modes now
+  refreshSelection();
+  if (nc) {
+    // everyone starts from the CONUS overview — the tiered risk map IS the
+    // point of nowcast mode (no auto-zoom, even for signed-in users)
+    map.setView([39, -98], 5, { animate: false });
+    addMsg("⚡ <b>Nowcast mode</b> — no dates needed. Colors show where the AI predicts " +
+           "trouble within 6 hours: 🔴 ≥ 5-yr flood, 🟠 ≥ 2-yr (bankfull), 🟡 ≥ 5× " +
+           "baseflow (density map zoomed out, colored pins zoomed in). Click gauges, " +
+           "draw a rectangle, or zoom until ≤25 are in view for observed flow + the " +
+           "next-6-hour prediction, refreshed hourly. Purple dashed <b>ungauged points</b> " +
+           "have no gauge to predict from — click one and the AI routes its upstream " +
+           "gauges' nowcasts down to it. <b>Experimental</b>; gauge points only " +
+           "(2-D maps stay in Hindcast).", "status");
+    loadNowcastRisk();
+    scheduleAutoView();
+  } else {
+    addMsg("🕘 <b>Hindcast mode</b> — historical CREST simulations (pick gauges and a time window). " +
+           "Purple dashed pins are <b>ungauged points</b>: river outlets with no USGS gauge that fill " +
+           "the coverage gaps — simulated with upstream gauge observations injected as inflow.", "status");
+    clearUpstreamNet();
+    if (panelGauge && simHydro[panelGauge]) focusGauge(panelGauge);
+  }
+  syncRiskLayer();
+  refreshSelection();                    // pin colors depend on the mode
+}
+
+function scheduleNowcast() {
+  clearTimeout(ncTimer);
+  ncTimer = setTimeout(() => { if (selected.size) showNowcastsFor([...selected]); }, 400);
+}
+
+// ungauged point in nowcast mode: route its upstream gauges' flow (observed +
+// their DI-LSTM nowcast) to it via EF5. Streams like a hindcast; the panel
+// hydrograph splits at t0 into routed-from-observed and routed-from-prediction.
+async function runRoutedNowcast(id) {
+  // Ungauged routed nowcasts are precomputed hourly by the keep-warm Space and
+  // published to CREST_data; serve the point instantly from that store (no live
+  // EF5 run). The line is the routed model itself: ~7 days of history from
+  // observed upstream flow (solid) then the 12-h prediction from the upstream
+  // AI nowcasts (dashed), split at t0.
+  try {
+    const r = await fetch(`/api/ungauged_now?w=0&s=0&e=0&n=0&ids=${encodeURIComponent(id)}`);
+    const d = await r.json();
+    const p = d.ok && (d.points || []).find((x) => x.id === id);
+    if (!p) {
+      // "missing" tells us WHY: only claim a hydrologic cause when the
+      // keep-warm fleet has actually confirmed there is no upstream gauge
+      const why = d.ok && d.missing && d.missing[id];
+      addMsg(why === "no_upstream"
+        ? `⚠️ <b>${escapeHtml(id)}</b> has no upstream USGS gauge draining to it, so ` +
+          "there is no observed flow to route — the routed-nowcast design can’t serve " +
+          "this point. Switch to 🕘 Hindcast to simulate it from rainfall."
+        : `⏳ <b>${escapeHtml(id)}</b>’s routed nowcast isn’t published yet — the hourly ` +
+          "precompute is still catching up on this point. Try again in a few minutes, " +
+          "or switch to 🕘 Hindcast to simulate it now.", "status");
+      selected.delete(id); refreshSelection();
+      return;
+    }
+    const t0disp = String(d.t0 || "").replace(/ UTC$/, "");
+    const rows = [];
+    (p.history || []).forEach(([t, q]) => rows.push({ time: t, sim_q: q }));
+    (p.forecast || []).forEach(([t, q]) => rows.push({ time: t, sim_q: q }));
+    simHydro[id] = rows;
+    routedNowcast[id] = { t0: t0disp };
+    gaugeState[id] = "done";
+    delete gaugeResult[id];
+    addMsg(`🔮 <b>${id}</b> — routed nowcast issued <b>${t0disp} UTC</b> (refreshed hourly): ` +
+      "<b>7 days</b> of routed history (solid, from observed upstream flow) then the " +
+      "12-hour prediction (dashed orange past “now”, from the upstream AI nowcasts). " +
+      "There are no observations here, so the line is the routed model itself.", "status");
+    renderTabs();
+    focusGauge(id);
+    renderHydro(id);
+  } catch (err) {
+    addMsg("⚠️ " + escapeHtml(String(err.message || err)), "status");
+  }
+}
+const NOWCAST_WINDOW_H = 180;  // [t0-168h, t0+12h] — 7-day routed history + 12h nowcast
+
+function scheduleAutoView() {        // zoomed to a small area -> show everything in view
+  clearTimeout(ncTimer);
+  ncTimer = setTimeout(() => {
+    if (!nowcastMode || selected.size) return;
+    const b = map.getBounds();
+    const vis = Object.values(gaugeData).filter((g) => !g.virtual && b.contains([g.lat, g.lon]));
+    if (vis.length && vis.length <= 25) showNowcastsFor(vis.map((g) => g.id));
+  }, 900);
+}
+
+async function showNowcastsFor(ids) {
+  ids = ids.slice(0, 25);
+  if (!ids.length) return;
+  try {
+    const r = await fetch(`/api/nowcast_now?w=0&s=0&e=0&n=0&ids=${ids.join(",")}&obs_hours=168`);
+    const d = await r.json();
+    if (!d.ok) {
+      addMsg(`⚠️ Nowcast unavailable: ${escapeHtml(d.reason || "no precomputed data yet")}`, "status");
+      return;
+    }
+    nowcastRes = { t0: d.t0, times: d.times, generated: d.generated,
+                   model: d.model, gauges: {} };
+    (d.gauges || []).forEach((g) => { nowcastRes.gauges[g.id] = g; });
+    const first = ids.find((i) => nowcastRes.gauges[i]);
+    if (!first) {
+      addMsg("⚠️ No precomputed nowcast for these gauges (outside CONUS radar coverage?).", "status");
+      return;
+    }
+    focusNowcastGauge(nowcastRes.gauges[panelGauge] ? panelGauge : first);
+  } catch (e) {
+    addMsg(`⚠️ Nowcast fetch failed: ${escapeHtml(e.message)}`, "status");
+  }
+}
+
+function focusNowcastGauge(id) {
+  panelGauge = id;
+  nowcastPanelActive = true;
+  const nc = nowcastRes.gauges[id];
+  const g = gaugeData[id];
+  document.getElementById("right-panel").classList.remove("hidden");
+  document.getElementById("rp-reopen").classList.add("hidden");
+  document.getElementById("rp-title").textContent = `⚡ ${id} · ${g ? g.name : ""}`;
+  const bar = document.getElementById("rp-tabs");
+  bar.innerHTML = "";
+  Object.keys(nowcastRes.gauges).forEach((gid2) => {
+    const t = document.createElement("button");
+    t.className = "rp-tab done" + (gid2 === panelGauge ? " active" : "");
+    t.innerHTML = `<span class="dot"></span>${gid2}<span class="x" title="Close & unselect this gauge">✕</span>`;
+    t.onclick = () => { panToGauge(gid2); focusNowcastGauge(gid2); popFocusHalo(); };
+    t.querySelector(".x").onclick = (e) => { e.stopPropagation(); closeNowcastTab(gid2); };
+    bar.appendChild(t);
+  });
+  renderFavBtn();
+  const peak6 = Math.max(...nc.q.slice(0, 6));
+  const cards = [statCard("Drainage",
+    Math.round((g ? g.area_km2 : nc.area_km2)).toLocaleString() + " km²")];
+  if (nc.obs_last_q != null) cards.push(statCard("Latest obs", nc.obs_last_q + " m³/s"));
+  if (nc.obs_age_h != null) cards.push(statCard("Obs age", nc.obs_age_h + " h"));
+  cards.push(statCard("Peak +6 h", (Math.round(peak6 * 10) / 10) + " m³/s"));
+  if (nc.q12 && nc.q12.length) {
+    const peak12 = Math.max(...nc.q12);
+    cards.push(statCard("Peak +" + nc.q12.length + " h",
+      (Math.round(peak12 * 10) / 10) + " m³/s"));
+  }
+  if (nc.qbase != null) cards.push(statCard("Baseflow (Eckhardt)", nc.qbase + " m³/s"));
+  if (nc.q2 != null) cards.push(statCard("2-yr / 5-yr flood", nc.q2 + " / " + (nc.q5 ?? "?") + " m³/s"));
+  const TIER_LABEL = { 1: "🟡 elevated — ≥ 5× baseflow",
+                       2: "🟠 minor flood — ≥ 2-yr flow",
+                       3: "🔴 flood — ≥ 5-yr flow" };
+  if (nc.tier) cards.push(statCard("⚠ Risk", TIER_LABEL[nc.tier]));
+  document.getElementById("rp-stats").innerHTML = cards.join("");
+  updateFocusHalo(id);
+  showUpstreamNet(id);
+  renderNowcastHydro(id);
+  document.getElementById("rp-report").innerHTML =
+    `<div class="adv-note">🔮 AI nowcast issued <b>${nowcastRes.t0 || "?"}</b> (newest radar hour), ` +
+    `refreshed hourly. <b>Experimental</b> — machine-learning prediction at the gauge point, ` +
+    `not a CREST simulation. Switch to 🕘 Hindcast for physics runs and 2-D maps.</div>`;
+}
+
+function _nowcastFig(id, big) {
+  const nc = nowcastRes.gauges[id];
+  const obs = nc.obs || [];
+  const traces = [];
+  if (obs.length) {
+    traces.push({ x: obs.map((r) => tsDisp(r[0])), y: obs.map((r) => r[1]), name: "Obs Q",
+      mode: "lines", line: { color: "#f4f4f4", width: big ? 1.8 : 1.5,
+                             shape: "spline", smoothing: 0.8 } });
+  }
+  // two independent models, drawn in full so any disagreement over the shared
+  // first 6 hours is visible rather than hidden
+  traces.push({ x: nowcastRes.times.slice(0, nc.q.length).map(tsDisp), y: nc.q,
+    name: "🔮 next 6 h",
+    mode: "lines+markers", line: { color: "#ff9f43", width: big ? 2.4 : 2, dash: "dot" },
+    marker: { size: big ? 7 : 5 } });
+  if (nc.q12 && nc.q12.length) {
+    traces.push({ x: nowcastRes.times.slice(0, nc.q12.length).map(tsDisp), y: nc.q12,
+      name: "🔮 next 12 h",
+      mode: "lines+markers", line: { color: "#c77dff", width: big ? 2.4 : 2, dash: "dot" },
+      marker: { size: big ? 7 : 5 } });
+  }
+  const issue = tsDisp((nowcastRes.t0 || "").slice(0, 16));
+  // default view = 24 h: 12 h history + 12 h prediction; the full 7 d of obs
+  // are in the traces, so dragging (or scroll-zoom enlarged) reveals them
+  let range = null;
+  if (issue) {
+    const t0ms = Date.parse((nowcastRes.t0 || "").slice(0, 16).replace(" ", "T") + ":00Z");
+    range = [axMs(t0ms - 12 * 3600e3),
+             axMs(t0ms + (nowcastRes.times.length + 0.5) * 3600e3)];
+  }
+  const layout = {
+    margin: big ? { l: 56, r: 24, t: 18, b: 40 } : { l: 46, r: 12, t: 12, b: 30 },
+    showlegend: true,
+    legend: { orientation: "h", y: big ? 1.08 : 1.18, font: { size: big ? 11 : 9 } },
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+    font: { color: "#cdd9e2", size: big ? 12 : 10 },
+    xaxis: { gridcolor: "rgba(255,255,255,.06)", range: range || undefined },
+    yaxis: { title: "Q m³/s", rangemode: "tozero", gridcolor: "rgba(255,255,255,.06)" },
+    shapes: issue ? [{ type: "line", x0: issue, x1: issue, y0: 0, y1: 1, yref: "paper",
+                       line: { color: "#ffd23f", width: 1.2, dash: "dot" } }] : [],
+    hovermode: "x",
+  };
+  return { traces, layout };
+}
+
+function renderNowcastHydro(id) {
+  const el = document.getElementById("rp-hydro");
+  document.getElementById("rp-expand").classList.remove("hidden");
+  document.getElementById("rp-tz").classList.remove("hidden");
+  updateTzBtns();
+  document.getElementById("rp-readout").classList.add("hidden");
+  const { traces, layout } = _nowcastFig(id, false);
+  if (el.querySelector(".muted")) el.innerHTML = "";
+  Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
+  if (hydroModalOpen) renderHydroBig();          // keep the big view in sync
+}
+
+function closeNowcastTab(id) {
+  selected.delete(id);
+  if (nowcastRes) delete nowcastRes.gauges[id];
+  refreshSelection();
+  const rest = nowcastRes ? Object.keys(nowcastRes.gauges) : [];
+  if (panelGauge === id) {
+    if (rest.length) { focusNowcastGauge(rest[0]); return; }
+    panelGauge = null;
+    nowcastPanelActive = false;
+    clearUpstreamNet();
+    updateFocusHalo(null);
+    document.getElementById("right-panel").classList.add("hidden");
+    document.getElementById("rp-reopen").classList.add("hidden");
+    return;
+  }
+  focusNowcastGauge(panelGauge);                 // re-render tabs without `id`
+}
+
+// ---- focused-gauge marker: a full-size teardrop pin above the gauge ------
+// Dual-contrast (white stroke + dark drop-shadow) so it reads on the bright
+// topo base as well as the dark/satellite bases; magenta is used by nothing
+// else on the map. The tip touches the gauge point; risk pins stay visible.
+const FOCUS_PIN_SVG =
+  '<svg width="30" height="42" viewBox="0 0 30 42">' +
+  '<path d="M15 41 C15 41 2.5 23.5 2.5 14 A12.5 12.5 0 1 1 27.5 14 ' +
+  'C27.5 23.5 15 41 15 41 Z" fill="#e6399b" stroke="#fff" stroke-width="2.5"/>' +
+  '<circle cx="15" cy="14" r="4.6" fill="#fff"/></svg>';
+let focusHalo = null;
+function updateFocusHalo(id) {
+  const g = (id && (gaugeData[id] || (nowcastRes && nowcastRes.gauges[id]))) || null;
+  if (focusHalo) { map.removeLayer(focusHalo); focusHalo = null; }
+  if (!g || g.lat == null) return;
+  focusHalo = L.marker([g.lat, g.lon], {
+    icon: L.divIcon({ className: "focus-pin fp-bounce", html: FOCUS_PIN_SVG,
+                      iconSize: [30, 42], iconAnchor: [15, 41] }),
+    interactive: false, zIndexOffset: 1500,
+  }).addTo(map);
+}
+function panToGauge(id) {
+  const g = gaugeData[id] || (nowcastRes && nowcastRes.gauges[id]) || null;
+  if (g && g.lat != null && !map.getBounds().contains([g.lat, g.lon]))
+    map.panTo([g.lat, g.lon], { animate: false });
+}
+function popFocusHalo() {              // re-drop the pin once (tab re-click)
+  const el = focusHalo && focusHalo.getElement && focusHalo.getElement();
+  if (!el) return;
+  el.classList.remove("fp-bounce");
+  void el.offsetWidth;                 // reflow restarts the CSS animation
+  el.classList.add("fp-bounce");
+}
+
+// ---- upstream river network (nowcast): HydroRIVERS walk from the gauge ---
+let riverLayer = null, riverGid = null;
+const riverCache = {};              // gid -> /api/upstream payload (static data)
+async function showUpstreamNet(id) {
+  if (!nowcastMode) return;
+  if (riverGid === id && riverLayer) return;
+  clearUpstreamNet();
+  try {
+    let d = riverCache[id];
+    if (!d) {
+      d = await (await fetch(`/api/upstream?gid=${id}`)).json();
+      riverCache[id] = d;
+    }
+    if (!d.ok || !nowcastMode || panelGauge !== id) return;
+    const grp = L.layerGroup();
+    d.lines.forEach((l) => L.polyline(l.xy, {
+      color: "#4fc3f7", opacity: 0.65, interactive: false,
+      weight: Math.min(4, 1 + 0.55 * (l.o - d.min_order)),
+    }).addTo(grp));
+    riverLayer = grp.addTo(map);
+    riverGid = id;
+  } catch (_) { /* network is decoration — never block the panel */ }
+}
+function clearUpstreamNet() {
+  if (riverLayer) { map.removeLayer(riverLayer); riverLayer = null; riverGid = null; }
+}
+
+// ---- flood-risk hotspot zoom: "bring me to the hotspot" (no location) ----
+async function zoomToHotspot(i) {
+  try {
+    const d = await (await fetch("/api/nowcast_hotspots")).json();
+    if (!d.ok || !d.hotspots || !d.hotspots.length) {
+      addMsg("✅ No flagged flood-risk clusters right now — the nowcast map is quiet.", "status");
+      return;
+    }
+    if (!nowcastMode) setMode(true);        // hotspot questions live in Nowcast mode
+    const k = Math.max(0, Math.min(i || 0, d.hotspots.length - 1));
+    const h = d.hotspots[k];
+    const [w, s, e, n] = h.bbox;
+    map.fitBounds([[s, w], [n, e]], { animate: false, maxZoom: 10 });
+    addMsg(`🎯 Flood-risk cluster ${k + 1} of ${d.hotspots.length}: ${h.n_flood} 🔴, ` +
+           `${h.n_minor} 🟠, ${h.n_elevated} 🟡 flagged gauge(s), nowcast issued ` +
+           `${d.t0 || "?"}. Click any pin (or zoom until ≤25 are in view) for ` +
+           `hydrographs — or ask for another cluster by number.`, "status");
+  } catch (_) {
+    addMsg("⚠️ Couldn't fetch the risk hotspots — try again in a moment.", "status");
+  }
+}
+
+document.getElementById("mode-hind").onclick = () => { if (nowcastMode) setMode(false); };
+document.getElementById("mode-now").onclick = () => { if (!nowcastMode) setMode(true); };
+
 // ---- boot ----------------------------------------------------------------
 initAuth();
 loadHuc8();                         // HUC8 basin guide (zoom in for gauge pins)
 loadViewportGauges();               // gauge pins when already zoomed in
 reattach();                         // pick up a run started before the app was closed
+
+// ---- V25: Events mode (2-D inundation from CREST-iMAP v2) ----------------
+let eventsMode = false;
+let evtGroup = null;                 // L.layerGroup for the depth overlay
+let evtOverlay = null;               // current L.imageOverlay
+let evtManifest = null;              // selected event's manifest
+let evtBase = "";                    // HF resolve base URL
+let evtFrameIdx = -1;                // -1 => maxdepth
+let evtTimer = null;
+let evtPanel = null;
+
+function enterEventsMode() {
+  if (eventsMode) return;
+  if (nowcastMode) setMode(false);   // reuse hindcast layer teardown
+  eventsMode = true;
+  document.getElementById("mode-hind").classList.remove("on");
+  document.getElementById("mode-now").classList.remove("on");
+  document.getElementById("mode-evt").classList.add("on");
+  if (!evtGroup) evtGroup = L.layerGroup().addTo(map);
+  addMsg("<b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
+         "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the basin " +
+         "in 2-D: blue shading is simulated water depth (darker = deeper). Pick an " +
+         "event to animate its depth frames or view the maximum-depth footprint; " +
+         "the right panel shows the trigger gauge's simulated streamflow against " +
+         "USGS observations.", "status");
+  loadEvents();
+}
+
+function leaveEventsMode() {
+  if (!eventsMode) return;
+  eventsMode = false;
+  document.getElementById("mode-evt").classList.remove("on");
+  stopEvtPlay();
+  if (evtOverlay) { evtGroup.removeLayer(evtOverlay); evtOverlay = null; }
+  if (evtPanel) { evtPanel.remove(); evtPanel = null; }
+  evtManifest = null;
+}
+
+async function loadEvents() {
+  let d = null;
+  try { d = await (await fetch("/api/events")).json(); } catch (_) {}
+  if (!d) { addMsg("⚠️ Couldn't load the event list.", "status"); return; }
+  evtBase = d.base;
+  const ids = Object.keys(d.events || {});
+  if (evtPanel) evtPanel.remove();
+  evtPanel = document.createElement("div");
+  evtPanel.id = "evt-panel";
+  evtPanel.style.cssText =
+    "position:absolute;top:70px;left:10px;z-index:1000;background:rgba(18,26,38,.92);" +
+    "color:#dfe9f5;border:1px solid #33475e;border-radius:10px;padding:10px 12px;" +
+    "max-width:300px;max-height:60vh;overflow:auto;font-size:12.5px;line-height:1.45";
+  const r = d.runner || {};
+  let html = "<b>Inundation events</b><br>";
+  if (r.running) {
+    html += `<div style="color:#ffd479">simulating <b>${r.running}</b> (${r.status})</div>`;
+  } else if (r.last && r.last.ok === false) {
+    html += `<div style="color:#ff9d9d">last run failed: ${r.last.error || ""}</div>`;
+  }
+  if (!ids.length) html += "<div style='opacity:.8'>No published events yet.</div>";
+  evtPanel.innerHTML = html;
+  ids.forEach((id) => {
+    const s = d.events[id];
+    const b = document.createElement("button");
+    b.style.cssText = "display:block;width:100%;text-align:left;margin:5px 0;" +
+      "background:#22334a;color:#dfe9f5;border:1px solid #3c557a;border-radius:7px;" +
+      "padding:6px 8px;cursor:pointer;font-size:12px";
+    b.innerHTML = `<b>${(s.trigger && s.trigger.gauge) || id}</b> · t0 ${s.t0 || "?"}` +
+      `${s.status === "active" ? ' · <span style="color:#7fd47f">active</span>' : ""}` +
+      `<br><span style="opacity:.75">${s.n_frames || 0} frames` +
+      `${s.archive_frames ? ` · ${s.archive_frames} archived` : ""}` +
+      `${s.demoted ? " (archived: max-depth only)" : ""}</span>`;
+    b.onclick = () => selectEvent(id, s);
+    evtPanel.appendChild(b);
+  });
+  document.getElementById("map").appendChild(evtPanel);
+  if (r.running && eventsMode) setTimeout(loadEvents, 20000);
+}
+
+async function selectEvent(id, summary) {
+  stopEvtPlay();
+  let man = null;
+  try { man = await (await fetch(`${evtBase}/${id}/manifest.json`)).json(); }
+  catch (_) { addMsg("⚠️ Couldn't load that event's manifest.", "status"); return; }
+  evtManifest = { ...man, _id: id, _demoted: !!(summary && summary.demoted) };
+  const ctl = document.createElement("div");
+  ctl.id = "evt-ctl";
+  ctl.style.cssText = "margin-top:8px;border-top:1px solid #33475e;padding-top:7px";
+  const nF = (man.frames || []).length;
+  const canAnim = nF > 0 && !evtManifest._demoted;
+  ctl.innerHTML =
+    `<b>${id}</b><br><span style="opacity:.8">cap ${man.depth_cap_m || 3} m · ` +
+    `grid ${man.grid.nx}×${man.grid.ny} @ ~${Math.round(man.grid.dx_m)} m</span><br>` +
+    `<button id="evt-max" style="margin:5px 4px 0 0">max depth</button>` +
+    (canAnim ? `<button id="evt-play">▶</button>` +
+      `<input id="evt-slider" type="range" min="0" max="${nF - 1}" value="0"` +
+      ` style="width:120px;vertical-align:middle">` +
+      `<span id="evt-t" style="opacity:.8"></span>` : "") +
+    `<div style="margin-top:6px;height:8px;border-radius:4px;background:` +
+    `linear-gradient(90deg, rgba(173,216,230,.45), rgb(8,48,107))"></div>` +
+    `<div style="display:flex;justify-content:space-between;opacity:.7">` +
+    `<span>0 m</span><span>≥ ${man.depth_cap_m || 3} m</span></div>`;
+  const old = document.getElementById("evt-ctl");
+  if (old) old.remove();
+  evtPanel.appendChild(ctl);
+  document.getElementById("evt-max").onclick = () => showEvtFrame(-1);
+  if (canAnim) {
+    document.getElementById("evt-play").onclick = toggleEvtPlay;
+    document.getElementById("evt-slider").oninput = (e) =>
+      showEvtFrame(parseInt(e.target.value, 10));
+  }
+  showEvtFrame(-1);
+  try { map.fitBounds(man.bounds, { padding: [40, 40] }); } catch (_) {}
+
+  // right panel: the trigger gauge's 1-D hydrograph — EF5 simulated flow
+  // (split solid/dashed at t0) vs USGS observations, straight from the
+  // event manifest (no extra requests)
+  const gid = (man.trigger && man.trigger.gauge) || man.gauge;
+  if (gid && Array.isArray(man.hydro) && man.hydro.length) {
+    simHydro[gid] = man.hydro;
+    routedNowcast[gid] = { t0: (man.t0 || "").replace("T", " ").replace("Z", "") };
+    gaugeState[gid] = "done";
+    delete gaugeResult[gid];
+    focusGauge(gid);
+    renderHydro(gid);
+  }
+}
+
+function showEvtFrame(i) {
+  if (!evtManifest) return;
+  evtFrameIdx = i;
+  const man = evtManifest;
+  const file = i < 0 ? man.maxdepth_png : man.frames[i].png;
+  const url = `${evtBase}/${man._id}/${file}`;
+  if (evtOverlay) { evtOverlay.setUrl(url); }
+  else {
+    evtOverlay = L.imageOverlay(url, man.bounds,
+      { opacity: 0.85, interactive: false }).addTo(evtGroup);
+  }
+  const lab = document.getElementById("evt-t");
+  if (lab) lab.textContent = i < 0 ? " max" : ` ${man.frames[i].t.slice(5, 16)}`;
+  const sl = document.getElementById("evt-slider");
+  if (sl && i >= 0) sl.value = i;
+  // keep the hydrograph's time marker in step with the slider/play scrub
+  if (i >= 0) {
+    try { updateHydroMarker(man.frames[i].t.replace("T", " ").replace("Z", "")); }
+    catch (_) {}
+  }
+}
+
+// clicking the hydrograph (small plot or expanded modal) scrubs the 2-D
+// inundation animation to the nearest depth frame
+function jumpEvtTo(t) {
+  if (!eventsMode || !evtManifest || !(evtManifest.frames || []).length) return;
+  const s = String(t).replace(" ", "T");
+  const tgt = Date.parse(s.endsWith("Z") ? s : s + "Z");
+  if (!isFinite(tgt)) return;
+  let best = 0, bd = Infinity;
+  evtManifest.frames.forEach((fr, i) => {
+    const d = Math.abs(Date.parse(fr.t) - tgt);
+    if (d < bd) { bd = d; best = i; }
+  });
+  stopEvtPlay();
+  showEvtFrame(best);
+}
+const _selectTimestepBase = selectTimestep;
+selectTimestep = function (id, t) {
+  _selectTimestepBase(id, t);
+  jumpEvtTo(t);
+};
+
+function stepEvtFrame() {
+  if (!evtManifest || !evtManifest.frames.length) return;
+  showEvtFrame(evtFrameIdx >= evtManifest.frames.length - 1 ? 0 : evtFrameIdx + 1);
+}
+function toggleEvtPlay() {
+  if (evtTimer) { stopEvtPlay(); return; }
+  document.getElementById("evt-play").textContent = "⏸";
+  evtTimer = setInterval(stepEvtFrame, 400);
+}
+function stopEvtPlay() {
+  if (evtTimer) { clearInterval(evtTimer); evtTimer = null; }
+  const b = document.getElementById("evt-play");
+  if (b) b.textContent = "▶";
+}
+
+document.getElementById("mode-evt").onclick = () => enterEventsMode();
+document.getElementById("mode-hind").onclick = () => {
+  leaveEventsMode();
+  if (nowcastMode) setMode(false);
+  else document.getElementById("mode-hind").classList.add("on");
+};
+document.getElementById("mode-now").onclick = () => {
+  leaveEventsMode();
+  if (!nowcastMode) setMode(true);
+  else document.getElementById("mode-now").classList.add("on");
+};

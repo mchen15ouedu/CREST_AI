@@ -1,0 +1,15 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+fastapi
+uvicorn
+huggingface_hub
+numpy
+pyarrow
+requests
+truststore
+netCDF4
+cftime
+pyproj
+xarray
+cfgrib
+rasterio

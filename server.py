@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import asyncio
 import json
+import math
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -377,18 +378,28 @@ def _pins_for_bbox(w: float, s: float, e: float, n: float, limit: int = 300):
     if len(cat) > limit:                            # keep the map responsive
         cx, cy = (w + e) / 2, (s + n) / 2
         cat = cat.assign(_d=((cat.LAT_GAGE - cy) ** 2 + (cat.LNG_GAGE - cx) ** 2)).nsmallest(limit, "_d")
+    from hf_data import gaugetz
     return [{
         "id": str(r.STAID).zfill(8), "name": str(r.STANAME),
         "lat": float(r.LAT_GAGE), "lon": float(r.LNG_GAGE),
         "area_km2": float(r.DRAIN_SQKM),
+        "tz": gaugetz.tz_of(str(r.STAID).zfill(8)),
     } for r in cat.itertuples()]
 
 
 @app.get("/api/gauges")
 def api_gauges(w: float, s: float, e: float, n: float):
-    """USGS gauge pins for the current viewport — works with zero AI interaction."""
+    """USGS gauge pins for the current viewport — works with zero AI interaction.
+    vp_pins: ungauged virtual points (HydroBASINS pour points) that fill the
+    coverage gaps — hindcast-simulatable via upstream-gauge injection."""
     pins = _pins_for_bbox(w, s, e, n)
-    return {"gauge_pins": pins, "n_gauges": len(pins), "max_sims": MAX_SIMS}
+    try:
+        from hf_data import virtualpoints
+        vps = virtualpoints.for_bbox(w, s, e, n)
+    except Exception:
+        vps = []
+    return {"gauge_pins": pins, "vp_pins": vps,
+            "n_gauges": len(pins), "max_sims": MAX_SIMS}
 
 
 class Query(BaseModel):
@@ -456,8 +467,21 @@ def api_chat(req: ChatReq):
     about the current simulation, and routes locate/set_time actions.
     {"action": "fallback"} tells the client to use its rule-based path."""
     from hf_data import chatagent
+    ctx = dict(req.context or {})
+    try:                             # live risk summary so the agent can route
+        from hf_data import nowcaststore
+        hs = nowcaststore.hotspots()  # "hotspot" questions with no location
+        if hs.get("ok"):
+            ctx["nowcast_risk"] = {
+                "t0": hs["t0"],
+                "n_hotspots": hs["n_hotspots"],       # true total (dynamic, may be 0)
+                "hotspots": [{k: h[k] for k in ("center", "score", "n_gauges",
+                                                "n_flood", "n_minor", "n_elevated")}
+                             for h in hs["hotspots"][:10]]}   # top 10 for context
+    except Exception:
+        pass
     try:
-        d = chatagent.respond(req.message, req.history, req.context)
+        d = chatagent.respond(req.message, req.history, ctx)
     except Exception as e:
         crashlog.capture("chat", e, message_text=req.message[:200])
         return {"action": "fallback", "error": str(e)}
@@ -604,6 +628,112 @@ def api_nowcast(sim_id: str, gauge_id: str):
     return _nc.for_job(job, gauge_id)
 
 
+@app.get("/api/nowcast_risk")
+def api_nowcast_risk():
+    """CONUS-wide flood-risk snapshot for Nowcast mode: which gauges' AI
+    next-6-h peak exceeds their 10-yr return flood (red density layer /
+    red pins)."""
+    from hf_data import nowcaststore
+    return nowcaststore.all_risk()
+
+
+@app.get("/api/nowcast_now")
+def api_nowcast_now(w: float, s: float, e: float, n: float, limit: int = 100,
+                    obs_hours: int = 0, ids: str = ""):
+    """Precomputed fleet nowcasts for every gauge in the viewport/rectangle
+    (or an explicit `ids` comma list) — instant (the updater Space refreshes
+    them hourly), no simulation needed. obs_hours>0 attaches recent observed
+    series (<=25 gauges) for plotting."""
+    from hf_data import nowcaststore
+    return nowcaststore.for_bbox(w, s, e, n, limit, obs_hours, ids)
+
+
+@app.get("/api/ungauged_now")
+def api_ungauged_now(w: float, s: float, e: float, n: float, limit: int = 200,
+                     ids: str = ""):
+    """Precomputed ungauged routed nowcasts for the viewport/rectangle (or an
+    explicit `ids` comma list) — served instantly from the keep-warm Space's
+    hourly parquet, no live EF5 run. Each point carries its ~7-day routed
+    history + 12-h forecast so the panel plots the split hydrograph directly."""
+    from hf_data import ungaugednow_store
+    return (ungaugednow_store.by_ids(ids) if ids
+            else ungaugednow_store.for_bbox(w, s, e, n, limit))
+
+
+@app.get("/api/nowcast_hotspots")
+def api_nowcast_hotspots():
+    """Ranked spatial clusters of flagged flood-risk gauges — the chat agent's
+    answer to "bring me to the flood risk hotspot" (no location needed)."""
+    from hf_data import nowcaststore
+    return nowcaststore.hotspots()
+
+
+@app.get("/api/events")
+def api_events(full: int = 0):
+    """V25: published 2-D inundation events (CREST-iMAP v2) + runner state.
+    Frame/manifest files resolve at {base}/<event_id>/<file>."""
+    from hf_data import eventsim, eventstore
+    return {"events": eventstore.load_index(), "runner": eventsim.status(bool(full)),
+            "base": (f"https://huggingface.co/datasets/{eventstore.REPO}/"
+                     f"resolve/main/{eventstore.PREFIX}")}
+
+
+@app.post("/api/event_tick")
+def api_event_tick():
+    """Hourly auto-trigger (pinged by the updater after each data refresh):
+    re-simulates every ACTIVE inundation episode at the fresh t0 and starts
+    newly flagged ones. An episode ends when the gauge's flow recedes to
+    normal (risk tier < EVENT_CONT_TIER), NOT when precipitation stops."""
+    try:
+        import crestimap  # noqa: F401
+    except ImportError:
+        return JSONResponse({"ok": False, "reason":
+                             "crestimap not installed on this Space build"},
+                            status_code=501)
+    from hf_data import eventsim
+    if eventsim.status()["running"]:
+        return {"ok": False, "reason": "runner busy"}
+    import threading
+    threading.Thread(target=eventsim.hourly_tick, daemon=True).start()
+    return {"ok": True, "started": "tick"}
+
+
+@app.post("/api/event_run")
+def api_event_run(gid: str = ""):
+    """V25 manual/agent trigger: 2-D inundation event for `gid`, or
+    auto-detect from the nowcast flood tier when gid is empty. The run takes
+    minutes (EF5 + hydrodynamic solver) and executes in a worker thread;
+    poll /api/events for progress."""
+    try:
+        import crestimap  # noqa: F401  (installed from the CREST-iMAP fork, v2)
+    except ImportError:
+        return JSONResponse({"ok": False, "reason":
+                             "crestimap not installed on this Space build"},
+                            status_code=501)
+    from hf_data import eventsim
+    st = eventsim.status()
+    if st["running"]:
+        return {"ok": False, "reason": "an event simulation is already running",
+                **st}
+    import threading
+    if gid:
+        threading.Thread(target=eventsim.run_one, args=(gid,),
+                         daemon=True).start()
+    else:
+        threading.Thread(target=eventsim.run_detected, daemon=True).start()
+    return {"ok": True, "started": gid or "auto-detect"}
+
+
+@app.get("/api/upstream")
+def api_upstream(gid: str):
+    """River network upstream of a gauge (HydroRIVERS topology walk) — drawn
+    on the Nowcast map when the gauge is focused. Static data, LRU-cached.
+    JSONResponse directly: jsonable_encoder walking ~50k coord floats costs
+    ~2 s; plain json.dumps is ~50 ms."""
+    from hf_data import rivernet
+    return JSONResponse(rivernet.upstream(gid))
+
+
 @app.post("/api/cancel/{sim_id}")
 def api_cancel(sim_id: str):
     """Stop a running simulation job: the EF5 processes are killed and the
@@ -631,6 +761,21 @@ def api_history(request: Request):
     return {"history": hist}
 
 
+def _sse_json(ev) -> str:
+    """json.dumps emits bare NaN/Infinity, which JSON.parse rejects — one such
+    value breaks the whole event stream in the browser. Missing values travel as
+    null, matching the convention the rest of the pipeline already uses."""
+    def clean(v):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        if isinstance(v, dict):
+            return {k: clean(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [clean(x) for x in v]
+        return v
+    return json.dumps(clean(ev), allow_nan=False)
+
+
 async def _drain(job, cursor: int = 0):
     """Replay the job's event log from `cursor`, then follow it live. Multiple
     clients (or a reopened browser) can each attach with their own cursor."""
@@ -639,7 +784,7 @@ async def _drain(job, cursor: int = 0):
             if cursor < len(job.events):
                 ev = job.events[cursor]
                 cursor += 1
-                yield {"data": json.dumps(ev)}
+                yield {"data": _sse_json(ev)}
                 if ev.get("kind") in ("all_done", "cal_done"):
                     break
             elif job.done.is_set():
@@ -692,6 +837,10 @@ class CalRequest(BaseModel):
 
 @app.post("/api/calibrate")
 def api_calibrate(req: CalRequest):
+    from hf_data import virtualpoints
+    if virtualpoints.is_virtual(req.gauge_id):
+        return JSONResponse({"error": "ungauged points have no observations — "
+                                      "calibration is not possible"}, status_code=422)
     job = caljobs.start_job(req.gauge_id,
                             datetime.fromisoformat(req.t_start),
                             datetime.fromisoformat(req.t_end),

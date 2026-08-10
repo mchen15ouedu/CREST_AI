@@ -1,0 +1,38 @@
+name: Wake worker Spaces
+
+# Keeps the 9 free worker Spaces awake: 6 fleet runners (gauge catalog
+# precompute) + 3 ungauged keep-warm shards (hourly routed nowcasts).
+# They otherwise rely only on their mutual keepalive ring, which deadlocks
+# if a platform restart puts them all to sleep at once (Jul 29 - Aug 3 2026:
+# all slept for 6 days). An external GET wakes a sleeping Space.
+#
+# Deliberately SEPARATE from the MRMS/nowcast workflow: waking workers has
+# nothing to do with the data pipeline, and this job must never page anyone —
+# every step tolerates failure, so it cannot send failure emails. The pings'
+# side effect is all that matters; the fleet is resumable and loses nothing
+# if a ping round is missed.
+
+on:
+  schedule:
+    - cron: '25 * * * *'       # hourly at :25 — offset from the :55 MRMS job
+  workflow_dispatch:
+
+concurrency:
+  group: wake-worker-spaces
+  cancel-in-progress: true      # a fresh round supersedes a stuck one
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true     # belt & suspenders: never mark the run red
+    steps:
+      - name: Ping all worker Spaces (parallel)
+        run: |
+          for s in crest-fleet-runner crest-fleet-runner2 crest-fleet-runner3 \
+                   crest-fleet-runner4 crest-fleet-runner5 crest-fleet-runner6 \
+                   crest-ungauged crest-ungauged2 crest-ungauged3; do
+            curl -sk -m 45 "https://vincewin-${s}.hf.space/" -o /dev/null &
+          done
+          wait || true
+          echo "ping round done"
