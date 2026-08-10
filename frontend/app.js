@@ -2591,11 +2591,12 @@ function enterEventsMode() {
   document.getElementById("mode-now").classList.remove("on");
   document.getElementById("mode-evt").classList.add("on");
   if (!evtGroup) evtGroup = L.layerGroup().addTo(map);
-  addMsg("🌊 <b>Events mode</b> — when the nowcast flags a gauge at flood level " +
+  addMsg("🌊 <b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
          "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the basin " +
          "in 2-D: blue shading is simulated water depth (darker = deeper). Pick an " +
-         "event to animate its depth frames or view the maximum-depth footprint.",
-         "status");
+         "event to animate its depth frames or view the maximum-depth footprint; " +
+         "the right panel shows the trigger gauge's simulated streamflow against " +
+         "USGS observations.", "status");
   loadEvents();
 }
 
@@ -2681,6 +2682,19 @@ async function selectEvent(id, summary) {
   }
   showEvtFrame(-1);
   try { map.fitBounds(man.bounds, { padding: [40, 40] }); } catch (_) {}
+
+  // right panel: the trigger gauge's 1-D hydrograph — EF5 simulated flow
+  // (split solid/dashed at t0) vs USGS observations, straight from the
+  // event manifest (no extra requests)
+  const gid = (man.trigger && man.trigger.gauge) || man.gauge;
+  if (gid && Array.isArray(man.hydro) && man.hydro.length) {
+    simHydro[gid] = man.hydro;
+    routedNowcast[gid] = { t0: (man.t0 || "").replace("T", " ").replace("Z", "") };
+    gaugeState[gid] = "done";
+    delete gaugeResult[gid];
+    focusGauge(gid);
+    renderHydro(gid);
+  }
 }
 
 function showEvtFrame(i) {
@@ -2698,7 +2712,33 @@ function showEvtFrame(i) {
   if (lab) lab.textContent = i < 0 ? " max" : ` ${man.frames[i].t.slice(5, 16)}`;
   const sl = document.getElementById("evt-slider");
   if (sl && i >= 0) sl.value = i;
+  // keep the hydrograph's time marker in step with the slider/play scrub
+  if (i >= 0) {
+    try { updateHydroMarker(man.frames[i].t.replace("T", " ").replace("Z", "")); }
+    catch (_) {}
+  }
 }
+
+// clicking the hydrograph (small plot or expanded modal) scrubs the 2-D
+// inundation animation to the nearest depth frame
+function jumpEvtTo(t) {
+  if (!eventsMode || !evtManifest || !(evtManifest.frames || []).length) return;
+  const s = String(t).replace(" ", "T");
+  const tgt = Date.parse(s.endsWith("Z") ? s : s + "Z");
+  if (!isFinite(tgt)) return;
+  let best = 0, bd = Infinity;
+  evtManifest.frames.forEach((fr, i) => {
+    const d = Math.abs(Date.parse(fr.t) - tgt);
+    if (d < bd) { bd = d; best = i; }
+  });
+  stopEvtPlay();
+  showEvtFrame(best);
+}
+const _selectTimestepBase = selectTimestep;
+selectTimestep = function (id, t) {
+  _selectTimestepBase(id, t);
+  jumpEvtTo(t);
+};
 
 function stepEvtFrame() {
   if (!evtManifest || !evtManifest.frames.length) return;

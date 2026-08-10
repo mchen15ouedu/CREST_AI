@@ -93,6 +93,15 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         log(f"EF5 nowcast-mode run {t_start:%m-%d %H}Z -> {t_end:%m-%d %H}Z "
             f"with gridded runoff output")
         meta = {}
+        hydro = {}
+
+        def _f(v):
+            try:
+                v = float(v)
+                return v if v == v and abs(v) != float("inf") else None
+            except (TypeError, ValueError):
+                return None
+
         for kind, payload in pipeline.run_gauge(
                 gid, t_start, t_end, model="auto", use_mock=False,
                 grids=EVENT_TOKENS, workdir=work, nowcast_t0=t0,
@@ -101,6 +110,15 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                 meta = payload
             elif kind == "status":
                 log(str(payload))
+            elif kind == "hydro":
+                # 1-D streamflow at the trigger gauge (sim + USGS obs) — kept
+                # in the manifest so the Events tab plots the hydrograph
+                for r in payload.get("rows") or []:
+                    if r.get("time"):
+                        hydro[str(r["time"])] = {
+                            "time": str(r["time"]), "sim_q": _f(r.get("sim_q")),
+                            "obs_q": _f(r.get("obs_q")),
+                            "precip": _f(r.get("precip"))}
             elif kind == "done" and payload.get("returncode", 0) not in (0, None):
                 raise RuntimeError(f"EF5 failed: {payload}")
         out_dir = os.path.join(work, "CREST_output")
@@ -132,6 +150,8 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
             dem_res=DEM_RES, dem_cache=DEM_CACHE, max_cells=MAX_CELLS,
             trigger={**(trigger or {}), "gauge": gid}, progress=log)
         manifest = run_event(cfg)
+        manifest["gauge"] = gid
+        manifest["hydro"] = [hydro[k] for k in sorted(hydro)]
 
         with _lock:
             _running["status"] = "render"
