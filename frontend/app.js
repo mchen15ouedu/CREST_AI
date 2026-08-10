@@ -2639,7 +2639,9 @@ async function loadEvents() {
       "background:#22334a;color:#dfe9f5;border:1px solid #3c557a;border-radius:7px;" +
       "padding:6px 8px;cursor:pointer;font-size:12px";
     b.innerHTML = `<b>${(s.trigger && s.trigger.gauge) || id}</b> · t0 ${s.t0 || "?"}` +
+      `${s.status === "active" ? ' · <span style="color:#7fd47f">active</span>' : ""}` +
       `<br><span style="opacity:.75">${s.n_frames || 0} frames` +
+      `${s.archive_frames ? ` · ${s.archive_frames} archived` : ""}` +
       `${s.demoted ? " (archived: max-depth only)" : ""}</span>`;
     b.onclick = () => selectEvent(id, s);
     evtPanel.appendChild(b);

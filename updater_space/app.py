@@ -112,12 +112,30 @@ def _run_all(feeds: list[str]):
         _state["freshness"] = lines
         _state["exit_codes"]["check"] = rc
         _log("=== run complete ===")
+        _ping_event_tick()                        # V25: hourly inundation tick
     except Exception as e:                        # keep the app alive whatever happens
         _log(f"run crashed: {e!r}")
     finally:
         _state["finished"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _state["running"] = False
         _lock.release()
+
+
+def _ping_event_tick():
+    """After the hourly refresh, nudge the app Space to advance inundation
+    episodes (re-simulate active ones at the fresh t0, start new tier-3
+    triggers, end episodes whose gauge flow receded to normal)."""
+    if os.environ.get("EVENT_TICK", "1") != "1":
+        return
+    url = os.environ.get("EVENT_TICK_URL",
+                         "https://vincewin-crest-demo.hf.space/api/event_tick")
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, method="POST")
+        with urllib.request.urlopen(req, timeout=45) as r:
+            _log(f"event tick -> HTTP {r.status}")
+    except Exception as e:
+        _log(f"event tick failed: {type(e).__name__}")
 
 
 def _start(feeds: list[str]) -> bool:

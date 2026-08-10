@@ -678,6 +678,26 @@ def api_events():
                      f"resolve/main/{eventstore.PREFIX}")}
 
 
+@app.post("/api/event_tick")
+def api_event_tick():
+    """Hourly auto-trigger (pinged by the updater after each data refresh):
+    re-simulates every ACTIVE inundation episode at the fresh t0 and starts
+    newly flagged ones. An episode ends when the gauge's flow recedes to
+    normal (risk tier < EVENT_CONT_TIER), NOT when precipitation stops."""
+    try:
+        import crestimap  # noqa: F401
+    except ImportError:
+        return JSONResponse({"ok": False, "reason":
+                             "crestimap not installed on this Space build"},
+                            status_code=501)
+    from hf_data import eventsim
+    if eventsim.status()["running"]:
+        return {"ok": False, "reason": "runner busy"}
+    import threading
+    threading.Thread(target=eventsim.hourly_tick, daemon=True).start()
+    return {"ok": True, "started": "tick"}
+
+
 @app.post("/api/event_run")
 def api_event_run(gid: str = ""):
     """V25 manual/agent trigger: 2-D inundation event for `gid`, or

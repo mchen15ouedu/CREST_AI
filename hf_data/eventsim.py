@@ -20,6 +20,13 @@ import threading
 EVENT_TOKENS = "streamflow|runoff|subrunoff"
 HORIZON_H = int(os.environ.get("EVENT_HORIZON_H", "12"))
 HINDCAST_H = int(os.environ.get("EVENT_HINDCAST_H", "48"))
+# episode lifecycle: an active event is re-simulated every hourly tick with
+# the fresh t0 (same event id, folder replaced) and ENDS when the gauge's
+# risk tier drops below EVENT_CONT_TIER — i.e. when FLOW recedes to normal,
+# not when precipitation stops (recession can outlive the rain by days).
+CONT_TIER = int(os.environ.get("EVENT_CONT_TIER", "1"))
+MAX_EPISODE_H = int(os.environ.get("EVENT_MAX_EPISODE_H", "96"))
+MAX_PER_TICK = int(os.environ.get("EVENT_MAX_PER_TICK", "2"))
 # events don't need the fleet's 90-day spin-up: upstream DA injection carries
 # the river and the flood is driven by current rain; 30 d bounds forcing prep
 WARMUP_D = int(os.environ.get("EVENT_WARMUP_D", "30"))
@@ -68,9 +75,11 @@ def detect(max_events: int = 1) -> list[dict]:
 
 
 def run_one(gid: str, t0: datetime.datetime | None = None,
-            trigger: dict | None = None) -> dict:
+            trigger: dict | None = None, episode_id: str | None = None) -> dict:
     """Full event pipeline for one trigger gauge. Blocking (minutes-long);
-    call from a worker thread. Returns the manifest (raises on failure)."""
+    call from a worker thread. Returns the manifest (raises on failure).
+    episode_id: re-simulate an ongoing episode under its original id (the
+    published folder is replaced with the fresh window)."""
     from crestimap import EventConfig, run_event   # needs the v2 package
     from . import eventstore, nowcaststore, pipeline
 
@@ -81,7 +90,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
     t_start = t0 - datetime.timedelta(hours=HINDCAST_H)
     t_end = t0 + datetime.timedelta(hours=HORIZON_H)
-    ev_id = f"{t0:%Y%m%d%H}_{gid}"
+    ev_id = episode_id or f"{t0:%Y%m%d%H}_{gid}"
     work = tempfile.mkdtemp(prefix=f"event_{gid}_")
 
     def log(s):
@@ -152,6 +161,15 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         manifest = run_event(cfg)
         manifest["gauge"] = gid
         manifest["hydro"] = [hydro[k] for k in sorted(hydro)]
+        manifest["status"] = "active"
+
+        with _lock:
+            _running["status"] = "archive"
+        try:
+            _update_archive(cfg.out_dir, manifest, log)
+        except Exception as e:
+            log(f"archive update failed ({type(e).__name__}: {e}) — "
+                f"continuing without it")
 
         with _lock:
             _running["status"] = "render"
@@ -176,6 +194,111 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     finally:
         with _lock:
             _running.update(id=None, status=None)
+
+
+def _update_archive(out_dir: str, manifest: dict, log):
+    """Continuous per-episode archive: events/<id>/archive.parquet.
+
+    Sparse long format — one row per WET cell per frame: (time, row, col,
+    depth_cm uint16), zstd-compressed; grid georeferencing in the schema
+    metadata. Each hourly re-simulation merges in: its fresh frames replace
+    overlapping timestamps (they carry more observations), timestamps only
+    the older runs covered are kept — so the archive spans the whole
+    episode start -> end. The episode-wide max depth is recomputed from it
+    (maxdepth.tif then covers the full episode, not just the last window),
+    the hydrograph is merged the same way, and retention demotion keeps
+    archive.parquet (only depth_* frames are dropped).
+    """
+    import json as _json
+
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    import rasterio
+
+    from . import eventstore
+
+    ev = manifest["event_id"]
+    gr = manifest["grid"]
+
+    # fresh frames -> sparse table
+    tables, new_times = [], []
+    for fr in manifest["frames"]:
+        with rasterio.open(os.path.join(out_dir, fr["file"])) as ds:
+            q = ds.read(1).astype(np.uint16)
+        t = datetime.datetime.strptime(fr["t"], "%Y-%m-%dT%H:%MZ")
+        new_times.append(t)
+        r, c = np.nonzero(q)
+        tables.append(pa.table({
+            "time": pa.array([t] * len(r), pa.timestamp("s")),
+            "row": pa.array(r.astype(np.uint16), pa.uint16()),
+            "col": pa.array(c.astype(np.uint16), pa.uint16()),
+            "depth_cm": pa.array(q[r, c], pa.uint16())}))
+    merged = pa.concat_tables(tables)
+    old_hydro = []
+
+    # previous archive of this episode (if any) — keep its older timestamps
+    schema = pa.schema([("time", pa.timestamp("s")), ("row", pa.uint16()),
+                        ("col", pa.uint16()), ("depth_cm", pa.uint16())])
+    try:
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(eventstore.REPO, f"{eventstore.PREFIX}/{ev}/archive.parquet",
+                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
+        told = pq.read_table(p)
+        gold = _json.loads((told.schema.metadata or {}).get(b"grid", b"{}"))
+        if gold.get("ny") == gr["ny"] and gold.get("nx") == gr["nx"]:
+            # parquet stores timestamps as ms — normalize before set ops
+            told = told.select(["time", "row", "col", "depth_cm"]).cast(schema)
+            keep = told.filter(pc.invert(pc.is_in(
+                told.column("time"),
+                value_set=pa.array(new_times, pa.timestamp("s")))))
+            merged = pa.concat_tables([keep, merged])
+            log(f"archive: merged {keep.num_rows} prior wet-cell rows")
+        else:
+            log("archive: grid changed — restarting archive")
+    except Exception:
+        pass  # first publish of the episode (or fetch hiccup): fresh archive
+    try:
+        from huggingface_hub import hf_hub_download
+        mp = hf_hub_download(eventstore.REPO, f"{eventstore.PREFIX}/{ev}/manifest.json",
+                             repo_type="dataset", token=os.environ.get("HF_TOKEN"))
+        with open(mp, encoding="utf-8") as fp:
+            old_hydro = _json.load(fp).get("hydro") or []
+    except Exception:
+        pass
+
+    merged = merged.sort_by([("time", "ascending")])
+    meta = dict(merged.schema.metadata or {})
+    meta[b"grid"] = _json.dumps(gr).encode()
+    meta[b"depth_unit"] = b"centimeters"
+    meta[b"event_id"] = str(ev).encode()
+    merged = merged.replace_schema_metadata(meta)
+    pq.write_table(merged, os.path.join(out_dir, "archive.parquet"),
+                   compression="zstd")
+
+    times = pc.unique(merged.column("time"))
+    manifest["archive"] = "archive.parquet"
+    manifest["archive_frames"] = len(times)
+
+    # episode-wide max depth from the archive (overwrites the run's own)
+    md = np.zeros((gr["ny"], gr["nx"]), dtype=np.uint16)
+    rr = merged.column("row").to_numpy()
+    cc = merged.column("col").to_numpy()
+    dd = merged.column("depth_cm").to_numpy()
+    np.maximum.at(md, (rr, cc), dd)
+    from crestimap.io import write_depth
+    from rasterio.transform import Affine
+    a, b, c0, d, e, f = gr["transform"]
+    write_depth(os.path.join(out_dir, "maxdepth.tif"), md.astype(float) / 100.0,
+                Affine(a, b, c0, d, e, f), gr.get("crs"))
+
+    # continuous hydrograph across the episode (new rows win on overlap)
+    if old_hydro:
+        have = {r["time"] for r in manifest["hydro"]}
+        rows = [r for r in old_hydro if r.get("time") not in have] + manifest["hydro"]
+        manifest["hydro"] = sorted(rows, key=lambda r: r["time"])
+    log(f"archive: {merged.num_rows} wet-cell rows over {len(times)} frames")
 
 
 DEPTH_CAP_M = float(os.environ.get("EVENT_DEPTH_CAP_M", "3.0"))
@@ -230,3 +353,61 @@ def run_detected(max_events: int = 1) -> list[dict]:
             out.append({"event_id": None, "gauge": pick["gauge"],
                         "error": f"{type(e).__name__}: {e}"})
     return out
+
+
+def hourly_tick() -> dict:
+    """Called by the updater after each hourly data refresh.
+
+    1. Every ACTIVE episode whose gauge is still at/above EVENT_CONT_TIER is
+       re-simulated at the fresh t0 (same event id; folder replaced).
+    2. Episodes whose gauge receded below the tier (flow back to normal) or
+       older than EVENT_MAX_EPISODE_H are marked ended — precipitation going
+       to zero does NOT end an episode while the hydrograph is still high.
+    3. Newly flagged tier-3 gauges start new episodes.
+    Runs at most EVENT_MAX_PER_TICK simulations, sequentially.
+    """
+    from . import eventstore, nowcaststore
+    if _running["id"]:
+        return {"skipped": "runner busy"}
+    risk = nowcaststore.all_risk()
+    tiers = (risk or {}).get("tiers") or {}
+    idx = eventstore.load_index()
+    now = datetime.datetime.utcnow()
+
+    jobs, ended = [], []
+    for eid, s in idx.items():
+        if s.get("status", "active") != "active":
+            continue
+        gid = str(((s.get("trigger") or {}).get("gauge")) or s.get("gauge") or "")
+        started = s.get("episode_started") or s.get("t0") or ""
+        try:
+            age_h = (now - datetime.datetime.strptime(
+                started, "%Y-%m-%dT%H:%MZ")).total_seconds() / 3600.0
+        except ValueError:
+            age_h = float("inf")
+        tier = int(tiers.get(gid, 0))
+        if gid and tier >= CONT_TIER and age_h <= MAX_EPISODE_H:
+            jobs.append({"gauge": gid, "episode": eid,
+                         "trigger": {**(s.get("trigger") or {}), "tier": tier}})
+        else:
+            ended.append(eid)
+    if ended:
+        eventstore.mark_ended(ended)
+
+    active_gauges = {j["gauge"] for j in jobs}
+    for pick in detect(MAX_PER_TICK):
+        if pick["gauge"] not in active_gauges:
+            jobs.append({"gauge": pick["gauge"], "episode": None,
+                         "trigger": pick})
+
+    results = []
+    for j in jobs[:MAX_PER_TICK]:
+        try:
+            m = run_one(j["gauge"], trigger=j["trigger"],
+                        episode_id=j["episode"])
+            results.append({"event_id": m.get("event_id"),
+                            "published": m.get("published")})
+        except Exception as e:
+            results.append({"gauge": j["gauge"],
+                            "error": f"{type(e).__name__}: {e}"})
+    return {"ran": len(results), "ended": ended, "results": results}

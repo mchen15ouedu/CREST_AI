@@ -57,11 +57,16 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
     ev = manifest["event_id"]
     with _lock:
         idx = load_index()
-        idx.pop(ev, None)
+        prior = idx.pop(ev, None)
         summary = {k: manifest.get(k) for k in
                    ("bbox", "t0", "sim_start", "t_end", "model", "trigger",
-                    "generated")}
+                    "generated", "gauge")}
         summary["n_frames"] = len(manifest.get("frames", []))
+        summary["status"] = manifest.get("status", "active")
+        # the episode keeps its first trigger time across hourly re-publishes
+        summary["episode_started"] = ((prior or {}).get("episode_started")
+                                      or manifest.get("t0"))
+        summary["archive_frames"] = manifest.get("archive_frames")
         # newest first
         idx = {ev: summary, **idx}
         drop = list(idx.keys())[KEEP_EVENTS:]
@@ -69,6 +74,11 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
             idx.pop(d, None)
 
         ops = []
+        if prior is not None:
+            # hourly re-publish of an ongoing episode: replace the folder so
+            # frames from the previous (1-h-older) window don't linger with
+            # shifted timestamps (deletions apply before additions)
+            ops.append(CommitOperationDelete(f"{PREFIX}/{ev}/", is_folder=True))
         for fn in sorted(os.listdir(local_dir)):
             p = os.path.join(local_dir, fn)
             if os.path.isfile(p):
@@ -99,6 +109,33 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
                               commit_message=f"event {ev} "
                                              f"(+{len(ops) - 1 - len(drop)} files, "
                                              f"-{len(drop)} old)")
+            return True
+        except Exception:
+            return False
+
+
+def mark_ended(event_ids) -> bool:
+    """Flip episodes to 'ended' in the index (single small commit). Their
+    folders — including archive.parquet — stay until retention removes them."""
+    from huggingface_hub import CommitOperationAdd
+    api = _api()
+    if api is None:
+        return False
+    with _lock:
+        idx = load_index()
+        changed = [e for e in event_ids
+                   if e in idx and idx[e].get("status") != "ended"]
+        if not changed:
+            return True
+        for e in changed:
+            idx[e]["status"] = "ended"
+        try:
+            api.create_commit(
+                repo_id=REPO, repo_type="dataset",
+                operations=[CommitOperationAdd(
+                    f"{PREFIX}/index.json",
+                    io.BytesIO(json.dumps(idx).encode()))],
+                commit_message=f"episodes ended: {', '.join(changed)}")
             return True
         except Exception:
             return False
