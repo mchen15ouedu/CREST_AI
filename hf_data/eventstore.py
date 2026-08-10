@@ -20,7 +20,11 @@ import threading
 
 REPO = os.environ.get("CREST_DATA_REPO", "vincewin/CREST_data")
 PREFIX = "events"
-KEEP_EVENTS = int(os.environ.get("EVENT_KEEP", "20"))
+# tiered retention: newest KEEP_FULL events keep their full frame stacks;
+# older ones are demoted to manifest + maxdepth (tif+png) only; beyond
+# KEEP_EVENTS the folder is deleted. ~8 x 35 MB + 32 x ~1.5 MB < 350 MB.
+KEEP_FULL = int(os.environ.get("EVENT_KEEP_FULL", "8"))
+KEEP_EVENTS = int(os.environ.get("EVENT_KEEP", "40"))
 
 _lock = threading.Lock()
 
@@ -69,6 +73,22 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
             p = os.path.join(local_dir, fn)
             if os.path.isfile(p):
                 ops.append(CommitOperationAdd(f"{PREFIX}/{ev}/{fn}", p))
+        # demote events beyond KEEP_FULL: drop the frame stacks, keep
+        # manifest + maxdepth + dem (validation/archive tier)
+        demote = [d for d in list(idx.keys())[KEEP_FULL:]
+                  if not idx[d].get("demoted")]
+        if demote:
+            try:
+                allfiles = api.list_repo_files(REPO, repo_type="dataset")
+            except Exception:
+                allfiles, demote = [], []
+            for d in demote:
+                for f in allfiles:
+                    base = os.path.basename(f)
+                    if (f.startswith(f"{PREFIX}/{d}/")
+                            and base.startswith("depth_")):
+                        ops.append(CommitOperationDelete(f))
+                idx[d]["demoted"] = True
         ops.append(CommitOperationAdd(
             f"{PREFIX}/index.json",
             io.BytesIO(json.dumps(idx).encode())))

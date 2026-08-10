@@ -2572,3 +2572,157 @@ initAuth();
 loadHuc8();                         // HUC8 basin guide (zoom in for gauge pins)
 loadViewportGauges();               // gauge pins when already zoomed in
 reattach();                         // pick up a run started before the app was closed
+
+// ---- V25: Events mode (2-D inundation from CREST-iMAP v2) ----------------
+let eventsMode = false;
+let evtGroup = null;                 // L.layerGroup for the depth overlay
+let evtOverlay = null;               // current L.imageOverlay
+let evtManifest = null;              // selected event's manifest
+let evtBase = "";                    // HF resolve base URL
+let evtFrameIdx = -1;                // -1 => maxdepth
+let evtTimer = null;
+let evtPanel = null;
+
+function enterEventsMode() {
+  if (eventsMode) return;
+  if (nowcastMode) setMode(false);   // reuse hindcast layer teardown
+  eventsMode = true;
+  document.getElementById("mode-hind").classList.remove("on");
+  document.getElementById("mode-now").classList.remove("on");
+  document.getElementById("mode-evt").classList.add("on");
+  if (!evtGroup) evtGroup = L.layerGroup().addTo(map);
+  addMsg("🌊 <b>Events mode</b> — when the nowcast flags a gauge at flood level " +
+         "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the basin " +
+         "in 2-D: blue shading is simulated water depth (darker = deeper). Pick an " +
+         "event to animate its depth frames or view the maximum-depth footprint.",
+         "status");
+  loadEvents();
+}
+
+function leaveEventsMode() {
+  if (!eventsMode) return;
+  eventsMode = false;
+  document.getElementById("mode-evt").classList.remove("on");
+  stopEvtPlay();
+  if (evtOverlay) { evtGroup.removeLayer(evtOverlay); evtOverlay = null; }
+  if (evtPanel) { evtPanel.remove(); evtPanel = null; }
+  evtManifest = null;
+}
+
+async function loadEvents() {
+  let d = null;
+  try { d = await (await fetch("/api/events")).json(); } catch (_) {}
+  if (!d) { addMsg("⚠️ Couldn't load the event list.", "status"); return; }
+  evtBase = d.base;
+  const ids = Object.keys(d.events || {});
+  if (evtPanel) evtPanel.remove();
+  evtPanel = document.createElement("div");
+  evtPanel.id = "evt-panel";
+  evtPanel.style.cssText =
+    "position:absolute;top:70px;left:10px;z-index:1000;background:rgba(18,26,38,.92);" +
+    "color:#dfe9f5;border:1px solid #33475e;border-radius:10px;padding:10px 12px;" +
+    "max-width:300px;max-height:60vh;overflow:auto;font-size:12.5px;line-height:1.45";
+  const r = d.runner || {};
+  let html = "<b>🌊 Inundation events</b><br>";
+  if (r.running) {
+    html += `<div style="color:#ffd479">⏳ simulating <b>${r.running}</b> (${r.status})</div>`;
+  } else if (r.last && r.last.ok === false) {
+    html += `<div style="color:#ff9d9d">last run failed: ${r.last.error || ""}</div>`;
+  }
+  if (!ids.length) html += "<div style='opacity:.8'>No published events yet.</div>";
+  evtPanel.innerHTML = html;
+  ids.forEach((id) => {
+    const s = d.events[id];
+    const b = document.createElement("button");
+    b.style.cssText = "display:block;width:100%;text-align:left;margin:5px 0;" +
+      "background:#22334a;color:#dfe9f5;border:1px solid #3c557a;border-radius:7px;" +
+      "padding:6px 8px;cursor:pointer;font-size:12px";
+    b.innerHTML = `<b>${(s.trigger && s.trigger.gauge) || id}</b> · t0 ${s.t0 || "?"}` +
+      `<br><span style="opacity:.75">${s.n_frames || 0} frames` +
+      `${s.demoted ? " (archived: max-depth only)" : ""}</span>`;
+    b.onclick = () => selectEvent(id, s);
+    evtPanel.appendChild(b);
+  });
+  document.getElementById("map").appendChild(evtPanel);
+  if (r.running && eventsMode) setTimeout(loadEvents, 20000);
+}
+
+async function selectEvent(id, summary) {
+  stopEvtPlay();
+  let man = null;
+  try { man = await (await fetch(`${evtBase}/${id}/manifest.json`)).json(); }
+  catch (_) { addMsg("⚠️ Couldn't load that event's manifest.", "status"); return; }
+  evtManifest = { ...man, _id: id, _demoted: !!(summary && summary.demoted) };
+  const ctl = document.createElement("div");
+  ctl.id = "evt-ctl";
+  ctl.style.cssText = "margin-top:8px;border-top:1px solid #33475e;padding-top:7px";
+  const nF = (man.frames || []).length;
+  const canAnim = nF > 0 && !evtManifest._demoted;
+  ctl.innerHTML =
+    `<b>${id}</b><br><span style="opacity:.8">cap ${man.depth_cap_m || 3} m · ` +
+    `grid ${man.grid.nx}×${man.grid.ny} @ ~${Math.round(man.grid.dx_m)} m</span><br>` +
+    `<button id="evt-max" style="margin:5px 4px 0 0">max depth</button>` +
+    (canAnim ? `<button id="evt-play">▶</button>` +
+      `<input id="evt-slider" type="range" min="0" max="${nF - 1}" value="0"` +
+      ` style="width:120px;vertical-align:middle">` +
+      `<span id="evt-t" style="opacity:.8"></span>` : "") +
+    `<div style="margin-top:6px;height:8px;border-radius:4px;background:` +
+    `linear-gradient(90deg, rgba(173,216,230,.45), rgb(8,48,107))"></div>` +
+    `<div style="display:flex;justify-content:space-between;opacity:.7">` +
+    `<span>0 m</span><span>≥ ${man.depth_cap_m || 3} m</span></div>`;
+  const old = document.getElementById("evt-ctl");
+  if (old) old.remove();
+  evtPanel.appendChild(ctl);
+  document.getElementById("evt-max").onclick = () => showEvtFrame(-1);
+  if (canAnim) {
+    document.getElementById("evt-play").onclick = toggleEvtPlay;
+    document.getElementById("evt-slider").oninput = (e) =>
+      showEvtFrame(parseInt(e.target.value, 10));
+  }
+  showEvtFrame(-1);
+  try { map.fitBounds(man.bounds, { padding: [40, 40] }); } catch (_) {}
+}
+
+function showEvtFrame(i) {
+  if (!evtManifest) return;
+  evtFrameIdx = i;
+  const man = evtManifest;
+  const file = i < 0 ? man.maxdepth_png : man.frames[i].png;
+  const url = `${evtBase}/${man._id}/${file}`;
+  if (evtOverlay) { evtOverlay.setUrl(url); }
+  else {
+    evtOverlay = L.imageOverlay(url, man.bounds,
+      { opacity: 0.85, interactive: false }).addTo(evtGroup);
+  }
+  const lab = document.getElementById("evt-t");
+  if (lab) lab.textContent = i < 0 ? " max" : ` ${man.frames[i].t.slice(5, 16)}`;
+  const sl = document.getElementById("evt-slider");
+  if (sl && i >= 0) sl.value = i;
+}
+
+function stepEvtFrame() {
+  if (!evtManifest || !evtManifest.frames.length) return;
+  showEvtFrame(evtFrameIdx >= evtManifest.frames.length - 1 ? 0 : evtFrameIdx + 1);
+}
+function toggleEvtPlay() {
+  if (evtTimer) { stopEvtPlay(); return; }
+  document.getElementById("evt-play").textContent = "⏸";
+  evtTimer = setInterval(stepEvtFrame, 400);
+}
+function stopEvtPlay() {
+  if (evtTimer) { clearInterval(evtTimer); evtTimer = null; }
+  const b = document.getElementById("evt-play");
+  if (b) b.textContent = "▶";
+}
+
+document.getElementById("mode-evt").onclick = () => enterEventsMode();
+document.getElementById("mode-hind").onclick = () => {
+  leaveEventsMode();
+  if (nowcastMode) setMode(false);
+  else document.getElementById("mode-hind").classList.add("on");
+};
+document.getElementById("mode-now").onclick = () => {
+  leaveEventsMode();
+  if (!nowcastMode) setMode(true);
+  else document.getElementById("mode-now").classList.add("on");
+};
