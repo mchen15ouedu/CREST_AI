@@ -30,7 +30,10 @@ MAX_PER_TICK = int(os.environ.get("EVENT_MAX_PER_TICK", "2"))
 # events don't need the fleet's 90-day spin-up: upstream DA injection carries
 # the river and the flood is driven by current rain; 30 d bounds forcing prep
 WARMUP_D = int(os.environ.get("EVENT_WARMUP_D", "30"))
-SIM_BACKSET_H = int(os.environ.get("EVENT_SIM_BACKSET_H", "6"))
+# the trigger typically fires slightly AFTER the flood starts (AI peak must
+# clear Q5 and the obs gate must confirm), so the hydrodynamic window reaches
+# back 12 h from t0 to capture the rising limb from the beginning
+SIM_BACKSET_H = int(os.environ.get("EVENT_SIM_BACKSET_H", "12"))
 MAX_CELLS = int(os.environ.get("EVENT_MAX_CELLS", "400000"))
 DEM_RES = os.environ.get("EVENT_DEM_RES", "1")
 DEM_CACHE = os.environ.get("EVENT_DEM_CACHE",
