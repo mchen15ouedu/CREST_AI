@@ -46,30 +46,77 @@ def status(full: bool = False) -> dict:
             "last": _running["last"]}
 
 
+OBS_GATE_FRAC = float(os.environ.get("EVENT_OBS_GATE", "0.3"))   # of Q2
+OBS_WINDOW_H = int(os.environ.get("EVENT_OBS_WINDOW_H", "6"))
+
+
+def _recent_obs_max(gid: str) -> float | None:
+    """Max observed flow [m3/s] at the gauge over the last OBS_WINDOW_H
+    hours from NWIS IV; None if the gauge reports nothing."""
+    import json as _json
+    import urllib.request
+    url = ("https://waterservices.usgs.gov/nwis/iv/?format=json"
+           f"&sites={gid}&period=PT{OBS_WINDOW_H}H&parameterCd=00060")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            d = _json.load(r)
+        vals = []
+        for ts in d["value"]["timeSeries"]:
+            for block in ts["values"]:
+                for v in block["value"]:
+                    q = float(v["value"])
+                    if q > -999:
+                        vals.append(q * 0.0283168)   # cfs -> m3/s
+        return max(vals) if vals else None
+    except Exception:
+        return None
+
+
 def detect(max_events: int = 1) -> list[dict]:
     """Trigger gauges: per hotspot cluster, the tier-3 member with the
-    largest drainage area (captures the shared basin)."""
+    largest drainage area — GATED on real observations. The AI tier alone
+    can hallucinate floods at data-dead gauges (seen live: two tier-3
+    triggers with zero USGS data and ~0 simulated flow), so a trigger also
+    requires the gauge to be reporting AND already at >= EVENT_OBS_GATE of
+    bankfull (Q2) within the last few hours."""
     from . import nowcaststore, pipeline
     hs = nowcaststore.hotspots()
     picks = []
     if not hs.get("ok"):
         return picks
+    try:
+        thr = nowcaststore._thresholds()
+    except Exception:
+        thr = {}
     seen = set()
     for cluster in hs.get("hotspots", []):
         reds = [m for m in cluster.get("top_gauges", []) if m.get("tier") == 3]
-        best, best_area = None, -1.0
+        cands = []
         for m in reds:
             g = pipeline.gauge_info(m["id"])
-            if not g or g["id"] in seen:
+            if g and g["id"] not in seen:
+                cands.append((float(g.get("area") or 0.0), g))
+        for area, g in sorted(cands, reverse=True, key=lambda t: t[0]):
+            gid = g["id"]
+            obs = _recent_obs_max(gid)
+            if obs is None:
+                print(f"event trigger {gid}: SKIP — no USGS obs in "
+                      f"{OBS_WINDOW_H} h (AI tier unsupported)")
                 continue
-            area = float(g.get("area") or 0.0)
-            if area > best_area:
-                best, best_area = g, area
-        if best:
-            seen.add(best["id"])
-            picks.append({"gauge": best["id"], "lat": best["lat"],
-                          "lon": best["lon"], "area_km2": best_area,
+            q2 = None
+            t = thr.get(gid)
+            if t is not None:
+                q2 = t[1] if t[1] == t[1] else None    # NaN check
+            gate = max(OBS_GATE_FRAC * q2, 1.0) if q2 else 1.0
+            if obs < gate:
+                print(f"event trigger {gid}: SKIP — obs {obs:.1f} m3/s below "
+                      f"gate {gate:.1f} (river not responding yet)")
+                continue
+            seen.add(gid)
+            picks.append({"gauge": gid, "lat": g["lat"], "lon": g["lon"],
+                          "area_km2": area, "obs_m3s": round(obs, 1),
                           "hotspot_score": cluster.get("score")})
+            break
         if len(picks) >= max_events:
             break
     return picks
@@ -171,6 +218,12 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         except Exception as e:
             log(f"archive update failed ({type(e).__name__}: {e}) — "
                 f"continuing without it")
+        if not manifest.get("archive_frames"):
+            # bone-dry simulation: nothing to show, nothing to re-run — end
+            # the episode so the hourly tick stops burning compute on it
+            manifest["status"] = "ended"
+            manifest["dry"] = True
+            log("simulated dry (no wet cells in any frame) — episode ended")
 
         with _lock:
             _running["status"] = "render"
