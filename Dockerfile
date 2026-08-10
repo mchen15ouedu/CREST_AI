@@ -49,10 +49,11 @@ RUN pip3 install --no-cache-dir --upgrade pip \
 # satisfied (PyPI default would pull multi-GB CUDA wheels). The fork is ~2 GB
 # (v1 case data), so clone blobless+sparse: only crestimap/ is materialized.
 RUN pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
- && git clone --filter=blob:none --sparse https://github.com/mchen15ouedu/CREST-iMAP.git /opt/crest-imap \
- && git -C /opt/crest-imap sparse-checkout set --cone crestimap \
- && git -C /opt/crest-imap checkout v2 \
- && pip3 install --no-cache-dir /opt/crest-imap \
+ && git clone --filter=blob:none --no-checkout https://github.com/mchen15ouedu/CREST-iMAP.git /opt/crest-imap \
+ && git -C /opt/crest-imap checkout origin/v2 -- crestimap \
+ && test -f /opt/crest-imap/crestimap/__init__.py \
+ && cp -r /opt/crest-imap/crestimap "$(python3 -c 'import site; print(site.getsitepackages()[0])')/" \
+ && rm -rf /opt/crest-imap \
  && python3 -c "import crestimap; print('crestimap', crestimap.__version__)"
 
 # ---- App code + EF5 binary on the expected path (AQUAH uses ./EF5/bin/ef5) ----
