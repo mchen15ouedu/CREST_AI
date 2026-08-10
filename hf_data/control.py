@@ -53,7 +53,8 @@ class ControlSpec:
     pet_unit: str = "mm/100d"
     model: str = "CREST"
     routing: str = "KW"
-    output_grids: bool = True                        # 2-D streamflow for live map
+    output_grids: bool | str = True                  # True -> streamflow; or EF5 token list
+                                                     # e.g. "streamflow|soilmoisture|runoff|subrunoff" (event runs)
     proj: str = "geographic"
     esriddm: bool = True
     selffam: bool = True
@@ -170,7 +171,8 @@ def build_control(spec: ControlSpec) -> str:
         if spec.da_file:               # assimilate upstream-gauge observations
             b += f"DA_FILE={os.path.abspath(spec.da_file)}\n"
         if grids:
-            b += "output_grids=streamflow\n"          # per EF5 manual; writes q.<time>.<model>.tif
+            toks = grids if isinstance(grids, str) else "streamflow"
+            b += f"output_grids={toks}\n"             # pipe-separated GriddedOutputText tokens
         if sd:                                         # STATES= -> load state dated TIME_BEGIN
             b += f"STATES={sd}\n"
             if save_state_at is not None:              # STATES+TIME_STATE => save at this time
