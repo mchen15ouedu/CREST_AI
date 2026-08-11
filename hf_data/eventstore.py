@@ -13,6 +13,7 @@ Storage discipline (HF limits):
 """
 from __future__ import annotations
 
+import datetime
 import io
 import json
 import os
@@ -23,10 +24,30 @@ PREFIX = "events"
 # tiered retention: newest KEEP_FULL events keep their full frame stacks;
 # older ones are demoted to manifest + maxdepth (tif+png) only; beyond
 # KEEP_EVENTS the folder is deleted. ~8 x 35 MB + 32 x ~1.5 MB < 350 MB.
+# Independently of the count caps, MAX_AGE_D bounds how long the event LIST
+# grows: events older than this are removed entirely (folder + index entry)
+# by the hourly retention_sweep, so the panel stays a rolling ~month.
 KEEP_FULL = int(os.environ.get("EVENT_KEEP_FULL", "8"))
 KEEP_EVENTS = int(os.environ.get("EVENT_KEEP", "40"))
+MAX_AGE_D = float(os.environ.get("EVENT_MAX_AGE_D", "30"))
 
 _lock = threading.Lock()
+
+
+def _age_days(event_id: str) -> float | None:
+    """Event age from the id's YYYYMMDDHH prefix (e.g. 2026081015_07233650)."""
+    try:
+        t = datetime.datetime.strptime(str(event_id)[:10], "%Y%m%d%H")
+        return (datetime.datetime.utcnow() - t).total_seconds() / 86400.0
+    except ValueError:
+        return None
+
+
+def _aged_out(idx: dict, keep: str | None = None) -> list[str]:
+    return [e for e in idx
+            if e != keep
+            and idx[e].get("status") != "active"
+            and (_age_days(e) or 0.0) > MAX_AGE_D]
 
 
 def _api():
@@ -70,6 +91,7 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
         # newest first
         idx = {ev: summary, **idx}
         drop = list(idx.keys())[KEEP_EVENTS:]
+        drop += [d for d in _aged_out(idx, keep=ev) if d not in drop]
         for d in drop:
             idx.pop(d, None)
 
@@ -139,6 +161,35 @@ def mark_ended(event_ids) -> bool:
             return True
         except Exception:
             return False
+
+
+def retention_sweep() -> int:
+    """Remove events older than EVENT_MAX_AGE_D (folder + index entry) in one
+    commit. Called from the hourly tick so the list ages out even during
+    quiet stretches with no new events; almost always a no-op. Returns the
+    number of events removed (0 on no-op or failure)."""
+    from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+    api = _api()
+    if api is None:
+        return 0
+    with _lock:
+        idx = load_index()
+        aged = _aged_out(idx)
+        if not aged:
+            return 0
+        for e in aged:
+            idx.pop(e, None)
+        ops = [CommitOperationDelete(f"{PREFIX}/{e}/", is_folder=True)
+               for e in aged]
+        ops.append(CommitOperationAdd(f"{PREFIX}/index.json",
+                                      io.BytesIO(json.dumps(idx).encode())))
+        try:
+            api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
+                              commit_message=f"retention: -{len(aged)} events "
+                                             f"older than {MAX_AGE_D:g} d")
+            return len(aged)
+        except Exception:
+            return 0
 
 
 def event_url(event_id: str, filename: str) -> str:

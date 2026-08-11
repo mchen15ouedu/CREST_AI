@@ -37,6 +37,36 @@ _lock = threading.Lock()
 _cache: dict = {"at": 0.0, "meta": None, "cols": None}
 _thr: dict = {"at": 0.0, "map": None}     # gid -> Q10 (m3/s); static file
 THR_TTL_S = 3600
+_pc: dict = {"at": 0.0, "times": None, "idx": None, "arr": None}
+
+
+def _precip_cache():
+    """72-h basin-mean MRMS precip per gauge from nowcast/precip_cache.parquet
+    (written by the same hourly commit as latest.parquet, so it matches t0).
+    Returns (times [iso-hour strs], {gid: row index}, arr [n_gauges, n_hours])
+    or (None, None, None)."""
+    now = time.time()
+    with _lock:
+        if _pc["arr"] is not None and now - _pc["at"] < TTL_S:
+            return _pc["times"], _pc["idx"], _pc["arr"]
+    try:
+        import pyarrow.parquet as pq
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(REPO, "nowcast/precip_cache.parquet",
+                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
+        t = pq.read_table(p)
+        hcols = sorted(n for n in t.schema.names if n.startswith("h")
+                       and n[1:].isdigit())
+        times = [f"{n[1:5]}-{n[5:7]}-{n[7:9]} {n[9:11]}:00" for n in hcols]
+        idx = {g: i for i, g in enumerate(t.column("gid").to_pylist())}
+        arr = np.stack([t.column(n).to_numpy(zero_copy_only=False)
+                        for n in hcols], 1).astype("float32")
+        with _lock:
+            _pc.update(at=now, times=times, idx=idx, arr=arr)
+        return times, idx, arr
+    except Exception:
+        with _lock:
+            return _pc["times"], _pc["idx"], _pc["arr"]
 
 
 def _load():
@@ -380,6 +410,17 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
                 g["obs"] = []
         with ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(_series, gauges))
+        # basin-mean MRMS precip over the model's 72-h lookback, so the panel
+        # can draw a real hydrograph (inverted precip bars over the flow)
+        ptimes, pidx, parr = _precip_cache()
+        if parr is not None:
+            for g in gauges:
+                i = pidx.get(g["id"])
+                if i is None:
+                    continue
+                v = parr[i]
+                g["precip"] = [[ptimes[k], round(float(v[k]), 2)]
+                               for k in range(len(ptimes)) if v[k] == v[k]]
     return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
             "times": times, "n_in_view": total, "truncated": total > len(gauges),
             "model": {"epoch": meta.get("model_epoch"),

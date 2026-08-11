@@ -125,6 +125,52 @@ def detect(max_events: int = 1) -> list[dict]:
     return picks
 
 
+def _basin_outline(ef5_dir: str, max_pts: int = 1200):
+    """True upstream-catchment boundary as [[lat, lon], ...] — EF5 carves the
+    watershed from the gauge and writes nodata outside it in every gridded
+    output, so the valid-data mask of any output grid IS the basin at 3
+    arc-sec. Coarsened so the ring stays a few KB in the manifest. None on
+    any failure (the UI falls back to the domain rectangle)."""
+    import glob
+
+    import numpy as np
+    import rasterio
+    from rasterio import features
+
+    fs = []
+    for kind in ("streamflow", "runoff", "subrunoff", "soilmoisture"):
+        fs = sorted(glob.glob(os.path.join(ef5_dir, f"{kind}.*.tif")))
+        if fs:
+            break
+    if not fs:
+        return None
+    with rasterio.open(fs[-1]) as ds:
+        a = ds.read(1)
+        nod = ds.nodata
+        tr = ds.transform
+    m = np.isfinite(a) & ((a != nod) if nod is not None else (a > -1.0))
+    if not m.any():
+        return None
+    f = max(1, int(np.ceil(max(m.shape) / 400)))     # keep the mask <= ~400 px
+    if f > 1:
+        ny, nx = m.shape[0] // f, m.shape[1] // f
+        m = m[:ny * f, :nx * f].reshape(ny, f, nx, f).any(axis=(1, 3))
+        tr = rasterio.Affine(tr.a * f, tr.b, tr.c, tr.d, tr.e * f, tr.f)
+    best, best_area = None, 0.0
+    for geom, val in features.shapes(m.astype("uint8"), transform=tr):
+        if val != 1:
+            continue
+        ring = geom["coordinates"][0]
+        area = abs(sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2)
+                       in zip(ring, ring[1:])))     # shoelace, lon/lat units
+        if area > best_area:
+            best, best_area = ring, area
+    if not best:
+        return None
+    step = max(1, len(best) // max_pts)
+    return [[round(y, 4), round(x, 4)] for x, y in best[::step]]
+
+
 def run_one(gid: str, t0: datetime.datetime | None = None,
             trigger: dict | None = None, episode_id: str | None = None) -> dict:
     """Full event pipeline for one trigger gauge. Blocking (minutes-long);
@@ -213,6 +259,12 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         manifest["gauge"] = gid
         manifest["hydro"] = [hydro[k] for k in sorted(hydro)]
         manifest["status"] = "active"
+        try:                       # true watershed ring for the map overlay
+            manifest["basin"] = _basin_outline(out_dir)
+            if manifest["basin"]:
+                log(f"basin outline: {len(manifest['basin'])} vertices")
+        except Exception as e:
+            log(f"basin outline skipped ({type(e).__name__}: {e})")
 
         with _lock:
             _running["status"] = "archive"
@@ -467,4 +519,9 @@ def hourly_tick() -> dict:
         except Exception as e:
             results.append({"gauge": j["gauge"],
                             "error": f"{type(e).__name__}: {e}"})
-    return {"ran": len(results), "ended": ended, "results": results}
+    try:                       # age out old events (no-op most hours)
+        swept = eventstore.retention_sweep()
+    except Exception:
+        swept = 0
+    return {"ran": len(results), "ended": ended, "swept": swept,
+            "results": results}

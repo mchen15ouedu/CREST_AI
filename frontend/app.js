@@ -2411,6 +2411,15 @@ function _nowcastFig(id, big) {
   const nc = nowcastRes.gauges[id];
   const obs = nc.obs || [];
   const traces = [];
+  // basin-mean MRMS precip (the model's own 72-h forcing window), drawn as
+  // inverted bars from the top like a real hydrograph
+  const pr = nc.precip || [];
+  const maxp = Math.max(0.1, ...pr.map((r) => r[1]));
+  if (pr.length) {
+    traces.push({ x: pr.map((r) => tsDisp(r[0])), y: pr.map((r) => r[1]),
+      name: "Precip", type: "bar", marker: { color: "#5b9bd5" },
+      yaxis: "y2", opacity: 0.7 });
+  }
   if (obs.length) {
     traces.push({ x: obs.map((r) => tsDisp(r[0])), y: obs.map((r) => r[1]), name: "Obs Q",
       mode: "lines", line: { color: "#f4f4f4", width: big ? 1.8 : 1.5,
@@ -2438,13 +2447,14 @@ function _nowcastFig(id, big) {
              axMs(t0ms + (nowcastRes.times.length + 0.5) * 3600e3)];
   }
   const layout = {
-    margin: big ? { l: 56, r: 24, t: 18, b: 40 } : { l: 46, r: 12, t: 12, b: 30 },
-    showlegend: true,
+    margin: big ? { l: 56, r: 56, t: 18, b: 40 } : { l: 46, r: 46, t: 12, b: 30 },
+    bargap: 0, showlegend: true,
     legend: { orientation: "h", y: big ? 1.08 : 1.18, font: { size: big ? 11 : 9 } },
     paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
     font: { color: "#cdd9e2", size: big ? 12 : 10 },
     xaxis: { gridcolor: "rgba(255,255,255,.06)", range: range || undefined },
     yaxis: { title: "Q m³/s", rangemode: "tozero", gridcolor: "rgba(255,255,255,.06)" },
+    yaxis2: { overlaying: "y", side: "right", range: [maxp * 3.4, 0], showgrid: false },
     shapes: issue ? [{ type: "line", x0: issue, x1: issue, y0: 0, y1: 1, yref: "paper",
                        line: { color: "#ffd23f", width: 1.2, dash: "dot" } }] : [],
     hovermode: "x",
@@ -2582,6 +2592,9 @@ let evtBase = "";                    // HF resolve base URL
 let evtFrameIdx = -1;                // -1 => maxdepth
 let evtTimer = null;
 let evtPanel = null;
+let evtPinsLayer = null;             // CONUS overview: one pin per event (or heat)
+let evtSiteLayer = null;             // selected event: gauge pin + basin + domain
+const EVT_HEAT_N = 30;               // above this many events, pins become a heatmap
 
 function enterEventsMode() {
   if (eventsMode) return;
@@ -2591,10 +2604,12 @@ function enterEventsMode() {
   document.getElementById("mode-now").classList.remove("on");
   document.getElementById("mode-evt").classList.add("on");
   if (!evtGroup) evtGroup = L.layerGroup().addTo(map);
+  map.setView([39, -98], 5, { animate: false });   // CONUS overview: event pins
   addMsg("<b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
          "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the basin " +
-         "in 2-D: blue shading is simulated water depth (darker = deeper). Pick an " +
-         "event to animate its depth frames or view the maximum-depth footprint; " +
+         "in 2-D: blue shading is simulated water depth (darker = deeper). Map pins " +
+         "mark every stored event — click one (or the list) to load it; the basin " +
+         "boundary and simulated domain are outlined so you can see the area, and " +
          "the right panel shows the trigger gauge's simulated streamflow against " +
          "USGS observations.", "status");
   loadEvents();
@@ -2606,8 +2621,72 @@ function leaveEventsMode() {
   document.getElementById("mode-evt").classList.remove("on");
   stopEvtPlay();
   if (evtOverlay) { evtGroup.removeLayer(evtOverlay); evtOverlay = null; }
+  if (evtPinsLayer) { try { map.removeLayer(evtPinsLayer); } catch (_) {} evtPinsLayer = null; }
+  if (evtSiteLayer) { try { map.removeLayer(evtSiteLayer); } catch (_) {} evtSiteLayer = null; }
   if (evtPanel) { evtPanel.remove(); evtPanel = null; }
   evtManifest = null;
+}
+
+// event location: trigger gauge if recorded, else the domain-bbox center
+function evtLatLon(s) {
+  const tg = (s && s.trigger) || {};
+  if (isFinite(tg.lat) && isFinite(tg.lon)) return [tg.lat, tg.lon];
+  const b = s && s.bbox;                              // [w, s, e, n]
+  if (Array.isArray(b) && b.length === 4) return [(b[1] + b[3]) / 2, (b[0] + b[2]) / 2];
+  return null;
+}
+
+// CONUS overview: a pin per stored event; heatmap instead when they get dense
+function renderEventPins(d) {
+  if (evtPinsLayer) { try { map.removeLayer(evtPinsLayer); } catch (_) {} evtPinsLayer = null; }
+  if (!eventsMode) return;
+  const pts = [];
+  Object.keys(d.events || {}).forEach((id) => {
+    const ll = evtLatLon(d.events[id]);
+    if (ll) pts.push([id, d.events[id], ll]);
+  });
+  if (!pts.length) return;
+  if (pts.length > EVT_HEAT_N && typeof L.heatLayer === "function") {
+    evtPinsLayer = L.heatLayer(pts.map((p) => [p[2][0], p[2][1], 1]),
+      { radius: 30, blur: 20, max: 1, minOpacity: 0.4,
+        gradient: { 0.3: "#0b3d66", 0.7: "#1d6fb8", 1: "#7ec8ff" } }).addTo(map);
+    return;
+  }
+  evtPinsLayer = L.layerGroup(pts.map(([id, s, ll]) => {
+    const active = s.status === "active";
+    const mk = L.circleMarker(ll, { radius: 8, weight: 2,
+      color: active ? "#7fd47f" : "#7ab3e8",
+      fillColor: active ? "#2f7d3f" : "#1d4c7a", fillOpacity: 0.85 });
+    mk.bindTooltip(`<b>${(s.trigger && s.trigger.gauge) || id}</b> · t0 ${s.t0 || "?"}` +
+      (active ? " · active" : ""), { sticky: true });
+    mk.on("click", () => selectEvent(id, s));
+    return mk;
+  })).addTo(map);
+}
+
+// selected event: trigger-gauge pin, true watershed ring (from the manifest,
+// derived from EF5's catchment mask), and the simulated-domain rectangle
+function drawEventSite(man) {
+  if (evtSiteLayer) { try { map.removeLayer(evtSiteLayer); } catch (_) {} }
+  evtSiteLayer = L.layerGroup().addTo(map);
+  const gid = (man.trigger && man.trigger.gauge) || man.gauge || "";
+  const bb = man.bbox;                                 // [w, s, e, n]
+  if (Array.isArray(bb) && bb.length === 4) {
+    L.rectangle([[bb[1], bb[0]], [bb[3], bb[2]]],
+      { color: "#9ecbff", weight: 1.2, dashArray: "6 5", fill: false, opacity: 0.7 })
+      .bindTooltip("Simulated domain", { sticky: true }).addTo(evtSiteLayer);
+  }
+  if (Array.isArray(man.basin) && man.basin.length > 3) {
+    L.polygon(man.basin, { color: "#ffd23f", weight: 2, fill: true,
+      fillColor: "#ffd23f", fillOpacity: 0.05, opacity: 0.9 })
+      .bindTooltip(`Basin draining to gauge ${gid}`, { sticky: true })
+      .addTo(evtSiteLayer);
+  }
+  const ll = evtLatLon(man);
+  if (ll) {
+    L.marker(ll).bindTooltip(`Trigger gauge ${gid}`, { direction: "top" })
+      .addTo(evtSiteLayer);
+  }
 }
 
 async function loadEvents() {
@@ -2647,6 +2726,7 @@ async function loadEvents() {
     evtPanel.appendChild(b);
   });
   document.getElementById("map").appendChild(evtPanel);
+  renderEventPins(d);
   if (r.running && eventsMode) setTimeout(loadEvents, 20000);
 }
 
@@ -2683,6 +2763,7 @@ async function selectEvent(id, summary) {
       showEvtFrame(parseInt(e.target.value, 10));
   }
   showEvtFrame(-1);
+  drawEventSite(evtManifest);
   try { map.fitBounds(man.bounds, { padding: [40, 40] }); } catch (_) {}
 
   // right panel: the trigger gauge's 1-D hydrograph — EF5 simulated flow
