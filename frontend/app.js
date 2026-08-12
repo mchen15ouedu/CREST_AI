@@ -1235,7 +1235,7 @@ function _hydroFig(rows, big, nc, splitT0, splitKind) {
     traces.push({ x, y: past, name: evt ? "Sim Q" : "Routed (obs upstream)",
       mode: "lines", connectgaps: false,
       line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } });
-    traces.push({ x, y: fut, name: evt ? "Sim Q (nowcast)" : "🔮 Routed nowcast",
+    traces.push({ x, y: fut, name: evt ? "nowcast" : "🔮 Routed nowcast",
       mode: "lines", connectgaps: false,
       line: { color: "#ff9f43", width: big ? 2.4 : 2.0, dash: "dot", shape: "spline", smoothing: 0.8 } });
   } else {

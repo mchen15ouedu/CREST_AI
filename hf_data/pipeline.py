@@ -433,7 +433,12 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         yield ("done", {"returncode": -9, "cancelled": True})
         return
 
-    if timestep == "1h" and not no_cache and not use_mock and not g.get("virtual"):
+    # nowcast/event runs force no_cache (their fabricated future must never
+    # enter the row cache) but warm-starting from fleet STATES is still right:
+    # without it an event run cold-starts on a 30-day warm-up (dry soils
+    # crush flood peaks), so include nowcast_t0 runs in the fleet fetch
+    if timestep == "1h" and (not no_cache or nowcast_t0) and not use_mock \
+            and not g.get("virtual"):
         try:      # fleet pre-runs (read-only repo): rows serve instantly below,
             from hf_data import fleetstore     # states give 10-day warm starts
             if fleetstore.ensure_local(g["id"], cache_model) == "fetched":
@@ -610,6 +615,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         elif bc_gauges:
             f0 = warmup_start or run_start
             bc_dir = os.path.join(work, "USGS_bc")
+            nc_pts_total = 0
             for b_ in bc_gauges:
                 try:
                     s = obs.get_series(b_["id"], f0, run_end)
@@ -617,6 +623,20 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                     from hf_data import crashlog
                     crashlog.capture("obs:bc", e, gauge=b_["id"])
                     s = []
+                if s and nowcast_t0:
+                    # event/nowcast run: extend DA with the gauge's own DI-LSTM
+                    # prediction beyond t0 (mirrors the speed-scheme path), so
+                    # the forecast horizon is driven by predicted upstream
+                    # inflow instead of DA simply running out of observations
+                    try:
+                        from hf_data import nowcaststore
+                        ns = [(t_, q_) for t_, q_ in
+                              nowcaststore.nowcast_series(b_["id"])
+                              if t_ > nowcast_t0]
+                        s = list(s) + ns
+                        nc_pts_total += len(ns)
+                    except Exception:
+                        pass
                 p = obs.write_ef5_obs(b_["id"], s, bc_dir) if s else None
                 if p:
                     da_series[b_["id"]] = s
@@ -627,6 +647,9 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             yield ("status", f"🛰 assimilating observed flow at "
                              f"{len(da_series)} upstream gauge(s) — "
                              f"{sum(len(v) for v in da_series.values())} obs points")
+            if not speed and nowcast_t0 and nc_pts_total:
+                yield ("status", f"🔮 {nc_pts_total} h of DI-LSTM nowcast appended "
+                                 f"as future inflow at the upstream DA gauges")
         elif bc_gauges:
             yield ("status", "(no usable USGS observations at the upstream gauges — "
                              "running without boundary conditions)")
@@ -686,6 +709,18 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         if fr.reused:
             yield ("status", f"♻️ forcing store: reused {fr.reused} MRMS timestep(s), "
                              f"prepared {len(fr.written)} new")
+        if fr.recent:
+            yield ("status", f"🛰 {fr.recent} fresh hour(s) filled from the "
+                             f"near-real-time MRMS store (Pass1) — the month "
+                             f"archive lags days behind real time")
+        if fr.missing:
+            # never let a rainless simulation pass silently again: EF5 reads
+            # a missing precip grid as ZERO rain (seen live: events simulated
+            # bone-dry through a real flood because the archive lagged)
+            yield ("status", f"⚠️ {len(fr.missing)} MRMS hour(s) unavailable in "
+                             f"both the archive and the near-real-time store — "
+                             f"EF5 runs those hours with ZERO rain "
+                             f"(first: {fr.missing[0]})")
         if _stopped():
             yield ("status", "⏹ stopped")
             yield ("done", {"returncode": -9, "cancelled": True})

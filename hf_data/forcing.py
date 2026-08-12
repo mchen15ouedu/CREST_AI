@@ -134,7 +134,18 @@ class ForcingResult:
     written: list[str] = field(default_factory=list)
     reused: int = 0                 # timesteps already in the store (merged, not redone)
     missing: list[str] = field(default_factory=list)
+    recent: int = 0                 # timesteps filled from the near-real-time store
     control_block: str = ""
+
+
+# Near-real-time fallback stores: the month tars archive FINAL products on a
+# slow cadence (MRMS Pass2 is batched every few days — seen live: the freshest
+# ~2 days absent), which is exactly the window every nowcast/event run needs.
+# Loose per-hour members uploaded hourly by scripts/update_mrms_recent.py fill
+# tar-missing hours. var -> (HF path strftime fmt, retention days).
+RECENT_STORES = {
+    "mrms": ("mrms_recent/mrms1h_pass1_%Y%m%d%H.pqf", 21),
+}
 
 
 def store_dir(var: str, bbox) -> str:
@@ -166,6 +177,10 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
             continue
         by_month.setdefault((t.year, t.month), []).append(t)
 
+    missing_ts: list[datetime] = []
+    recent = RECENT_STORES.get(var)
+    now = datetime.utcnow()
+
     for (year, month), steps in sorted(by_month.items()):
         if cancel is not None and cancel.is_set():
             return res                           # partial store stays valid (merge)
@@ -178,6 +193,11 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
                 local_tar = hf_hub_download(repo, ref.strftime(cfg.year_fmt),
                                             repo_type="dataset", cache_dir=cache_dir)
             except EntryNotFoundError:           # genuine data gap (permanent 404):
+                if recent and (now - max(steps)) <= timedelta(days=recent[1]):
+                    # a brand-new month may have no tar yet; the near-real-time
+                    # store below covers this window
+                    missing_ts.extend(steps)
+                    continue
                 # fail loudly but readably — never silently run with no forcing.
                 # (transient network errors raise other types and still propagate.)
                 raise RuntimeError(
@@ -194,17 +214,53 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
                 if member not in names:                # NARR-derived members use
                     member = t.strftime(cfg.out_fmt)   # the generic name
                 if member not in names:
-                    res.missing.append(member)
+                    missing_ts.append(t)
                     continue
                 a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())
                 clip = _clip(a, xll, yll, cell, nod, bbox)
                 if clip is None:
-                    res.missing.append(member)
+                    missing_ts.append(t)
                     continue
                 sub, nxll, nyll = clip
                 out_name = t.strftime(cfg.out_fmt)
                 _write_pqf(os.path.join(out_dir, out_name), sub, nxll, nyll, cell, nod)
                 res.written.append(out_name)
+
+    # ---- near-real-time fill (tar-missing hours) --------------------------- #
+    # The archive tar batches the final product days behind real time; every
+    # hour it lacks is fetched from the loose hourly store instead. A filled
+    # hour lands in the shared per-basin store and is reused by later runs
+    # even after the tar catches up — acceptable: both are gauge-corrected
+    # MRMS (Pass1 vs Pass2), and the store is ephemeral on Space restarts.
+    if recent and missing_ts:
+        fmt, keep_days = recent
+        unfilled = []
+        for i, t in enumerate(sorted(missing_ts)):
+            if cancel is not None and cancel.is_set():
+                unfilled.extend(sorted(missing_ts)[i:])
+                break
+            if t > now or (now - t) > timedelta(days=keep_days):
+                unfilled.append(t)
+                continue
+            try:
+                p = hf_hub_download(repo, t.strftime(fmt), repo_type="dataset",
+                                    cache_dir=cache_dir)
+                with open(p, "rb") as fh:
+                    a, xll, yll, cell, nod = _read_pqf(fh.read())
+                clip = _clip(a, xll, yll, cell, nod, bbox)
+                if clip is None:
+                    unfilled.append(t)
+                    continue
+                sub, nxll, nyll = clip
+                out_name = t.strftime(cfg.out_fmt)
+                _write_pqf(os.path.join(out_dir, out_name), sub, nxll, nyll,
+                           cell, nod)
+                res.written.append(out_name)
+                res.recent += 1
+            except Exception:                    # not posted / aged out / hiccup
+                unfilled.append(t)
+        missing_ts = unfilled
+    res.missing = [t.strftime(cfg.member_fmt) for t in sorted(missing_ts)]
 
     res.control_block = (
         f"[{cfg.section}]\nTYPE=PQF\nUNIT={cfg.unit}\nFREQ={cfg.ef5_freq}\n"
