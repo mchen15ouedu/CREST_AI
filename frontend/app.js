@@ -2786,8 +2786,12 @@ function showEvtFrame(i) {
   const man = evtManifest;
   const file = i < 0 ? man.maxdepth_png : man.frames[i].png;
   const url = `${evtBase}/${man._id}/${file}`;
-  if (evtOverlay) { evtOverlay.setUrl(url); }
-  else {
+  if (evtOverlay) {
+    evtOverlay.setUrl(url);
+    // bounds belong to the EVENT, not the overlay object — without this,
+    // switching events kept drawing at the previous event's location
+    evtOverlay.setBounds(L.latLngBounds(man.bounds));
+  } else {
     evtOverlay = L.imageOverlay(url, man.bounds,
       { opacity: 0.85, interactive: false }).addTo(evtGroup);
   }

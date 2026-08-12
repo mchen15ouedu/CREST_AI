@@ -125,12 +125,18 @@ def detect(max_events: int = 1) -> list[dict]:
     return picks
 
 
-def _basin_outline(ef5_dir: str, max_pts: int = 1200):
+def _basin_outline(ef5_dir: str, gauge_ll=None, max_pts: int = 1200, log=print):
     """True upstream-catchment boundary as [[lat, lon], ...] — EF5 carves the
     watershed from the gauge and writes nodata outside it in every gridded
     output, so the valid-data mask of any output grid IS the basin at 3
-    arc-sec. Coarsened so the ring stays a few KB in the manifest. None on
-    any failure (the UI falls back to the domain rectangle)."""
+    arc-sec. Coarsened so the ring stays a few KB in the manifest.
+
+    The mask can hold several disjoint blobs (and EF5's gauge snap sometimes
+    carves a NEIGHBORING catchment for small basins — seen live: rings 11-12
+    km from the gauge). So the ring must CONTAIN the trigger gauge (bbox test
+    with ~2 km slack; the outlet sits exactly on the ring). If no ring does,
+    return None rather than draw a misleading polygon — the UI falls back to
+    the pin + domain rectangle. None on any failure, too."""
     import glob
 
     import numpy as np
@@ -156,16 +162,26 @@ def _basin_outline(ef5_dir: str, max_pts: int = 1200):
         ny, nx = m.shape[0] // f, m.shape[1] // f
         m = m[:ny * f, :nx * f].reshape(ny, f, nx, f).any(axis=(1, 3))
         tr = rasterio.Affine(tr.a * f, tr.b, tr.c, tr.d, tr.e * f, tr.f)
+    PAD = 0.02                                       # ~2 km containment slack
     best, best_area = None, 0.0
     for geom, val in features.shapes(m.astype("uint8"), transform=tr):
         if val != 1:
             continue
         ring = geom["coordinates"][0]
+        if gauge_ll is not None:
+            glat, glon = gauge_ll
+            lons = [p[0] for p in ring]
+            lats = [p[1] for p in ring]
+            if not (min(lats) - PAD <= glat <= max(lats) + PAD
+                    and min(lons) - PAD <= glon <= max(lons) + PAD):
+                continue
         area = abs(sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2)
                        in zip(ring, ring[1:])))     # shoelace, lon/lat units
         if area > best_area:
             best, best_area = ring, area
     if not best:
+        log("basin outline: no catchment ring contains the gauge "
+            "(EF5 gauge snap may have carved a neighboring basin) — skipped")
         return None
     step = max(1, len(best) // max_pts)
     return [[round(y, 4), round(x, 4)] for x, y in best[::step]]
@@ -260,7 +276,8 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         manifest["hydro"] = [hydro[k] for k in sorted(hydro)]
         manifest["status"] = "active"
         try:                       # true watershed ring for the map overlay
-            manifest["basin"] = _basin_outline(out_dir)
+            manifest["basin"] = _basin_outline(
+                out_dir, gauge_ll=(g["lat"], g["lon"]), log=log)
             if manifest["basin"]:
                 log(f"basin outline: {len(manifest['basin'])} vertices")
         except Exception as e:
