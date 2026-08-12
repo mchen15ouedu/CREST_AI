@@ -431,10 +431,21 @@ DEPTH_CAP_M = float(os.environ.get("EVENT_DEPTH_CAP_M", "3.0"))
 MIN_SHOW_M = 0.02                     # < 2 cm renders transparent
 
 
+# depth color scale (fractions of DEPTH_CAP_M -> RGB): pale cyan for
+# centimeters of water through blues to indigo/purple at the cap, so depth
+# CLASSES are distinguishable on the map instead of a near-uniform dark blue.
+# The panel legend gradient in frontend/app.js mirrors these stops.
+DEPTH_STOPS_X = (0.0, 0.15, 0.35, 0.60, 0.85, 1.0)
+DEPTH_STOPS_R = (224, 120, 50, 20, 60, 130)
+DEPTH_STOPS_G = (255, 200, 140, 80, 30, 20)
+DEPTH_STOPS_B = (255, 255, 235, 190, 160, 140)
+
+
 def _make_pngs(out_dir: str, manifest: dict):
     """Colormapped RGBA overlays for the map (Leaflet imageOverlay): dry is
-    transparent, light->dark blue over 0..DEPTH_CAP_M. Adds `bounds`,
-    per-frame `png`, and `maxdepth_png` to the manifest (file rewritten)."""
+    transparent; wet cells follow the DEPTH_STOPS ramp over 0..DEPTH_CAP_M.
+    Adds `bounds`, per-frame `png`, and `maxdepth_png` to the manifest
+    (file rewritten)."""
     import json
 
     import numpy as np
@@ -452,10 +463,10 @@ def _make_pngs(out_dir: str, manifest: dict):
             depth = ds.read(1).astype(float) / 100.0
         x = np.clip(depth / DEPTH_CAP_M, 0.0, 1.0)
         alpha = np.where(depth >= MIN_SHOW_M,
-                         60 + 195 * np.sqrt(x), 0.0).astype(np.uint8)
-        r = (173 + (8 - 173) * x).astype(np.uint8)
-        g = (216 + (48 - 216) * x).astype(np.uint8)
-        b = (230 + (107 - 230) * x).astype(np.uint8)
+                         90 + 165 * np.sqrt(x), 0.0).astype(np.uint8)
+        r = np.interp(x, DEPTH_STOPS_X, DEPTH_STOPS_R).astype(np.uint8)
+        g = np.interp(x, DEPTH_STOPS_X, DEPTH_STOPS_G).astype(np.uint8)
+        b = np.interp(x, DEPTH_STOPS_X, DEPTH_STOPS_B).astype(np.uint8)
         out = tif_name[:-4] + ".png"
         Image.fromarray(np.dstack([r, g, b, alpha]), "RGBA").save(
             os.path.join(out_dir, out), optimize=True)

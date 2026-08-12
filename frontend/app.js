@@ -2710,6 +2710,9 @@ async function loadEvents() {
     html += `<div style="color:#ff9d9d">last run failed: ${r.last.error || ""}</div>`;
   }
   if (!ids.length) html += "<div style='opacity:.8'>No published events yet.</div>";
+  // controls dock ABOVE the event list, so the slider/play buttons are
+  // always visible without scrolling an 11-event panel
+  html += '<div id="evt-ctl-slot"></div>';
   evtPanel.innerHTML = html;
   ids.forEach((id) => {
     const s = d.events[id];
@@ -2748,14 +2751,23 @@ async function selectEvent(id, summary) {
     (canAnim ? `<button id="evt-play">▶</button>` +
       `<input id="evt-slider" type="range" min="0" max="${nF - 1}" value="0"` +
       ` style="width:120px;vertical-align:middle">` +
-      `<span id="evt-t" style="opacity:.8"></span>` : "") +
+      `<span id="evt-t" style="opacity:.8"></span>`
+      : `<div style="opacity:.75;margin-top:4px">older event — hourly frames ` +
+        `pruned by retention; showing the maximum-depth footprint</div>`) +
     `<div style="margin-top:6px;height:8px;border-radius:4px;background:` +
-    `linear-gradient(90deg, rgba(173,216,230,.45), rgb(8,48,107))"></div>` +
+    `linear-gradient(90deg, #e0ffff 0%, #78c8ff 15%, #328ceb 35%, #1450be 60%, ` +
+    `#3c1ea0 85%, #82148c 100%)"></div>` +
     `<div style="display:flex;justify-content:space-between;opacity:.7">` +
-    `<span>0 m</span><span>≥ ${man.depth_cap_m || 3} m</span></div>`;
-  const old = document.getElementById("evt-ctl");
-  if (old) old.remove();
-  evtPanel.appendChild(ctl);
+    `<span>0 m</span><span>≥ ${man.depth_cap_m || 3} m</span></div>` +
+    `<div style="display:flex;justify-content:space-between;opacity:.55;font-size:11px">` +
+    `<span>shallow</span><span>deep</span></div>`;
+  const slot = document.getElementById("evt-ctl-slot");
+  if (slot) slot.replaceChildren(ctl);
+  else {
+    const old = document.getElementById("evt-ctl");
+    if (old) old.remove();
+    evtPanel.appendChild(ctl);
+  }
   document.getElementById("evt-max").onclick = () => showEvtFrame(-1);
   if (canAnim) {
     document.getElementById("evt-play").onclick = toggleEvtPlay;
@@ -2764,7 +2776,11 @@ async function selectEvent(id, summary) {
   }
   showEvtFrame(-1);
   drawEventSite(evtManifest);
-  try { map.fitBounds(man.bounds, { padding: [40, 40] }); } catch (_) {}
+  // animate:false — the animated zoom can silently never complete (seen
+  // live), leaving the map at CONUS zoom where the overlay is a dot
+  try {
+    map.fitBounds(man.bounds, { padding: [40, 40], maxZoom: 13, animate: false });
+  } catch (_) {}
 
   // right panel: the trigger gauge's 1-D hydrograph — EF5 simulated flow
   // (split solid/dashed at t0) vs USGS observations, straight from the
@@ -2794,6 +2810,10 @@ function showEvtFrame(i) {
   } else {
     evtOverlay = L.imageOverlay(url, man.bounds,
       { opacity: 0.85, interactive: false }).addTo(evtGroup);
+    // crisp model cells instead of a smeared blur when zoomed past the
+    // simulation resolution — the blockiness is honest (it IS the grid)
+    const el = evtOverlay.getElement();
+    if (el) el.style.imageRendering = "pixelated";
   }
   const lab = document.getElementById("evt-t");
   if (lab) lab.textContent = i < 0 ? " max" : ` ${man.frames[i].t.slice(5, 16)}`;
