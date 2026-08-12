@@ -236,7 +236,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     episode_id: re-simulate an ongoing episode under its original id (the
     published folder is replaced with the fresh window)."""
     from crestimap import EventConfig, run_event   # needs the v2 package
-    from . import eventstore, nowcaststore, pipeline
+    from . import eventqueue, eventstore, nowcaststore, pipeline
 
     g = pipeline.gauge_info(gid)
     if g is None:
@@ -304,31 +304,68 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                 if kinds:
                     log(f"workdir {root}/: {dict(sorted(kinds.items())[:8])}")
 
-        with _lock:
-            _running["status"] = "solver"
+        basin_ring = None
+        try:            # true watershed ring (map overlay + worker job spec)
+            basin_ring = _basin_outline(out_dir, gauge_ll=(g["lat"], g["lon"]),
+                                        log=log)
+            if basin_ring:
+                log(f"basin outline: {len(basin_ring)} vertices")
+        except Exception as e:
+            log(f"basin outline skipped ({type(e).__name__}: {e})")
+
         # EF5 keeps the FULL basin (routing needs the whole catchment; its
         # routed channel stage carries upstream water INTO the window); only
         # the 2-D solver domain is cropped to hold native resolution
-        solver_bbox = _hires_window(tuple(pipeline.basin_bbox(g)),
-                                    (g["lat"], g["lon"]), log=log)
+        basin_bbox = tuple(pipeline.basin_bbox(g))
+        solver_bbox = _hires_window(basin_bbox, (g["lat"], g["lon"]), log=log)
+        sim_start = t0 - datetime.timedelta(hours=SIM_BACKSET_H)
+
+        # V27 P1: offer the solve to a GPU worker — full basin at native
+        # resolution, everything it needs in one bundle. The worker pool is
+        # a ladder (HPC GPU -> ZeroGPU Space -> nobody); the local CPU
+        # window below remains the unconditional fallback.
+        if eventqueue.mode() != "off":
+            spec = {"event_id": ev_id, "episode": bool(episode_id),
+                    "gauge": {"id": gid, "lat": g["lat"], "lon": g["lon"],
+                              "area_km2": g.get("area")},
+                    "bbox_basin": list(basin_bbox),
+                    "bbox_window": list(solver_bbox),
+                    "t0": t0.strftime("%Y-%m-%dT%H:%MZ"),
+                    "t_end": t_end.strftime("%Y-%m-%dT%H:%MZ"),
+                    "sim_start": sim_start.strftime("%Y-%m-%dT%H:%MZ"),
+                    "model": wb_model, "dem_res": DEM_RES,
+                    "trigger": {**(trigger or {}), "gauge": gid},
+                    "hydro": [hydro[k] for k in sorted(hydro)],
+                    "basin": basin_ring,
+                    "queued": datetime.datetime.utcnow().strftime(
+                        "%Y-%m-%dT%H:%M:%SZ")}
+            queued = eventqueue.enqueue(ev_id, spec, out_dir, log=log)
+            if queued and eventqueue.mode() == "on":
+                with _lock:
+                    _running["status"] = "queued"
+                if eventqueue.wait_for_claim(ev_id, log=log):
+                    man = eventqueue.wait_for_result(ev_id, spec["queued"],
+                                                     log=log)
+                    if man is not None:
+                        man["published"] = True
+                        _running["last"] = {"event": ev_id, "ok": True,
+                                            "published": True, "worker": True}
+                        return man
+
+        with _lock:
+            _running["status"] = "solver"
         cfg = EventConfig(
             event_id=ev_id, bbox=solver_bbox,
             t0=t0, t_end=t_end, ef5_output_dir=out_dir,
             out_dir=os.path.join(work, "event_out"), model=wb_model,
-            sim_start=t0 - datetime.timedelta(hours=SIM_BACKSET_H),
+            sim_start=sim_start,
             dem_res=DEM_RES, dem_cache=DEM_CACHE, max_cells=MAX_CELLS,
             trigger={**(trigger or {}), "gauge": gid}, progress=log)
         manifest = run_event(cfg)
         manifest["gauge"] = gid
         manifest["hydro"] = [hydro[k] for k in sorted(hydro)]
         manifest["status"] = "active"
-        try:                       # true watershed ring for the map overlay
-            manifest["basin"] = _basin_outline(
-                out_dir, gauge_ll=(g["lat"], g["lon"]), log=log)
-            if manifest["basin"]:
-                log(f"basin outline: {len(manifest['basin'])} vertices")
-        except Exception as e:
-            log(f"basin outline skipped ({type(e).__name__}: {e})")
+        manifest["basin"] = basin_ring     # computed above, pre-queue
 
         with _lock:
             _running["status"] = "archive"
