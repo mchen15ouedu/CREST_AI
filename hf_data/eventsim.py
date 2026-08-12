@@ -478,14 +478,13 @@ DEPTH_CAP_M = float(os.environ.get("EVENT_DEPTH_CAP_M", "3.0"))
 MIN_SHOW_M = 0.02                     # < 2 cm renders transparent
 
 
-# depth color scale (fractions of DEPTH_CAP_M -> RGB): pale cyan for
-# centimeters of water through blues to indigo/purple at the cap, so depth
-# CLASSES are distinguishable on the map instead of a near-uniform dark blue.
-# The panel legend gradient in frontend/app.js mirrors these stops.
-DEPTH_STOPS_X = (0.0, 0.15, 0.35, 0.60, 0.85, 1.0)
-DEPTH_STOPS_R = (224, 120, 50, 20, 60, 130)
-DEPTH_STOPS_G = (255, 200, 140, 80, 30, 20)
-DEPTH_STOPS_B = (255, 255, 235, 190, 160, 140)
+# depth color scale (fractions of DEPTH_CAP_M -> RGB): green (shallow) ->
+# yellow -> red -> purple (>= cap), so depth CLASSES are distinguishable at
+# a glance. The panel legend gradient in frontend/app.js mirrors these stops.
+DEPTH_STOPS_X = (0.0, 0.30, 0.65, 1.0)
+DEPTH_STOPS_R = (46, 250, 235, 130)
+DEPTH_STOPS_G = (160, 220, 50, 20)
+DEPTH_STOPS_B = (60, 40, 35, 140)
 
 
 def _make_pngs(out_dir: str, manifest: dict):

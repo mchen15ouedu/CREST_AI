@@ -2604,6 +2604,9 @@ function enterEventsMode() {
   document.getElementById("mode-now").classList.remove("on");
   document.getElementById("mode-evt").classList.add("on");
   if (!evtGroup) evtGroup = L.layerGroup().addTo(map);
+  // the Model options panel is a hindcast tool and overlaps the event list
+  const lp = document.getElementById("left-panel");
+  if (lp) lp.style.display = "none";
   map.setView([39, -98], 5, { animate: false });   // CONUS overview: event pins
   addMsg("<b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
          "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the basin " +
@@ -2621,6 +2624,8 @@ function leaveEventsMode() {
   eventsMode = false;
   document.getElementById("mode-evt").classList.remove("on");
   evtReleaseAnimBar();
+  const lp = document.getElementById("left-panel");
+  if (lp) lp.style.display = "";
   if (evtOverlay) { evtGroup.removeLayer(evtOverlay); evtOverlay = null; }
   if (evtPinsLayer) { try { map.removeLayer(evtPinsLayer); } catch (_) {} evtPinsLayer = null; }
   if (evtSiteLayer) { try { map.removeLayer(evtSiteLayer); } catch (_) {} evtSiteLayer = null; }
@@ -2753,8 +2758,7 @@ async function selectEvent(id, summary) {
       : `<div style="opacity:.75;margin-top:4px">older event — hourly frames ` +
         `pruned by retention; showing the maximum-depth footprint</div>`) +
     `<div style="margin-top:6px;height:8px;border-radius:4px;background:` +
-    `linear-gradient(90deg, #e0ffff 0%, #78c8ff 15%, #328ceb 35%, #1450be 60%, ` +
-    `#3c1ea0 85%, #82148c 100%)"></div>` +
+    `linear-gradient(90deg, #2ea03c 0%, #fadc28 30%, #eb3223 65%, #82148c 100%)"></div>` +
     `<div style="display:flex;justify-content:space-between;opacity:.7">` +
     `<span>0 m</span><span>≥ ${man.depth_cap_m || 3} m</span></div>` +
     `<div style="display:flex;justify-content:space-between;opacity:.55;font-size:11px">` +
