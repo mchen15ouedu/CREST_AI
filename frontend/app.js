@@ -585,7 +585,8 @@ async function simulate() {
   const stepH = timestepHours(opt.timestep);
   lastSim = { tStart: tS, tEnd: tE, hours: HH,
               expectedSteps: Math.max(1, Math.round(HH / stepH)) + 1 };
-  ids.forEach((id) => { simHydro[id] = []; gaugeState[id] = "running"; delete gaugeResult[id]; });
+  ids.forEach((id) => { simHydro[id] = []; gaugeState[id] = "running";
+                        delete gaugeResult[id]; delete routedNowcast[id]; });
   renderTabs();
   if (ids.length && !panelGauge) focusGauge(ids[0]);
   else if (ids.includes(panelGauge)) renderHydro(panelGauge);  // honest "run in
@@ -1019,6 +1020,7 @@ function renderTabs() {
 function closeSimTab(id) {
   selected.delete(id);
   delete simHydro[id]; delete gaugeState[id]; delete gaugeResult[id];
+  delete routedNowcast[id];
   if (overlays[id]) { try { q2dGroup.removeLayer(overlays[id]); } catch (_) {} delete overlays[id]; }
   delete gaugeFrames[id];
   refreshSelection();
@@ -1196,14 +1198,18 @@ function setHydroTz(utc) {
   if (hydroModalOpen) renderHydroBig();
 }
 
-// routedNowcast[id] = { t0 } — ungauged points whose panel hydrograph is a
-// routed nowcast: the Sim Q line splits at t0 into routed-from-observed (solid)
-// and routed-from-prediction (dashed), with a "now" divider
+// routedNowcast[id] = { t0, kind? } — gauges whose Sim Q line splits at t0
+// into solid (driven by observed data) and dashed (prediction), with a "now"
+// divider. kind "event" = a 2-D inundation event's trigger gauge (EF5
+// nowcast-mode run, labeled Sim Q); default = an ungauged point's routed
+// nowcast (labeled Routed). Entries are cleared when a fresh run starts,
+// the tab closes, or events mode exits — a stale split must never restyle
+// a later ordinary hydrograph.
 const routedNowcast = {};
 
 function _utcMs(t) { return Date.parse(String(t).replace(" ", "T") + "Z"); }
 
-function _hydroFig(rows, big, nc, splitT0) {
+function _hydroFig(rows, big, nc, splitT0, splitKind) {
   const x = rows.map((r) => tsDisp(r.time)), sim = rows.map((r) => r.sim_q),
     obs = rows.map((r) => r.obs_q), pr = rows.map((r) => r.precip || 0);
   const maxp = Math.max(0.1, ...pr);
@@ -1218,16 +1224,19 @@ function _hydroFig(rows, big, nc, splitT0) {
       line: { color: "#f4f4f4", width: big ? 1.6 : 1.3, shape: "spline", smoothing: 0.8 } });
   }
   if (splitT0) {
-    // routed nowcast: one continuous line, solid up to t0, dashed after —
-    // build two y-arrays that share the t0 point so they join seamlessly
+    // one continuous line, solid up to t0, dashed after — build two y-arrays
+    // that share the t0 point so they join seamlessly. Labels follow what
+    // the line actually is: an event trigger gauge shows EF5's simulation
+    // ("Sim Q"); an ungauged point shows its routed nowcast ("Routed").
+    const evt = splitKind === "event";
     const t0ms = _utcMs(splitT0);
     const past = rows.map((r) => (_utcMs(r.time) <= t0ms ? r.sim_q : null));
     const fut = rows.map((r) => (_utcMs(r.time) >= t0ms ? r.sim_q : null));
-    traces.push({ x, y: past, name: "Routed (obs upstream)", mode: "lines",
-      connectgaps: false,
+    traces.push({ x, y: past, name: evt ? "Sim Q" : "Routed (obs upstream)",
+      mode: "lines", connectgaps: false,
       line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } });
-    traces.push({ x, y: fut, name: "🔮 Routed nowcast", mode: "lines",
-      connectgaps: false,
+    traces.push({ x, y: fut, name: evt ? "Sim Q (nowcast)" : "🔮 Routed nowcast",
+      mode: "lines", connectgaps: false,
       line: { color: "#ff9f43", width: big ? 2.4 : 2.0, dash: "dot", shape: "spline", smoothing: 0.8 } });
   } else {
     traces.push({ x, y: sim, name: "Sim Q", mode: "lines",
@@ -1305,7 +1314,8 @@ function renderHydro(id) {
   if (el.querySelector(".muted")) el.innerHTML = "";     // drop placeholder before plotting
   const { traces, layout } = _hydroFig(rows, false,
     gaugeResult[id] && gaugeResult[id].nowcast,
-    routedNowcast[id] && routedNowcast[id].t0);
+    routedNowcast[id] && routedNowcast[id].t0,
+    routedNowcast[id] && routedNowcast[id].kind);
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true });
   _bindHydroClick(el, id);
   xp.classList.remove("hidden");
@@ -1420,7 +1430,8 @@ function renderHydroBig() {
   el.style.height = Math.round(_hmBaseH() * Math.max(1, (hmZoom + 1) / 2)) + "px";
   const { traces, layout } = nc ? _nowcastFig(panelGauge, true)
     : _hydroFig(rows, true, gaugeResult[panelGauge] && gaugeResult[panelGauge].nowcast,
-                routedNowcast[panelGauge] && routedNowcast[panelGauge].t0);
+                routedNowcast[panelGauge] && routedNowcast[panelGauge].t0,
+                routedNowcast[panelGauge] && routedNowcast[panelGauge].kind);
   Plotly.react(el, traces, layout, { displayModeBar: false, responsive: true,
                                      scrollZoom: true, doubleClick: "reset" });
   if (!nc) _bindHydroClick(el, panelGauge);
@@ -2182,6 +2193,7 @@ async function reattach(explicitId) {
     j.gauge_ids.forEach((id) => {
       simHydro[id] = [];
       gaugeState[id] = j.done ? "done" : "running";
+      delete routedNowcast[id];
     });
     renderTabs();
     addMsg(j.done
@@ -2637,6 +2649,14 @@ function leaveEventsMode() {
   eventsMode = false;
   document.getElementById("mode-evt").classList.remove("on");
   evtReleaseAnimBar();
+  // drop event hydrographs: outside events mode the panel must not show an
+  // event's Sim Q split (or its rows) as if it were a user-run simulation
+  Object.keys(routedNowcast).forEach((id) => {
+    if (routedNowcast[id].kind === "event") {
+      delete routedNowcast[id]; delete simHydro[id]; delete gaugeState[id];
+    }
+  });
+  if (panelGauge && !simHydro[panelGauge]) renderHydro(panelGauge);
   const lp = document.getElementById("left-panel");
   if (lp) lp.style.display = "";
   refreshSelection();                  // drop the event-gauge pin coloring
@@ -2809,7 +2829,8 @@ async function selectEvent(id, summary) {
   const gid = (man.trigger && man.trigger.gauge) || man.gauge;
   if (gid && Array.isArray(man.hydro) && man.hydro.length) {
     simHydro[gid] = man.hydro;
-    routedNowcast[gid] = { t0: (man.t0 || "").replace("T", " ").replace("Z", "") };
+    routedNowcast[gid] = { t0: (man.t0 || "").replace("T", " ").replace("Z", ""),
+                           kind: "event" };
     gaugeState[gid] = "done";
     delete gaugeResult[gid];
     focusGauge(gid);
