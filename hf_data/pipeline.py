@@ -461,18 +461,25 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         pl = {"cached_rows": [], "run_start": t_start, "run_end": t_end,
               "load_state_time": ex, "warmup_from": wfrom, "need_warmup": needw,
               "reason": "calibration run — row cache bypassed"}
+    rows_pre_served = False
     if pl["run_start"] is None and grids:
         # rows are cached, but the 2-D streamflow maps need rendered frames —
         # if none are cached on disk, re-run the window (fast: warm-starts
-        # from the saved state) so the map animation always appears
+        # from the saved state) so the map animation always appears. The
+        # cached rows are KEPT and served immediately (the fleet pre-runs
+        # exist so a gauge click shows its hydrograph instantly); the re-run
+        # then only renders frames, its duplicate row stream suppressed.
         from hf_data import viz as _viz
         if not _viz.has_frames_cache(g["id"], cache_model, t_start, t_end):
             lt, wf, nw = statecache._state_choice(g["id"], cache_model, t_start)
-            pl = {"cached_rows": [], "run_start": t_start, "run_end": t_end,
+            pl = {"cached_rows": pl["cached_rows"], "run_start": t_start,
+                  "run_end": t_end,
                   "load_state_time": lt, "warmup_from": wf, "need_warmup": nw,
                   "reason": "re-run to render the 2-D streamflow maps"}
-            yield ("status", "hydrograph is cached but the 2-D streamflow maps "
-                             "aren't — re-running the window to render them")
+            rows_pre_served = bool(pl["cached_rows"])
+            yield ("status", "hydrograph served from the cached rows — the 2-D "
+                             "streamflow maps aren't rendered yet, re-running "
+                             "the window in the background to draw them")
     if pl["cached_rows"]:
         yield ("status", f"♻️ reused {len(pl['cached_rows'])} cached step(s) "
                          f"({pl['cached_rows'][0]['time']}…{pl['cached_rows'][-1]['time']})")
@@ -776,6 +783,10 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     for ev in stream_run(handle, poll=0.2, cancel=cancel):
         if ev["kind"] == "hydro":
             new_rows += ev["rows"]
+            if rows_pre_served:
+                continue     # hydrograph already fully on screen from the
+                             # cached rows; streaming them again would double
+                             # every point (the frontend appends blindly)
         ev["bbox"] = bbox
         if (ev["kind"] == "done" and not use_mock
                 and (ev.get("returncode") not in (0, None) or not new_rows)):
