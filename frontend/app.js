@@ -403,6 +403,12 @@ function gaugeStyle(id) {
       weight: on ? 2 : 1.4, dashArray: on ? null : "3,3",
       fillColor: on ? "#ffd479" : "#6f5aa8", fillOpacity: on ? 0.95 : 0.55 };
   }
+  // events mode: gauges that carry a 2-D inundation event stand out (click
+  // opens the event directly)
+  if (eventsMode && evtByGauge[id]) {
+    return { radius: 8, color: "#fff", weight: 2,
+      fillColor: EVT_GAUGE_COLOR, fillOpacity: 0.95 };
+  }
   // nowcast mode: pin colored by risk tier (yellow >=5x baseflow, orange >=Q2,
   // red >=Q5) from the hourly precomputed predictions
   const tier = (nowcastMode && riskData && riskData.tiers && riskData.tiers[id]) || 0;
@@ -413,6 +419,11 @@ function gaugeStyle(id) {
     fillOpacity: 0.95 };
 }
 function toggleGauge(id) {
+  // events mode: clicking a triggered gauge opens its inundation event
+  if (eventsMode && evtByGauge[id]) {
+    selectEvent(evtByGauge[id].id, evtByGauge[id].s);
+    return;
+  }
   selected.has(id) ? selected.delete(id) : selected.add(id);
   refreshSelection();
   if (nowcastMode) {
@@ -2594,7 +2605,9 @@ let evtTimer = null;
 let evtPanel = null;
 let evtPinsLayer = null;             // CONUS overview: one pin per event (or heat)
 let evtSiteLayer = null;             // selected event: gauge pin + basin + domain
+let evtByGauge = {};                 // gid -> {id, s}: newest event per trigger gauge
 const EVT_HEAT_N = 30;               // above this many events, pins become a heatmap
+const EVT_GAUGE_COLOR = "#e83e8c";   // gauge pins that carry a 2-D inundation event
 
 function enterEventsMode() {
   if (eventsMode) return;
@@ -2626,6 +2639,7 @@ function leaveEventsMode() {
   evtReleaseAnimBar();
   const lp = document.getElementById("left-panel");
   if (lp) lp.style.display = "";
+  refreshSelection();                  // drop the event-gauge pin coloring
   if (evtOverlay) { evtGroup.removeLayer(evtOverlay); evtOverlay = null; }
   if (evtPinsLayer) { try { map.removeLayer(evtPinsLayer); } catch (_) {} evtPinsLayer = null; }
   if (evtSiteLayer) { try { map.removeLayer(evtSiteLayer); } catch (_) {} evtSiteLayer = null; }
@@ -2701,6 +2715,15 @@ async function loadEvents() {
   if (!d) { addMsg("⚠️ Couldn't load the event list.", "status"); return; }
   evtBase = d.base;
   const ids = Object.keys(d.events || {});
+  // newest-first index: keep each trigger gauge's newest event, so clicking
+  // the gauge pin itself (distinct color) opens its inundation map
+  evtByGauge = {};
+  ids.forEach((id) => {
+    const s = d.events[id];
+    const gid = (s.trigger && s.trigger.gauge) || s.gauge;
+    if (gid && !evtByGauge[gid]) evtByGauge[gid] = { id, s };
+  });
+  refreshSelection();                        // recolor visible gauge pins
   if (evtPanel) evtPanel.remove();
   evtPanel = document.createElement("div");
   evtPanel.id = "evt-panel";

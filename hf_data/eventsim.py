@@ -474,8 +474,15 @@ def _update_archive(out_dir: str, manifest: dict, log):
     log(f"archive: {merged.num_rows} wet-cell rows over {len(times)} frames")
 
 
-DEPTH_CAP_M = float(os.environ.get("EVENT_DEPTH_CAP_M", "3.0"))
+DEPTH_CAP_M = float(os.environ.get("EVENT_DEPTH_CAP_M", "3.0"))  # dry fallback
 MIN_SHOW_M = 0.02                     # < 2 cm renders transparent
+# the color scale ADAPTS to each event: cap = p99 of the episode's wet
+# maxdepth cells, clamped to [CAP_MIN, CAP_MAX] — a fixed 0..3 m scale
+# saturates major floods purple and wastes range on shallow ones. All of an
+# event's frames share the one cap (comparable during animation); the panel
+# legend reads depth_cap_m from the manifest.
+CAP_MIN_M = float(os.environ.get("EVENT_CAP_MIN_M", "0.5"))
+CAP_MAX_M = float(os.environ.get("EVENT_CAP_MAX_M", "10.0"))
 
 
 # depth color scale (fractions of DEPTH_CAP_M -> RGB): green (shallow) ->
@@ -504,10 +511,12 @@ def _make_pngs(out_dir: str, manifest: dict):
     east, south = c + a * gr["nx"], f + e * gr["ny"]
     manifest["bounds"] = [[south, west], [north, east]]
 
+    cap = adaptive_cap(os.path.join(out_dir, "maxdepth.tif"))
+
     def render(tif_name):
         with rasterio.open(os.path.join(out_dir, tif_name)) as ds:
             depth = ds.read(1).astype(float) / 100.0
-        x = np.clip(depth / DEPTH_CAP_M, 0.0, 1.0)
+        x = np.clip(depth / cap, 0.0, 1.0)
         alpha = np.where(depth >= MIN_SHOW_M,
                          90 + 165 * np.sqrt(x), 0.0).astype(np.uint8)
         r = np.interp(x, DEPTH_STOPS_X, DEPTH_STOPS_R).astype(np.uint8)
@@ -521,9 +530,25 @@ def _make_pngs(out_dir: str, manifest: dict):
     for fr in manifest["frames"]:
         fr["png"] = render(fr["file"])
     manifest["maxdepth_png"] = render("maxdepth.tif")
-    manifest["depth_cap_m"] = DEPTH_CAP_M
+    manifest["depth_cap_m"] = cap
     with open(os.path.join(out_dir, "manifest.json"), "w") as fp:
         json.dump(manifest, fp)
+
+
+def adaptive_cap(maxdepth_tif: str) -> float:
+    """Event-specific color-scale cap: p99 of the episode's wet maxdepth
+    cells, clamped to [CAP_MIN_M, CAP_MAX_M]; DEPTH_CAP_M if (near-)dry."""
+    import numpy as np
+    import rasterio
+    try:
+        with rasterio.open(maxdepth_tif) as ds:
+            depth = ds.read(1).astype(float) / 100.0
+        wet = depth[depth >= MIN_SHOW_M]
+        if len(wet) < 10:
+            return DEPTH_CAP_M
+        return round(float(np.clip(np.percentile(wet, 99), CAP_MIN_M, CAP_MAX_M)), 2)
+    except Exception:
+        return DEPTH_CAP_M
 
 
 def run_detected(max_events: int = 1) -> list[dict]:
