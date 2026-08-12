@@ -2617,9 +2617,10 @@ function enterEventsMode() {
 
 function leaveEventsMode() {
   if (!eventsMode) return;
+  stopEvtPlay();
   eventsMode = false;
   document.getElementById("mode-evt").classList.remove("on");
-  stopEvtPlay();
+  evtReleaseAnimBar();
   if (evtOverlay) { evtGroup.removeLayer(evtOverlay); evtOverlay = null; }
   if (evtPinsLayer) { try { map.removeLayer(evtPinsLayer); } catch (_) {} evtPinsLayer = null; }
   if (evtSiteLayer) { try { map.removeLayer(evtSiteLayer); } catch (_) {} evtSiteLayer = null; }
@@ -2748,10 +2749,7 @@ async function selectEvent(id, summary) {
     `<b>${id}</b><br><span style="opacity:.8">cap ${man.depth_cap_m || 3} m · ` +
     `grid ${man.grid.nx}×${man.grid.ny} @ ~${Math.round(man.grid.dx_m)} m</span><br>` +
     `<button id="evt-max" style="margin:5px 4px 0 0">max depth</button>` +
-    (canAnim ? `<button id="evt-play">▶</button>` +
-      `<input id="evt-slider" type="range" min="0" max="${nF - 1}" value="0"` +
-      ` style="width:120px;vertical-align:middle">` +
-      `<span id="evt-t" style="opacity:.8"></span>`
+    (canAnim ? `<span style="opacity:.75">time scroll: use the bar below the map</span>`
       : `<div style="opacity:.75;margin-top:4px">older event — hourly frames ` +
         `pruned by retention; showing the maximum-depth footprint</div>`) +
     `<div style="margin-top:6px;height:8px;border-radius:4px;background:` +
@@ -2769,11 +2767,7 @@ async function selectEvent(id, summary) {
     evtPanel.appendChild(ctl);
   }
   document.getElementById("evt-max").onclick = () => showEvtFrame(-1);
-  if (canAnim) {
-    document.getElementById("evt-play").onclick = toggleEvtPlay;
-    document.getElementById("evt-slider").oninput = (e) =>
-      showEvtFrame(parseInt(e.target.value, 10));
-  }
+  evtBindAnimBar(canAnim ? nF : 0);
   showEvtFrame(-1);
   drawEventSite(evtManifest);
   // animate:false — the animated zoom can silently never complete (seen
@@ -2796,6 +2790,36 @@ async function selectEvent(id, summary) {
   }
 }
 
+// events mode borrows the SAME bottom-center animation bar the Hindcast
+// streamflow animation uses (#anim), instead of burying a second slider in
+// the side panel; handlers are swapped in and restored on exit
+function evtBindAnimBar(nF) {
+  const bar = document.getElementById("anim");
+  const play = document.getElementById("anim-play");
+  const slider = document.getElementById("anim-slider");
+  if (!nF) { evtReleaseAnimBar(); return; }
+  bar.classList.remove("hidden");
+  play.textContent = "▶";
+  play.onclick = toggleEvtPlay;
+  slider.min = "0";
+  slider.max = String(nF - 1);
+  slider.value = "0";
+  slider.oninput = (e) => { stopEvtPlay(); showEvtFrame(parseInt(e.target.value, 10)); };
+  document.getElementById("anim-time").textContent = "max depth";
+}
+
+function evtReleaseAnimBar() {
+  const bar = document.getElementById("anim");
+  const play = document.getElementById("anim-play");
+  const slider = document.getElementById("anim-slider");
+  play.onclick = togglePlay;                       // hindcast handlers back
+  slider.oninput = (e) => { stopPlay(); setFrame(parseInt(e.target.value)); };
+  if (animMax > 0) {                               // hindcast animation exists
+    slider.max = String(animMax);
+    setFrame(animIdx);
+  } else bar.classList.add("hidden");
+}
+
 function showEvtFrame(i) {
   if (!evtManifest) return;
   evtFrameIdx = i;
@@ -2815,10 +2839,12 @@ function showEvtFrame(i) {
     const el = evtOverlay.getElement();
     if (el) el.style.imageRendering = "pixelated";
   }
-  const lab = document.getElementById("evt-t");
-  if (lab) lab.textContent = i < 0 ? " max" : ` ${man.frames[i].t.slice(5, 16)}`;
-  const sl = document.getElementById("evt-slider");
-  if (sl && i >= 0) sl.value = i;
+  const lab = document.getElementById("anim-time");
+  if (lab && eventsMode) {
+    lab.textContent = i < 0 ? "max depth" : man.frames[i].t.slice(5, 16).replace("T", " ");
+  }
+  const sl = document.getElementById("anim-slider");
+  if (sl && eventsMode && i >= 0) sl.value = String(i);
   // keep the hydrograph's time marker in step with the slider/play scrub
   if (i >= 0) {
     try { updateHydroMarker(man.frames[i].t.replace("T", " ").replace("Z", "")); }
@@ -2853,13 +2879,15 @@ function stepEvtFrame() {
 }
 function toggleEvtPlay() {
   if (evtTimer) { stopEvtPlay(); return; }
-  document.getElementById("evt-play").textContent = "⏸";
+  document.getElementById("anim-play").textContent = "⏸";
   evtTimer = setInterval(stepEvtFrame, 400);
 }
 function stopEvtPlay() {
   if (evtTimer) { clearInterval(evtTimer); evtTimer = null; }
-  const b = document.getElementById("evt-play");
-  if (b) b.textContent = "▶";
+  if (eventsMode) {
+    const b = document.getElementById("anim-play");
+    if (b) b.textContent = "▶";
+  }
 }
 
 document.getElementById("mode-evt").onclick = () => enterEventsMode();

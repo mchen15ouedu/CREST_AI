@@ -5,14 +5,18 @@ clusters pick trigger gauges -> EF5 nowcast-mode run over the basin with
 output_grids=streamflow|runoff|subrunoff -> crestimap well-balanced solver
 (3DEP DEM on demand) -> compact depth frames -> eventstore (one commit).
 
-CPU sizing: 1" DEM downsampled to <= EVENT_MAX_CELLS (default 400k)
-=> ~15-45 min per event on cpu-upgrade. A GPU Space raises the ceiling
-to 1/3" (10 m). crestimap installs from the CREST-iMAP fork's v2 branch
-(Dockerfile); everything here degrades to a clear error if it's missing.
+CPU sizing: RESOLUTION IS FIXED at the DEM's native cell size; when the
+basin box exceeds EVENT_MAX_CELLS (default 400k) at that resolution, the
+solver WINDOW shrinks around the trigger gauge (_hires_window) — never the
+resolution. Full-basin native coverage = parallel/GPU milestone (subbasin
+decomposition + ghost-cell halo exchange). crestimap installs from the
+CREST-iMAP fork's v2 branch (Dockerfile); everything here degrades to a
+clear error if it's missing.
 """
 from __future__ import annotations
 
 import datetime
+import math
 import os
 import tempfile
 import threading
@@ -38,6 +42,44 @@ MAX_CELLS = int(os.environ.get("EVENT_MAX_CELLS", "400000"))
 DEM_RES = os.environ.get("EVENT_DEM_RES", "1")
 DEM_CACHE = os.environ.get("EVENT_DEM_CACHE",
                            os.path.join(tempfile.gettempdir(), "dem_cache"))
+# RESOLUTION IS FIXED at the DEM's native cell size — a coarsened flood map
+# (one pixel = 10 street blocks) is useless information. When the basin box
+# exceeds the cell budget at native resolution, the SIMULATED WINDOW shrinks
+# around the trigger gauge instead (user directive 2026-08-12); covering the
+# full basin at native resolution is the parallel-computing milestone.
+DEM_RES_DEG = {"1": 1.0 / 3600.0, "13": 1.0 / 10800.0}
+
+
+def _hires_window(bbox, gauge_ll, log=print):
+    """Crop the basin box to the largest window that fits EVENT_MAX_CELLS at
+    the DEM's NATIVE resolution, centered on the trigger gauge with a 25%
+    bias toward the basin-box center (the upstream side, where the flood
+    comes from). Returns bbox unchanged when it already fits."""
+    w, s, e, n = bbox
+    glat, glon = gauge_ll
+    res = DEM_RES_DEG.get(DEM_RES, 1.0 / 3600.0)
+    side_deg = math.sqrt(float(MAX_CELLS)) * res
+    if (n - s) <= side_deg and (e - w) <= side_deg:
+        return bbox
+    cy = glat + 0.25 * ((s + n) / 2.0 - glat)
+    cx = glon + 0.25 * ((w + e) / 2.0 - glon)
+    hl_lat = min(side_deg, n - s) / 2.0
+    hl_lon = min(side_deg, e - w) / 2.0
+    # the gauge must stay well inside the window (bias is a preference only);
+    # applying the gauge clamp BEFORE the box clamp keeps it inside even when
+    # the gauge sits near a basin-box edge
+    cy = min(max(cy, glat - 0.4 * hl_lat), glat + 0.4 * hl_lat)
+    cx = min(max(cx, glon - 0.4 * hl_lon), glon + 0.4 * hl_lon)
+    cy = min(max(cy, s + hl_lat), n - hl_lat)
+    cx = min(max(cx, w + hl_lon), e - hl_lon)
+    km = 111.0
+    coslat = max(0.2, math.cos(math.radians(glat)))
+    log(f"resolution-first window: {2 * hl_lon * km * coslat:.0f} x "
+        f"{2 * hl_lat * km:.0f} km around the gauge at native ~"
+        f"{res * 111000:.0f} m (basin box {(e - w) * km * coslat:.0f} x "
+        f"{(n - s) * km:.0f} km exceeds the {MAX_CELLS} cell budget; "
+        f"full-basin native coverage needs the parallel/GPU tier)")
+    return (cx - hl_lon, cy - hl_lat, cx + hl_lon, cy + hl_lat)
 
 _running: dict = {"id": None, "status": None, "log": [], "last": None}
 _lock = threading.Lock()
@@ -264,8 +306,13 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
 
         with _lock:
             _running["status"] = "solver"
+        # EF5 keeps the FULL basin (routing needs the whole catchment; its
+        # routed channel stage carries upstream water INTO the window); only
+        # the 2-D solver domain is cropped to hold native resolution
+        solver_bbox = _hires_window(tuple(pipeline.basin_bbox(g)),
+                                    (g["lat"], g["lon"]), log=log)
         cfg = EventConfig(
-            event_id=ev_id, bbox=tuple(pipeline.basin_bbox(g)),
+            event_id=ev_id, bbox=solver_bbox,
             t0=t0, t_end=t_end, ef5_output_dir=out_dir,
             out_dir=os.path.join(work, "event_out"), model=wb_model,
             sim_start=t0 - datetime.timedelta(hours=SIM_BACKSET_H),
