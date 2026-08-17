@@ -10,7 +10,7 @@ Checks:
   nowcast   precomputed fleet nowcast issue age      (< 3 h)
   mrms      newest radar animation frame age          (< 3 h)
   tick      last hourly event tick on THIS process    (< 2 h)
-  queue     depth, oldest unclaimed bundle age        (< 6 h unclaimed)
+  queue     depth, oldest NEVER-PUBLISHED bundle age  (< 6 h unclaimed)
   workers   freshest claim heartbeat anywhere         (informational)
   events    active episodes, publishes in last 24 h   (informational)
 
@@ -45,6 +45,13 @@ def _age_h(ts: str, fmt: str) -> float | None:
                      / 3600.0, 2)
     except (ValueError, TypeError):
         return None
+
+
+def _oldest_queued(rows) -> float | None:
+    ages = [_age_h(r.get("queued") or "", "%Y-%m-%dT%H:%M:%SZ")
+            for r in rows]
+    ages = [a for a in ages if a is not None]
+    return max(ages) if ages else None
 
 
 def snapshot() -> dict:
@@ -111,20 +118,34 @@ def snapshot() -> dict:
             from . import eventqueue
             rows = eventqueue.queue_status()
             unclaimed = [r for r in rows if not r.get("worker")]
-            oldest = None
-            for r in unclaimed:
-                a = _age_h(r.get("queued") or "", "%Y-%m-%dT%H:%M:%SZ")
-                if a is not None and (oldest is None or a > oldest):
-                    oldest = a
+            # A bundle whose event is already in the published index is
+            # FINISHED work whose queue entry has not been swept yet — the
+            # sweep only runs on the next enqueue, so a solved re-sim can
+            # sit "unclaimed" for up to QUEUE_MAX_AGE_H (48 h) and pin this
+            # check red forever. Only a NEVER-published bundle means a flood
+            # is going unmapped, so ok/alerting keys off those; the raw
+            # unclaimed age stays in the payload for visibility. Same "done"
+            # test the tick's CPU-rung sweep uses (eventsim: rid in idx).
+            try:
+                from . import eventstore as _es
+                published = set(_es.load_index())
+            except Exception:
+                published = set()
+            pending = [r for r in unclaimed
+                       if str(r.get("id") or "") not in published]
+            oldest = _oldest_queued(unclaimed)
+            oldest_pending = _oldest_queued(pending)
             hbs = [_age_h(r.get("hb") or "", "%Y-%m-%dT%H:%M:%SZ")
                    for r in rows]
             hbs = [h for h in hbs if h is not None]
             out["queue"] = {"depth": len(rows),
                             "unclaimed": len(unclaimed),
                             "oldest_unclaimed_h": oldest,
+                            "unpublished": len(pending),
+                            "oldest_unpublished_h": oldest_pending,
                             "mode": eventqueue.mode(),
-                            "ok": oldest is None
-                            or oldest <= UNCLAIMED_MAX_H}
+                            "ok": oldest_pending is None
+                            or oldest_pending <= UNCLAIMED_MAX_H}
             out["workers"] = {"last_heartbeat_h": min(hbs) if hbs else None,
                               "active_claims": sum(1 for r in rows
                                                    if r.get("worker"))}
