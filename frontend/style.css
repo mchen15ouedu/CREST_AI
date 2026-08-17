@@ -28,6 +28,31 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Se
 }
 #mode-seg .seg.on { background: #1b2a3a; color: #ffd479; }
 #mode-seg #mode-now.on { background: #3a2413; color: #ff9f43; }
+/* Nowcast rain-radar control — stacked above the risk legend (bottom-left).
+   The gradient MIRRORS RAIN_X/R/G/B in scripts/update_mrms_recent.py. */
+#mrms-ctl {
+  position: absolute; left: 12px; bottom: calc(var(--chat-h) + 148px); z-index: 640;
+  background: rgba(17,23,31,.92); border: 1px solid #223; border-radius: 8px;
+  color: #cfe0ee; font-size: 12px; padding: 7px 11px; width: 196px;
+}
+#mrms-ctl .m-title { font-size: 11px; color: #8fa3b3; margin-bottom: 5px; }
+#mrms-ctl .m-sub { opacity: .75; }
+#mrms-ctl .m-btns { display: flex; gap: 4px; }
+#mrms-ctl .m-btns button {
+  flex: 1; background: #1b2a3a; color: #cfe0ee; border: 1px solid #33475e;
+  border-radius: 6px; padding: 3px 0; font-size: 11px; cursor: pointer;
+}
+#mrms-ctl .m-btns button.on { background: #14432e; color: #7fd4a0; border-color: #2a6f4e; }
+#mrms-ctl .m-scale { margin-top: 6px; }
+#mrms-ctl .m-bar { height: 8px; border-radius: 4px;
+  background: linear-gradient(90deg, #96d296 0%, #3caa3c 17%, #ffdc00 33%,
+    #ff9600 50%, #e6281e 67%, #b4148c 83%, #780078 100%); }
+#mrms-ctl .m-ticks { display: flex; justify-content: space-between;
+  font-size: 9px; color: #8fa3b3; margin-top: 2px; font-variant-numeric: tabular-nums; }
+#mrms-ctl .m-note { font-size: 10px; color: #8fa3b3; margin-top: 2px; }
+body.font-lg #mrms-ctl { zoom: 1.18; }
+body.font-xl #mrms-ctl { zoom: 1.4; }
+
 /* nowcast flood-risk legend (bottom-left, above Leaflet attribution) */
 #risk-legend {
   position: absolute; left: 12px; bottom: calc(var(--chat-h) + 46px); z-index: 640;
@@ -270,6 +295,24 @@ body.font-xl #anim, body.font-xl #q-legend { zoom: 1.4; }
     #c9dd45 48%, #ffd23f 57%, #fd8d3c 70%, #f03b20 84%, #bd0026 100%); }
 #q-legend .q-ticks { display: flex; justify-content: space-between; font-size: 10px; color: #8fa3b3; margin-top: 2px; }
 #q-legend .q-peak { font-size: 10px; color: #8fa3b3; margin-top: 3px; }
+
+/* inundation depth legend — same bottom-left slot as #q-legend (the two are
+   never shown together: entering 2D-inundation mode hides the streamflow one).
+   The gradient MIRRORS DEPTH_STOPS in hf_data/eventsim.py — change both. */
+#depth-legend {
+  position: absolute; left: 12px; bottom: calc(var(--chat-h) + 12px); z-index: 640;
+  background: rgba(17,23,31,.92); border: 1px solid #223; border-radius: 8px;
+  padding: 8px 10px; color: #cfe0ee; width: 186px;
+}
+#left-panel:not(.collapsed):not(.hidden) ~ #depth-legend { left: 324px; }
+#depth-legend .d-title { font-size: 11px; color: #8fa3b3; margin-bottom: 5px; }
+#depth-legend .d-bar { height: 10px; border-radius: 4px;
+  background: linear-gradient(90deg, #2ea03c 0%, #fadc28 30%, #eb3223 65%, #82148c 100%); }
+#depth-legend .d-ticks { display: flex; justify-content: space-between;
+  font-size: 10px; color: #8fa3b3; margin-top: 2px; font-variant-numeric: tabular-nums; }
+#depth-legend .d-note { font-size: 10px; color: #8fa3b3; margin-top: 4px; line-height: 1.35; }
+body.font-lg #depth-legend { zoom: 1.18; }
+body.font-xl #depth-legend { zoom: 1.4; }
 
 /* modal */
 .modal { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,.55);

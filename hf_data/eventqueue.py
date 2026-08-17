@@ -78,13 +78,50 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
                         if f.startswith(f"{QPREFIX}/")]
         except Exception:
             existing = []
+        # The id timestamp is the EPISODE START, which an active episode keeps
+        # for days — id age alone is NOT queue-entry age. A re-enqueued old
+        # episode's fresh bundle (and its worker's live claim!) was swept by
+        # this loop keyed on id age (observed 2026-08-14 15:35Z, killing a
+        # claim 25 min into a solve). Stale now additionally requires the
+        # entry's event to be genuinely idle: no fresh claim, and its spec's
+        # own `queued` stamp (not the id) past QUEUE_MAX_AGE_H.
+        spec_age_h: dict[str, float] = {}
+        claim_ok: dict[str, bool] = {}
+
+        def _entry_idle_and_old(eid: str) -> bool:
+            if eid not in claim_ok:
+                claim_ok[eid] = _fresh(_claim(eid))
+            if claim_ok[eid]:
+                return False
+            if eid not in spec_age_h:
+                age = float("inf")                # spec gone -> orphan, sweep
+                sp = _spec(eid)
+                if sp:
+                    try:
+                        age = (datetime.datetime.utcnow() -
+                               datetime.datetime.strptime(sp.get("queued", ""),
+                                                          _TS)
+                               ).total_seconds() / 3600.0
+                    except ValueError:
+                        pass
+                spec_age_h[eid] = age
+            return spec_age_h[eid] > QUEUE_MAX_AGE_H
+
         for f in existing:
             base = os.path.basename(f)
-            stale = (eventstore._age_days(base) or 0.0) * 24.0 > QUEUE_MAX_AGE_H
+            eid = base.split(".", 1)[0]
+            id_old = (eventstore._age_days(base) or 0.0) * 24.0 > QUEUE_MAX_AGE_H
             prior = (base.startswith(f"{event_id}.")
                      and base.split(".", 1)[1] not in ("json",
                                                        "forcing.tar.gz"))
-            if stale or prior:
+            if prior and base.endswith(".claim") and _fresh(_claim(event_id)):
+                # a worker is actively solving the PREVIOUS bundle of this
+                # event — deleting its claim mid-run made the whole ladder
+                # fall over once (observed live 2026-08-14 14:10Z). Leave it;
+                # the worker re-scans the replaced spec when it finishes.
+                continue
+            if prior or (id_old and eid != event_id
+                         and _entry_idle_and_old(eid)):
                 ops.append(CommitOperationDelete(f))
         mb = os.path.getsize(tar_path) / 1e6
         api.create_commit(repo_id=eventstore.REPO, repo_type="dataset",
@@ -93,6 +130,7 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
                                          f"({len(tifs)} grids, {mb:.0f} MB)")
         log(f"queue: job {event_id} enqueued "
             f"({len(tifs)} grids, {mb:.0f} MB) [mode {mode()}]")
+        _wake_workers(log)
         return True
     except Exception as e:
         log(f"queue: enqueue failed ({type(e).__name__}: {e})")
@@ -104,10 +142,101 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
             pass
 
 
+_qs_cache: dict = {"t": 0.0, "rows": []}
+
+
+def queue_status() -> list[dict]:
+    """Dashboard view of in-flight work: every queued spec with its claim
+    state — [{id, gauge, queued, worker}] (worker None = waiting). Cached
+    60 s; the event panel polls /api/events every ~20 s."""
+    now = time.time()
+    if now - _qs_cache["t"] < 60:
+        return _qs_cache["rows"]
+    rows = []
+    api = eventstore._api()
+    if api is not None:
+        try:
+            files = [f for f in api.list_repo_files(eventstore.REPO,
+                                                    repo_type="dataset")
+                     if f.startswith(f"{QPREFIX}/")]
+            ids = sorted({os.path.basename(f)[:-5] for f in files
+                          if f.endswith(".json")
+                          and not f.endswith(".failed.json")})
+            for ev in ids:
+                sp = _spec(ev) or {}
+                c = _claim(ev) if f"{QPREFIX}/{ev}.claim" in files else None
+                rows.append({"id": ev,
+                             "gauge": (sp.get("gauge") or {}).get("id"),
+                             "queued": sp.get("queued"),
+                             "worker": (c or {}).get("worker")
+                             if _fresh(c) else None,
+                             # last heartbeat even if stale — health's
+                             # "when was any worker last alive" signal
+                             "hb": (c or {}).get("hb")})
+        except Exception:
+            pass
+    _qs_cache.update(t=now, rows=rows)
+    return rows
+
+
+def claim_fresh_for(event_id: str) -> str | None:
+    """Worker ident if a FRESH claim exists for this exact event id (a worker
+    is actively solving it), else None."""
+    c = _claim(event_id)
+    return c.get("worker") if c and _fresh(c) else None
+
+
+def gauge_pending(gid: str) -> str | None:
+    """Event id of any queued spec for this gauge (claimed or not), else
+    None. Guards double-triggering: with delegated hand-offs the published
+    index lags the queue, so 'is there already work in flight for this
+    gauge' must be answered from the queue itself."""
+    api = eventstore._api()
+    if api is None:
+        return None
+    try:
+        files = api.list_repo_files(eventstore.REPO, repo_type="dataset")
+    except Exception:
+        return None
+    suffix = f"_{gid}.json"
+    for f in files:
+        base = os.path.basename(f)
+        if (f.startswith(f"{QPREFIX}/") and base.endswith(suffix)
+                and not base.endswith(".failed.json")):
+            return base[:-5]
+    return None
+
+
+def _wake_workers(log=print):
+    """Fire-and-forget GET to each worker Space URL so a slept ZeroGPU
+    backup wakes when a job appears (Spaces wake on any HTTP request).
+    EVENT_WORKER_WAKE_URLS: comma-separated, e.g.
+    https://vincewin-crest-gpu-worker.hf.space"""
+    urls = [u.strip() for u in
+            os.environ.get("EVENT_WORKER_WAKE_URLS", "").split(",") if u.strip()]
+    if not urls:
+        return
+    import requests
+    for u in urls:
+        try:
+            requests.get(u, timeout=10)
+        except Exception:
+            pass                                  # waking is best-effort
+    log(f"queue: pinged {len(urls)} worker Space(s) awake")
+
+
 def _claim(event_id: str) -> dict | None:
+    return _qjson(f"{event_id}.claim")
+
+
+def _spec(event_id: str) -> dict | None:
+    return _qjson(f"{event_id}.json")
+
+
+def _qjson(basename: str) -> dict | None:
     try:
         from huggingface_hub import hf_hub_download
-        p = hf_hub_download(eventstore.REPO, f"{QPREFIX}/{event_id}.claim",
+        p = hf_hub_download(eventstore.REPO, f"{QPREFIX}/{basename}",
                             repo_type="dataset",
                             token=os.environ.get("HF_TOKEN"),
                             force_download=True)

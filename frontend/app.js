@@ -2263,6 +2263,7 @@ function syncRiskLayer() {                // density map out wide, pins when clo
   if (showHeat) { if (!map.hasLayer(riskLayer)) riskLayer.addTo(map); }
   else if (riskLayer && map.hasLayer(riskLayer)) map.removeLayer(riskLayer);
   document.getElementById("risk-legend").classList.toggle("hidden", !nowcastMode);
+  document.getElementById("mrms-ctl").classList.toggle("hidden", !nowcastMode);
 }
 
 function setMode(nc) {
@@ -2272,6 +2273,10 @@ function setMode(nc) {
   updateFocusHalo(null);               // the mode's own refocus re-adds it
   updateMapMode();                     // vpLayer shows in both modes now
   refreshSelection();
+  // Model options is a hindcast (expert) tool — nowcast needs no dates or
+  // knobs, so the panel only exists in hindcast mode
+  const lpm = document.getElementById("left-panel");
+  if (lpm) lpm.style.display = nc ? "none" : "";
   if (nc) {
     // everyone starts from the CONUS overview — the tiered risk map IS the
     // point of nowcast mode (no auto-zoom, even for signed-in users)
@@ -2282,14 +2287,16 @@ function setMode(nc) {
            "draw a rectangle, or zoom until ≤25 are in view for observed flow + the " +
            "next-6-hour prediction, refreshed hourly. Purple dashed <b>ungauged points</b> " +
            "have no gauge to predict from — click one and the AI routes its upstream " +
-           "gauges' nowcasts down to it. <b>Experimental</b>; gauge points only " +
-           "(2-D maps stay in Hindcast).", "status");
+           "gauges' nowcasts down to it. The <b>rain radar</b> control (bottom-left) " +
+           "overlays MRMS rainfall and animates the last 24 h–7 days. " +
+           "<b>Experimental</b>; gauge points only (2-D maps stay in Hindcast).", "status");
     loadNowcastRisk();
     scheduleAutoView();
   } else {
     addMsg("🕘 <b>Hindcast mode</b> — historical CREST simulations (pick gauges and a time window). " +
            "Purple dashed pins are <b>ungauged points</b>: river outlets with no USGS gauge that fill " +
            "the coverage gaps — simulated with upstream gauge observations injected as inflow.", "status");
+    mrmsOff();                         // radar overlay is a nowcast-only layer
     clearUpstreamNet();
     if (panelGauge && simHydro[panelGauge]) focusGauge(panelGauge);
   }
@@ -2615,6 +2622,7 @@ let evtBase = "";                    // HF resolve base URL
 let evtFrameIdx = -1;                // -1 => maxdepth
 let evtTimer = null;
 let evtPanel = null;
+let evtPollTimer = null;             // single event-list refresh timer
 let evtPinsLayer = null;             // CONUS overview: one pin per event (or heat)
 let evtSiteLayer = null;             // selected event: gauge pin + basin + domain
 let evtByGauge = {};                 // gid -> {id, s}: newest event per trigger gauge
@@ -2632,6 +2640,8 @@ function enterEventsMode() {
   // the Model options panel is a hindcast tool and overlaps the event list
   const lp = document.getElementById("left-panel");
   if (lp) lp.style.display = "none";
+  // the streamflow legend shares this corner and means nothing here
+  document.getElementById("q-legend").classList.add("hidden");
   map.setView([39, -98], 5, { animate: false });   // CONUS overview: event pins
   addMsg("<b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
          "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the basin " +
@@ -2664,6 +2674,8 @@ function leaveEventsMode() {
   if (evtPinsLayer) { try { map.removeLayer(evtPinsLayer); } catch (_) {} evtPinsLayer = null; }
   if (evtSiteLayer) { try { map.removeLayer(evtSiteLayer); } catch (_) {} evtSiteLayer = null; }
   if (evtPanel) { evtPanel.remove(); evtPanel = null; }
+  if (evtPollTimer) { clearTimeout(evtPollTimer); evtPollTimer = null; }
+  hideDepthLegend();
   evtManifest = null;
 }
 
@@ -2758,6 +2770,15 @@ async function loadEvents() {
   } else if (r.last && r.last.ok === false) {
     html += `<div style="color:#ff9d9d">last run failed: ${r.last.error || ""}</div>`;
   }
+  // in-flight worker queue: events exist here before they publish — without
+  // this, GPU-solved events were invisible for hours ("no new events?")
+  (d.queue || []).forEach((q) => {
+    const known = d.events && d.events[q.id];
+    html += `<div style="color:#9fc4e8;font-size:12px">` +
+      `${q.worker ? "🛠" : "⏳"} <b>${q.gauge || q.id}</b> — ` +
+      `${q.worker ? "solving on GPU worker" : "queued for GPU worker"}` +
+      `${known ? " (refresh)" : " (new)"}</div>`;
+  });
   if (!ids.length) html += "<div style='opacity:.8'>No published events yet.</div>";
   // controls dock ABOVE the event list, so the slider/play buttons are
   // always visible without scrolling an 11-event panel
@@ -2769,17 +2790,104 @@ async function loadEvents() {
     b.style.cssText = "display:block;width:100%;text-align:left;margin:5px 0;" +
       "background:#22334a;color:#dfe9f5;border:1px solid #3c557a;border-radius:7px;" +
       "padding:6px 8px;cursor:pointer;font-size:12px";
-    b.innerHTML = `<b>${(s.trigger && s.trigger.gauge) || id}</b> · t0 ${s.t0 || "?"}` +
-      `${s.status === "active" ? ' · <span style="color:#7fd47f">active</span>' : ""}` +
-      `<br><span style="opacity:.75">${s.n_frames || 0} frames` +
-      `${s.archive_frames ? ` · ${s.archive_frames} archived` : ""}` +
-      `${s.demoted ? " (archived: max-depth only)" : ""}</span>`;
+    const gid = (s.trigger && s.trigger.gauge) || s.gauge || id;
+    const f = s.final;
+    if (s.status !== "active" && f) {
+      // V30: a finished episode is shown as its FINAL PRODUCT — the hourly
+      // events were fragments; this consolidated card replaces them
+      const num = (v, d2) => (v === null || v === undefined) ? null
+        : (+v).toFixed(d2 === undefined ? 1 : d2);
+      const parts = [];
+      if (f.duration_h != null) parts.push(`${num(f.duration_h, 0)} h`);
+      if (f.peak_obs_m3s != null) parts.push(`peak ${num(f.peak_obs_m3s)} m³/s`);
+      if (f.peak_depth_m != null) parts.push(`max depth ${num(f.peak_depth_m)} m`);
+      if (f.inundated_km2 != null) parts.push(`${num(f.inundated_km2)} km² wet`);
+      // skill numbers are EVENT scores — computed over this episode's
+      // window only, never diluted by flat days (say so on the card)
+      let skill = "";
+      if (f.nse_h1 != null || f.nse_h6 != null) {
+        const nse = (v) => (v === null || v === undefined) ? "–" : (+v).toFixed(2);
+        skill = `<br><span style="color:#9fc4e8">event score (this episode ` +
+          `only): nowcast NSE 1 h ${nse(f.nse_h1)} · 6 h ${nse(f.nse_h6)}</span>`;
+      }
+      b.innerHTML = `<b>🏁 ${gid}</b> · flood episode ended ${f.ended || ""}` +
+        `<br><span style="opacity:.8">${parts.join(" · ")}</span>` + skill;
+    } else {
+      b.innerHTML = `<b>${gid}</b> · t0 ${s.t0 || "?"}` +
+        `${s.status === "active" ? ' · <span style="color:#7fd47f">active</span>' : ""}` +
+        `<br><span style="opacity:.75">${s.n_frames || 0} frames` +
+        `${s.archive_frames ? ` · ${s.archive_frames} archived` : ""}` +
+        `${s.demoted ? " (archived: max-depth only)" : ""}</span>`;
+    }
     b.onclick = () => selectEvent(id, s);
     evtPanel.appendChild(b);
   });
   document.getElementById("map").appendChild(evtPanel);
+  renderEvtCtl();              // the selected event's controls survive a refresh
   renderEventPins(d);
-  if (r.running && eventsMode) setTimeout(loadEvents, 20000);
+  // one timer only: each call used to schedule another without clearing the
+  // previous, so every re-entry into events mode doubled the refresh rate
+  if (evtPollTimer) clearTimeout(evtPollTimer);
+  evtPollTimer = null;
+  if (r.running && eventsMode) evtPollTimer = setTimeout(loadEvents, 20000);
+}
+
+// The depth ramp is baked into the overlay PNGs server-side (DEPTH_STOPS in
+// hf_data/eventsim.py) against a per-event cap = p99 of that episode's wet
+// cells. The legend reports the cap so the adaptive scale is readable rather
+// than implicit — a 0.6 m nuisance flood and a 10 m valley fill both use the
+// full color range, and only this readout says which one you're looking at.
+function showDepthLegend(man) {
+  const el = document.getElementById("depth-legend");
+  if (!el || !man) return;
+  const cap = +man.depth_cap_m || 3;
+  const fmt = (v) => (cap < 2 ? v.toFixed(2) : v.toFixed(1));
+  // ticks sit on the ramp's own break points (green / yellow / red / purple)
+  document.getElementById("depth-ticks").innerHTML =
+    [0, 0.30 * cap, 0.65 * cap, cap]
+      .map((v, i) => `<span>${i === 0 ? "0" : (i === 3 ? "≥" : "") + fmt(v)}</span>`).join("");
+  document.getElementById("depth-note").textContent =
+    `metres — scale fits this event (cap ${fmt(cap)} m)`;
+  el.classList.remove("hidden");
+}
+
+function hideDepthLegend() {
+  const el = document.getElementById("depth-legend");
+  if (el) el.classList.add("hidden");
+}
+
+// Rebuilt from evtManifest rather than held in the DOM: loadEvents() replaces
+// #evt-panel wholesale every refresh, which used to wipe these controls (and,
+// when they still held it, the depth legend) seconds after an event was picked.
+function renderEvtCtl() {
+  const man = evtManifest;
+  if (!man || !evtPanel) return;
+  const id = man._id;
+  const nF = (man.frames || []).length;
+  const canAnim = nF > 0 && !man._demoted;
+  const ctl = document.createElement("div");
+  ctl.id = "evt-ctl";
+  ctl.style.cssText = "margin-top:8px;border-top:1px solid #33475e;padding-top:7px";
+  const gr = man.grid || {};
+  const grTxt = (gr.nx && gr.ny)
+    ? ` · grid ${gr.nx}×${gr.ny} @ ~${Math.round(gr.dx_m || 0)} m` : "";
+  ctl.innerHTML =
+    `<b>${id}</b><br><span style="opacity:.8">depth scale 0–${man.depth_cap_m || 3} m` +
+    `${grTxt}</span><br>` +
+    `<button id="evt-max" style="margin:5px 4px 0 0">max depth</button>` +
+    (canAnim ? `<span style="opacity:.75">time scroll: use the bar below the map</span>`
+      : `<div style="opacity:.75;margin-top:4px">older event — hourly frames ` +
+        `pruned by retention; showing the maximum-depth footprint</div>`);
+  const slot = document.getElementById("evt-ctl-slot");
+  if (slot) slot.replaceChildren(ctl);
+  else {
+    const old = document.getElementById("evt-ctl");
+    if (old) old.remove();
+    evtPanel.appendChild(ctl);
+  }
+  const mx = document.getElementById("evt-max");
+  if (mx) mx.onclick = () => showEvtFrame(-1);
+  showDepthLegend(man);
 }
 
 async function selectEvent(id, summary) {
@@ -2788,32 +2896,9 @@ async function selectEvent(id, summary) {
   try { man = await (await fetch(`${evtBase}/${id}/manifest.json`)).json(); }
   catch (_) { addMsg("⚠️ Couldn't load that event's manifest.", "status"); return; }
   evtManifest = { ...man, _id: id, _demoted: !!(summary && summary.demoted) };
-  const ctl = document.createElement("div");
-  ctl.id = "evt-ctl";
-  ctl.style.cssText = "margin-top:8px;border-top:1px solid #33475e;padding-top:7px";
   const nF = (man.frames || []).length;
   const canAnim = nF > 0 && !evtManifest._demoted;
-  ctl.innerHTML =
-    `<b>${id}</b><br><span style="opacity:.8">cap ${man.depth_cap_m || 3} m · ` +
-    `grid ${man.grid.nx}×${man.grid.ny} @ ~${Math.round(man.grid.dx_m)} m</span><br>` +
-    `<button id="evt-max" style="margin:5px 4px 0 0">max depth</button>` +
-    (canAnim ? `<span style="opacity:.75">time scroll: use the bar below the map</span>`
-      : `<div style="opacity:.75;margin-top:4px">older event — hourly frames ` +
-        `pruned by retention; showing the maximum-depth footprint</div>`) +
-    `<div style="margin-top:6px;height:8px;border-radius:4px;background:` +
-    `linear-gradient(90deg, #2ea03c 0%, #fadc28 30%, #eb3223 65%, #82148c 100%)"></div>` +
-    `<div style="display:flex;justify-content:space-between;opacity:.7">` +
-    `<span>0 m</span><span>≥ ${man.depth_cap_m || 3} m</span></div>` +
-    `<div style="display:flex;justify-content:space-between;opacity:.55;font-size:11px">` +
-    `<span>shallow</span><span>deep</span></div>`;
-  const slot = document.getElementById("evt-ctl-slot");
-  if (slot) slot.replaceChildren(ctl);
-  else {
-    const old = document.getElementById("evt-ctl");
-    if (old) old.remove();
-    evtPanel.appendChild(ctl);
-  }
-  document.getElementById("evt-max").onclick = () => showEvtFrame(-1);
+  renderEvtCtl();
   evtBindAnimBar(canAnim ? nF : 0);
   showEvtFrame(-1);
   drawEventSite(evtManifest);
@@ -2835,6 +2920,19 @@ async function selectEvent(id, summary) {
     delete gaugeResult[gid];
     focusGauge(gid);
     renderHydro(gid);
+  }
+  // finished episode: surface the verification next to the hydrograph —
+  // ALWAYS labeled as event scores (computed over this episode's window
+  // only), so they're never mistaken for overall model skill
+  const f = summary && summary.final;
+  if (f && (f.nse_h1 != null || f.nse_h6 != null)) {
+    const nse = (v) => (v === null || v === undefined) ? "–" : (+v).toFixed(2);
+    addMsg(`📊 <b>Event scores</b> — nowcast skill over <b>this episode's ` +
+      `window only</b> (flat days excluded by design): NSE at 1 h lead ` +
+      `<b>${nse(f.nse_h1)}</b>, at 6 h lead <b>${nse(f.nse_h6)}</b>` +
+      `${f.peak_obs_m3s != null ? ` · observed peak ${(+f.peak_obs_m3s).toFixed(1)} m³/s` : ""}` +
+      `${f.peak_depth_m != null ? ` · simulated max depth ${(+f.peak_depth_m).toFixed(1)} m` : ""}`,
+      "status");
   }
 }
 
@@ -2937,6 +3035,120 @@ function stopEvtPlay() {
     if (b) b.textContent = "▶";
   }
 }
+
+// ---- Nowcast rain radar: MRMS Pass1 frame animation (V28) ----------------
+// Hourly transparent PNGs (1/4-res CONUS, rolling 7 days) rendered by the
+// updater into CREST_data mrms_frames/; animated straight off the HF CDN.
+// Borrows the shared #anim bar exactly like events mode does.
+let mrmsHours = [];                  // every published frame hour, ascending
+let mrmsBase = "";
+let mrmsBounds = [[20, -130], [55, -60]];
+let mrmsSel = [];                    // hours inside the chosen range
+let mrmsRange = 0;                   // 0 = off, else lookback hours
+let mrmsIdx = 0;
+let mrmsOverlay = null;
+let mrmsTimer = null;
+
+function mrmsLabel(h) {
+  return `${h.slice(4, 6)}-${h.slice(6, 8)} ${h.slice(8)}:00 UTC`;
+}
+
+function mrmsFrameUrl(h) { return `${mrmsBase}/mrms1h_${h}.png`; }
+
+function mrmsShow(i) {
+  if (!mrmsSel.length) return;
+  mrmsIdx = Math.max(0, Math.min(i, mrmsSel.length - 1));
+  const url = mrmsFrameUrl(mrmsSel[mrmsIdx]);
+  if (mrmsOverlay) mrmsOverlay.setUrl(url);
+  else mrmsOverlay = L.imageOverlay(url, mrmsBounds,
+    { opacity: 0.75, interactive: false }).addTo(map);
+  // browser-cache the next few frames so playback never stutters
+  for (let k = 1; k <= 3; k++) {
+    if (mrmsIdx + k < mrmsSel.length) new Image().src = mrmsFrameUrl(mrmsSel[mrmsIdx + k]);
+  }
+  const lab = document.getElementById("anim-time");
+  if (lab && nowcastMode) lab.textContent = mrmsLabel(mrmsSel[mrmsIdx]);
+  const sl = document.getElementById("anim-slider");
+  if (sl && nowcastMode) sl.value = String(mrmsIdx);
+}
+
+function stepMrms() {
+  mrmsShow(mrmsIdx >= mrmsSel.length - 1 ? 0 : mrmsIdx + 1);
+}
+function stopMrmsPlay() {
+  if (mrmsTimer) { clearInterval(mrmsTimer); mrmsTimer = null; }
+  if (nowcastMode && mrmsRange) {
+    const b = document.getElementById("anim-play");
+    if (b) b.textContent = "▶";
+  }
+}
+function toggleMrmsPlay() {
+  if (mrmsTimer) { stopMrmsPlay(); return; }
+  document.getElementById("anim-play").textContent = "⏸";
+  mrmsTimer = setInterval(stepMrms, 300);
+}
+
+function mrmsBindAnimBar() {
+  const bar = document.getElementById("anim");
+  const play = document.getElementById("anim-play");
+  const slider = document.getElementById("anim-slider");
+  bar.classList.remove("hidden");
+  play.textContent = "▶";
+  play.onclick = toggleMrmsPlay;
+  slider.min = "0";
+  slider.max = String(mrmsSel.length - 1);
+  slider.value = String(mrmsSel.length - 1);
+  slider.oninput = (e) => { stopMrmsPlay(); mrmsShow(parseInt(e.target.value, 10)); };
+}
+
+function mrmsReleaseAnimBar() {
+  const bar = document.getElementById("anim");
+  const play = document.getElementById("anim-play");
+  const slider = document.getElementById("anim-slider");
+  play.onclick = togglePlay;                       // hindcast handlers back
+  slider.oninput = (e) => { stopPlay(); setFrame(parseInt(e.target.value)); };
+  if (animMax > 0 && !nowcastMode) {
+    slider.max = String(animMax);
+    setFrame(animIdx);
+  } else bar.classList.add("hidden");
+}
+
+function mrmsOff() {
+  stopMrmsPlay();
+  mrmsRange = 0;
+  mrmsSel = [];
+  if (mrmsOverlay) { try { map.removeLayer(mrmsOverlay); } catch (_) {} mrmsOverlay = null; }
+  mrmsReleaseAnimBar();
+  document.querySelectorAll("#mrms-ctl .m-btns button").forEach(
+    (b) => b.classList.toggle("on", b.dataset.h === "0"));
+}
+
+async function setMrmsRange(hrs) {
+  if (!hrs) { mrmsOff(); return; }
+  try {
+    const d = await (await fetch("/api/mrms_frames")).json();
+    if (!d.ok || !(d.hours || []).length) {
+      addMsg("⚠️ No radar frames are published yet — the updater renders them " +
+             "hourly; try again in a little while.", "status");
+      mrmsOff();
+      return;
+    }
+    mrmsHours = d.hours;
+    mrmsBase = d.base;
+    if (Array.isArray(d.bounds)) mrmsBounds = d.bounds;
+  } catch (_) { addMsg("⚠️ Couldn't load the radar frame index.", "status"); return; }
+  stopMrmsPlay();
+  mrmsRange = hrs;
+  mrmsSel = mrmsHours.slice(-hrs);                 // hourly frames -> last N hours
+  document.querySelectorAll("#mrms-ctl .m-btns button").forEach(
+    (b) => b.classList.toggle("on", parseInt(b.dataset.h, 10) === hrs));
+  mrmsBindAnimBar();
+  mrmsShow(mrmsSel.length - 1);                    // newest frame first
+}
+
+document.querySelectorAll("#mrms-ctl .m-btns button").forEach((b) => {
+  b.onclick = () => setMrmsRange(parseInt(b.dataset.h, 10));
+});
 
 document.getElementById("mode-evt").onclick = () => enterEventsMode();
 document.getElementById("mode-hind").onclick = () => {

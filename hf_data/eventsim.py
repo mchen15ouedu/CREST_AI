@@ -20,6 +20,7 @@ import math
 import os
 import tempfile
 import threading
+import time
 
 EVENT_TOKENS = "streamflow|runoff|subrunoff"
 HORIZON_H = int(os.environ.get("EVENT_HORIZON_H", "12"))
@@ -29,8 +30,30 @@ HINDCAST_H = int(os.environ.get("EVENT_HINDCAST_H", "48"))
 # risk tier drops below EVENT_CONT_TIER — i.e. when FLOW recedes to normal,
 # not when precipitation stops (recession can outlive the rain by days).
 CONT_TIER = int(os.environ.get("EVENT_CONT_TIER", "1"))
+# episode END is decided by USGS OBSERVATIONS, not the AI tier (user
+# directive 2026-08-14): the episode lives while recent observed flow stays
+# >= CONT_OBS_MULT x normal (baseflow); the AI tier is only the fallback for
+# gauges that stop reporting mid-episode.
+CONT_OBS_MULT = float(os.environ.get("EVENT_CONT_OBS_MULT", "5.0"))
 MAX_EPISODE_H = int(os.environ.get("EVENT_MAX_EPISODE_H", "96"))
 MAX_PER_TICK = int(os.environ.get("EVENT_MAX_PER_TICK", "2"))
+# V30: the CPU rung is a LAST resort, not a parallel engine — in queue mode
+# "on" a local solve runs only when an event has gone this long with no
+# fresh worker claim and no publish progress (worker output supersedes the
+# CPU window anyway, and hours-long CPU solves were what starved the tick)
+CPU_FALLBACK_H = float(os.environ.get("EVENT_CPU_FALLBACK_H", "3"))
+# ...and when it does engage it gets a WALL-CLOCK BUDGET. A free CPU Space
+# solving a 400k-cell grid can take days: 05570000 held the runner for 39 h
+# and was still at sim t=8.5 of 24 h, so every hourly tick since returned
+# "runner busy" and detection stopped dead (found 2026-08-17). Past the
+# budget the local solve aborts, the bundle stays queued for a real worker,
+# and the runner is freed. Only applied when the bundle IS queued (queue mode
+# "off" has no worker to hand off to, so there the CPU rung must finish).
+CPU_MAX_H = float(os.environ.get("EVENT_CPU_MAX_H", "2"))
+# ...and it is not retried immediately: a grid the CPU cannot finish in the
+# budget will not finish next hour either, and retrying burns the whole tick
+# every hour. In-memory, so a Space restart gives it a fresh chance.
+CPU_COOLDOWN_H = float(os.environ.get("EVENT_CPU_COOLDOWN_H", "12"))
 # events don't need the fleet's 90-day spin-up: upstream DA injection carries
 # the river and the flood is driven by current rain; 30 d bounds forcing prep
 WARMUP_D = int(os.environ.get("EVENT_WARMUP_D", "30"))
@@ -81,12 +104,40 @@ def _hires_window(bbox, gauge_ll, log=print):
         f"full-basin native coverage needs the parallel/GPU tier)")
     return (cx - hl_lon, cy - hl_lat, cx + hl_lon, cy + hl_lat)
 
-_running: dict = {"id": None, "status": None, "log": [], "last": None}
+_running: dict = {"id": None, "status": None, "log": [], "last": None,
+                  "started": None}
 _lock = threading.Lock()
+# event ids whose local CPU solve blew CPU_MAX_H -> when it happened; the
+# tick's CPU-rung sweep skips them for CPU_COOLDOWN_H
+_cpu_timeout: dict = {}
+
+
+def _busy_h() -> float | None:
+    """Hours the current job has held the runner — None when idle. Health
+    reads this: a tick that keeps reporting "runner busy" is only healthy
+    while the job it is waiting on is young."""
+    st = _running.get("started")
+    if not _running["id"] or not st:
+        return None
+    try:
+        t = datetime.datetime.strptime(st, "%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError):
+        return None
+    return round((datetime.datetime.utcnow() - t).total_seconds() / 3600.0, 2)
+
+
+def note_tick_attempt() -> None:
+    """Stamp tick liveness. Called by hourly_tick AND by the /api/event_tick
+    endpoint's busy short-circuit, so `tick.last` means "the hourly ping is
+    arriving" and the separate busy_h field carries the wedge alarm — before
+    this, a wedged runner made the two indistinguishable."""
+    _running["last_tick"] = datetime.datetime.utcnow().strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
 
 
 def status(full: bool = False) -> dict:
     return {"running": _running["id"], "status": _running["status"],
+            "started": _running.get("started"), "busy_h": _busy_h(),
             "log": _running["log"][-(400 if full else 30):],
             "last": _running["last"]}
 
@@ -114,6 +165,16 @@ def _recent_obs_max(gid: str) -> float | None:
                         vals.append(q * 0.0283168)   # cfs -> m3/s
         return max(vals) if vals else None
     except Exception:
+        return None
+
+
+def _age_days_started(s: dict) -> float | None:
+    """Age [days] of an index entry from its episode start (None unknown)."""
+    try:
+        t = datetime.datetime.strptime(
+            s.get("episode_started") or s.get("t0") or "", "%Y-%m-%dT%H:%MZ")
+        return (datetime.datetime.utcnow() - t).total_seconds() / 86400.0
+    except ValueError:
         return None
 
 
@@ -230,20 +291,54 @@ def _basin_outline(ef5_dir: str, gauge_ll=None, max_pts: int = 1200, log=print):
 
 
 def run_one(gid: str, t0: datetime.datetime | None = None,
-            trigger: dict | None = None, episode_id: str | None = None) -> dict:
+            trigger: dict | None = None, episode_id: str | None = None,
+            defer: bool = False, force_cpu: bool = False) -> dict:
     """Full event pipeline for one trigger gauge. Blocking (minutes-long);
     call from a worker thread. Returns the manifest (raises on failure).
     episode_id: re-simulate an ongoing episode under its original id (the
-    published folder is replaced with the fresh window)."""
+    published folder is replaced with the fresh window).
+    defer: enqueue for a worker WITHOUT the CPU fallback (manual refills —
+    the runner stays free and the worker publishes whenever it gets there).
+    force_cpu: solve locally even in queue mode "on" — the tick passes this
+    when an event has sat unclaimed/unpublished past EVENT_CPU_FALLBACK_H
+    (V30: the CPU rung is demoted to that last resort; a fresh enqueue no
+    longer burns hours of runner CPU on a solve a worker replaces anyway)."""
     from crestimap import EventConfig, run_event   # needs the v2 package
     from . import eventqueue, eventstore, nowcaststore, pipeline
 
     g = pipeline.gauge_info(gid)
     if g is None:
         raise ValueError(f"unknown gauge {gid}")
+
+    # a worker is mid-solve on this episode's previous bundle: replacing the
+    # spec (and historically, clobbering the claim) would waste its hours of
+    # GPU work — its publish IS this hour's refresh. Skip quietly.
+    if episode_id and eventqueue.mode() == "on":
+        w = eventqueue.claim_fresh_for(episode_id)
+        if w:
+            _running["last"] = {"event": episode_id, "ok": True,
+                                "delegated": w, "skipped": "worker mid-solve"}
+            return {"event_id": episode_id, "published": False,
+                    "delegated": w, "skipped": "worker mid-solve"}
     t0 = t0 or nowcaststore.issue_t0() or \
         datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-    t_start = t0 - datetime.timedelta(hours=HINDCAST_H)
+    # NO MOVING WINDOW (user directive 2026-08-14): an episode's simulation
+    # window is anchored at its FIRST trigger minus the backset and only
+    # GROWS forward — re-sims must never slide past the flood's rise/peak
+    # (03190000's crest was lost exactly that way). The worker spec carries
+    # the full anchored span; the CPU fallback contributes the fresh 24-h
+    # slice and the publish-time frame merge keeps the record fixed-start.
+    anchor = t0
+    if episode_id:
+        st = (eventstore.load_index().get(episode_id) or {}).get(
+            "episode_started") or ""
+        try:
+            anchor = datetime.datetime.strptime(st, "%Y-%m-%dT%H:%MZ")
+        except ValueError:
+            pass
+    sim_anchor = anchor - datetime.timedelta(hours=SIM_BACKSET_H)
+    # EF5 forcing must span the whole anchored solver window
+    t_start = min(t0 - datetime.timedelta(hours=HINDCAST_H), sim_anchor)
     t_end = t0 + datetime.timedelta(hours=HORIZON_H)
     ev_id = episode_id or f"{t0:%Y%m%d%H}_{gid}"
     work = tempfile.mkdtemp(prefix=f"event_{gid}_")
@@ -252,7 +347,9 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         _running["log"].append(s)
 
     with _lock:
-        _running.update(id=ev_id, status="ef5", log=[])
+        _running.update(id=ev_id, status="ef5", log=[],
+                        started=datetime.datetime.utcnow().strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"))
     try:
         log(f"EF5 nowcast-mode run {t_start:%m-%d %H}Z -> {t_end:%m-%d %H}Z "
             f"with gridded runoff output")
@@ -318,12 +415,50 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         # the 2-D solver domain is cropped to hold native resolution
         basin_bbox = tuple(pipeline.basin_bbox(g))
         solver_bbox = _hires_window(basin_bbox, (g["lat"], g["lon"]), log=log)
-        sim_start = t0 - datetime.timedelta(hours=SIM_BACKSET_H)
+        # worker spec = full anchored span (fixed episode window); the local
+        # CPU fallback still solves only the fresh 24-h slice — its frames
+        # merge into the fixed-start record at publish
+        sim_start = sim_anchor
+        sim_start_local = max(sim_anchor,
+                              t0 - datetime.timedelta(hours=SIM_BACKSET_H))
+
+        # warm continuation (user directive 2026-08-14): the hourly update
+        # inherits the previous run's water state. The episode's latest
+        # published depth frame at/just before this run's fresh-slice start
+        # is dropped into the forcing dir as init_depth.tif — the enqueue
+        # tars every .tif, so workers get it too, and run_event/chunkrun
+        # auto-discover it (h0 = max(channel pre-wet, previous depth)).
+        if episode_id:
+            try:
+                pm = eventstore._prior_manifest(ev_id) or {}
+                js = sim_start_local.strftime("%Y-%m-%dT%H:%MZ")
+                cand = [f for f in pm.get("frames", [])
+                        if f.get("t", "") <= js and f.get("file")]
+                if cand:
+                    fr = max(cand, key=lambda f: f["t"])
+                    from huggingface_hub import hf_hub_download
+                    p = hf_hub_download(
+                        eventstore.REPO,
+                        f"{eventstore.PREFIX}/{ev_id}/{fr['file']}",
+                        repo_type="dataset",
+                        token=os.environ.get("HF_TOKEN"),
+                        force_download=True)
+                    import shutil as _sh
+                    ts = fr["t"].replace("-", "").replace("T", "") \
+                        .replace(":", "").replace("Z", "")
+                    _sh.copy(p, os.path.join(out_dir,
+                                             f"init_depth_{ts}.tif"))
+                    log(f"warm-start IC: previous depth frame {fr['t']} "
+                        f"carried into this run (applied only when a run's "
+                        f"window starts there)")
+            except Exception as e:
+                log(f"no warm-start IC ({type(e).__name__}) — cold pre-wet")
 
         # V27 P1: offer the solve to a GPU worker — full basin at native
         # resolution, everything it needs in one bundle. The worker pool is
         # a ladder (HPC GPU -> ZeroGPU Space -> nobody); the local CPU
         # window below remains the unconditional fallback.
+        queued = False
         if eventqueue.mode() != "off":
             spec = {"event_id": ev_id, "episode": bool(episode_id),
                     "gauge": {"id": gid, "lat": g["lat"], "lon": g["lon"],
@@ -343,25 +478,78 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
             if queued and eventqueue.mode() == "on":
                 with _lock:
                     _running["status"] = "queued"
+                if defer:
+                    # manual refill: leave the bundle for the worker pool and
+                    # free the runner immediately — no claim wait, no CPU
+                    log(f"deferred to the worker queue — the result "
+                        f"publishes whenever a worker picks it up")
+                    _running["last"] = {"event": ev_id, "ok": True,
+                                        "deferred": True}
+                    return {"event_id": ev_id, "published": False,
+                            "deferred": True}
                 if eventqueue.wait_for_claim(ev_id, log=log):
-                    man = eventqueue.wait_for_result(ev_id, spec["queued"],
-                                                     log=log)
-                    if man is not None:
-                        man["published"] = True
-                        _running["last"] = {"event": ev_id, "ok": True,
-                                            "published": True, "worker": True}
-                        return man
+                    # DELEGATED: the worker owns the job now. Blocking here
+                    # for hours (the old wait_for_result) held the runner and
+                    # starved hourly_tick — new floods went unmapped while we
+                    # babysat a claimed solve (Indiana, 2026-08-13). The
+                    # worker publishes on its own; ticks keep flowing.
+                    w = eventqueue.claim_fresh_for(ev_id) or "worker"
+                    log(f"delegated to {w} — full-basin result will publish "
+                        f"when the solve finishes; runner freed")
+                    _running["last"] = {"event": ev_id, "ok": True,
+                                        "delegated": w}
+                    return {"event_id": ev_id, "published": False,
+                            "delegated": w}
+                if not force_cpu:
+                    # V30: no claim yet, but the CPU rung is demoted — leave
+                    # the bundle queued; the tick re-checks and only falls
+                    # back to a local solve after EVENT_CPU_FALLBACK_H with
+                    # no claim and no publish progress
+                    log(f"no worker claim — bundle stays queued (CPU "
+                        f"fallback only after {CPU_FALLBACK_H:g} h "
+                        f"without progress)")
+                    _running["last"] = {"event": ev_id, "ok": True,
+                                        "queued": True}
+                    return {"event_id": ev_id, "published": False,
+                            "queued": True}
 
         with _lock:
             _running["status"] = "solver"
+        # wall-clock budget for the demoted CPU rung (see CPU_MAX_H): the
+        # solver calls progress once per output frame, so raising from the
+        # callback aborts mid-integration instead of holding the tick for
+        # days. Only armed when a worker can pick the bundle up instead.
+        solve_log = log
+        if queued and CPU_MAX_H > 0:
+            deadline = time.monotonic() + CPU_MAX_H * 3600.0
+
+            def solve_log(s):                       # noqa: F811
+                log(s)
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"local CPU solve exceeded EVENT_CPU_MAX_H="
+                        f"{CPU_MAX_H:g} h ({s})")
+
         cfg = EventConfig(
             event_id=ev_id, bbox=solver_bbox,
             t0=t0, t_end=t_end, ef5_output_dir=out_dir,
             out_dir=os.path.join(work, "event_out"), model=wb_model,
-            sim_start=sim_start,
+            sim_start=sim_start_local,
             dem_res=DEM_RES, dem_cache=DEM_CACHE, max_cells=MAX_CELLS,
-            trigger={**(trigger or {}), "gauge": gid}, progress=log)
-        manifest = run_event(cfg)
+            trigger={**(trigger or {}), "gauge": gid}, progress=solve_log)
+        try:
+            manifest = run_event(cfg)
+        except TimeoutError as e:
+            # not a failure — the designed give-up. The bundle is already in
+            # the queue, so the work is not lost; only this runner is freed.
+            with _lock:
+                _cpu_timeout[ev_id] = datetime.datetime.utcnow()
+            log(f"{e} — aborted, bundle stays queued for a worker "
+                f"(no CPU retry for {CPU_COOLDOWN_H:g} h)")
+            _running["last"] = {"event": ev_id, "ok": True,
+                                "cpu_timeout": True, "queued": True}
+            return {"event_id": ev_id, "published": False,
+                    "cpu_timeout": True, "queued": True}
         manifest["gauge"] = gid
         manifest["hydro"] = [hydro[k] for k in sorted(hydro)]
         manifest["status"] = "active"
@@ -403,7 +591,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         raise
     finally:
         with _lock:
-            _running.update(id=None, status=None)
+            _running.update(id=None, status=None, started=None)
 
 
 def _update_archive(out_dir: str, manifest: dict, log):
@@ -612,6 +800,7 @@ def hourly_tick() -> dict:
     Runs at most EVENT_MAX_PER_TICK simulations, sequentially.
     """
     from . import eventstore, nowcaststore
+    note_tick_attempt()                            # health: tick liveness
     if _running["id"]:
         return {"skipped": "runner busy"}
     risk = nowcaststore.all_risk()
@@ -631,25 +820,104 @@ def hourly_tick() -> dict:
         except ValueError:
             age_h = float("inf")
         tier = int(tiers.get(gid, 0))
-        if gid and tier >= CONT_TIER and age_h <= MAX_EPISODE_H:
+        # observed flow decides the end: episode continues while the gauge's
+        # recent USGS max is >= CONT_OBS_MULT x baseflow. AI tier only backs
+        # up a gauge that went silent (obs None).
+        obs = _recent_obs_max(gid) if gid else None
+        qbase = None
+        try:
+            qbase = float((nowcaststore._thresholds().get(gid) or {}
+                           ).get("qbase") or 0) or None
+        except Exception:
+            pass
+        if obs is not None and qbase:
+            still_high = obs >= max(CONT_OBS_MULT * qbase, 1.0)
+        else:
+            still_high = tier >= CONT_TIER
+        if gid and still_high and age_h <= MAX_EPISODE_H:
+            # publish progress stale + nobody claiming -> this re-sim runs
+            # on the CPU rung (V30 demotion: last resort, not default)
+            try:
+                pub_age_h = (now - datetime.datetime.strptime(
+                    s.get("generated") or "", "%Y-%m-%dT%H:%M:%SZ")
+                ).total_seconds() / 3600.0
+            except ValueError:
+                pub_age_h = float("inf")
             jobs.append({"gauge": gid, "episode": eid,
+                         "force_cpu": pub_age_h > CPU_FALLBACK_H,
                          "trigger": {**(s.get("trigger") or {}), "tier": tier}})
         else:
             ended.append(eid)
     if ended:
-        eventstore.mark_ended(ended)
+        eventstore.mark_ended(ended)     # fast: stops re-sims immediately
+    # V30 episode final products: consolidate ended episodes (stats + the
+    # episode-scoped nowcast verification) in a background thread — scoring
+    # downloads ~1 archived nowcast per episode-hour and must not delay the
+    # tick. Also self-heals: recently-ended episodes still missing "final"
+    # (e.g. a worker publish raced the index commit) get another pass.
+    heal = [e for e, s in idx.items()
+            if s.get("status") == "ended" and not s.get("final")
+            and (_age_days_started(s) or 99.0) < 3.0]
+    to_final = ended + [e for e in heal if e not in ended]
+    if to_final:
+        threading.Thread(target=eventstore.finalize_episodes,
+                         args=(to_final, print), daemon=True).start()
 
+    from . import eventqueue as _eq
     active_gauges = {j["gauge"] for j in jobs}
+    new_picks = []
     for pick in detect(MAX_PER_TICK):
-        if pick["gauge"] not in active_gauges:
-            jobs.append({"gauge": pick["gauge"], "episode": None,
-                         "trigger": pick})
+        if pick["gauge"] in active_gauges:
+            continue
+        if _eq.mode() == "on" and _eq.gauge_pending(pick["gauge"]):
+            continue           # already in the worker queue (index lags it)
+        new_picks.append({"gauge": pick["gauge"], "episode": None,
+                          "trigger": pick})
+    # V30 CPU-rung last resort: queued bundles that were never published
+    # (not in the index) and sat unclaimed past CPU_FALLBACK_H get a local
+    # solve — enqueue-only detections and deferred refills must not strand
+    # when every worker is dead or busy. t0 comes from the event id so a
+    # backdated refill keeps its window.
+    if _eq.mode() == "on":
+        for row in _eq.queue_status():
+            rid, rgid = str(row.get("id") or ""), str(row.get("gauge") or "")
+            if (not rgid or row.get("worker") or rid in idx
+                    or rgid in active_gauges
+                    or any(p["gauge"] == rgid for p in new_picks)):
+                continue
+            try:
+                q_age_h = (now - datetime.datetime.strptime(
+                    row.get("queued") or "", "%Y-%m-%dT%H:%M:%SZ")
+                ).total_seconds() / 3600.0
+                t0_row = datetime.datetime.strptime(rid[:10], "%Y%m%d%H")
+            except ValueError:
+                continue
+            to = _cpu_timeout.get(rid)
+            if to and (now - to).total_seconds() / 3600.0 < CPU_COOLDOWN_H:
+                continue      # blew the CPU budget already — wait for a worker
+            if q_age_h > CPU_FALLBACK_H:
+                print(f"event tick: {rid} unclaimed for {q_age_h:.1f} h — "
+                      f"CPU fallback engages")
+                new_picks.append({"gauge": rgid, "episode": None,
+                                  "t0": t0_row, "force_cpu": True,
+                                  "trigger": {"cpu_fallback": True}})
+    # NEW floods outrank hourly refreshes of already-mapped ones: the first
+    # slot goes to a new detection when one exists. Episode re-sims fill the
+    # rest. (Before this, episodes filled the list first and the [:MAX] slice
+    # starved every new trigger — Indiana flooded for two days unmapped
+    # while the runner refreshed two known basins.)
+    jobs = (new_picks[:1] + jobs + new_picks[1:])
+    if len(jobs) > MAX_PER_TICK:
+        starved = jobs[MAX_PER_TICK:]
+        print(f"event tick: {len(starved)} job(s) wait for a slot: "
+              f"{[j['gauge'] for j in starved]}")
 
     results = []
     for j in jobs[:MAX_PER_TICK]:
         try:
-            m = run_one(j["gauge"], trigger=j["trigger"],
-                        episode_id=j["episode"])
+            m = run_one(j["gauge"], t0=j.get("t0"), trigger=j["trigger"],
+                        episode_id=j["episode"],
+                        force_cpu=bool(j.get("force_cpu")))
             results.append({"event_id": m.get("event_id"),
                             "published": m.get("published")})
         except Exception as e:

@@ -37,13 +37,52 @@ truststore.inject_into_ssl()
 
 from forcing_update_common import HF_REPO, hf_token                             # noqa: E402
 from update_mrms import MRMS_GRID                                               # noqa: E402
-from hf_data.forcing import _write_pqf                                          # noqa: E402
+from hf_data.forcing import _read_pqf, _write_pqf                               # noqa: E402
 
 PRODUCT = "MultiSensor_QPE_01H_Pass1"
 NCEP_URL = ("https://mrms.ncep.noaa.gov/2D/{prod}/"
             "MRMS_{prod}_00.00_{t:%Y%m%d}-{t:%H}0000.grib2.gz")
 PREFIX = "mrms_recent/"
 MEMBER_FMT = "mrms1h_pass1_%Y%m%d%H.pqf"
+
+# -- browser-ready radar frames (Nowcast-mode rain overlay) -------------------
+# Each stored Pass1 hour also gets a colormapped transparent PNG at 1/4 the
+# grid (block-MAX pooled, so 1-km storm cores stay visible at ~4 km display
+# resolution; ~1750 px across CONUS is at/above screen width at national
+# zoom). ~160 KB per wet frame; a rolling week is ~30 MB — the frontend
+# animates these straight off the HF CDN. Retention is 7 days BY DESIGN
+# (user-set), shorter than the PQFs' 21: frames are display sugar, the PQFs
+# are forcing.
+FRAME_PREFIX = "mrms_frames/"
+FRAME_FMT = "mrms1h_%Y%m%d%H.png"
+FRAME_KEEP_DAYS = 7
+FRAME_DS = 4
+# rain-rate colormap (mm/h -> RGB); below RAIN_MIN renders fully transparent
+RAIN_MIN = 0.1
+RAIN_X = (0.1, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0)
+RAIN_R = (150, 60, 255, 255, 230, 180, 120)
+RAIN_G = (210, 170, 220, 150, 40, 20, 0)
+RAIN_B = (150, 60, 0, 0, 30, 140, 120)
+
+
+def render_frame(a: np.ndarray, nodata: float) -> bytes:
+    """Colormapped RGBA PNG bytes for one Pass1 grid (dry = transparent)."""
+    import io
+
+    from PIL import Image
+    a = np.where((a == nodata) | ~np.isfinite(a) | (a < 0), 0.0, a).astype("float32")
+    nr, nc = a.shape
+    a = a[: nr - nr % FRAME_DS, : nc - nc % FRAME_DS]
+    a = a.reshape(a.shape[0] // FRAME_DS, FRAME_DS,
+                  a.shape[1] // FRAME_DS, FRAME_DS).max(axis=(1, 3))
+    r = np.interp(a, RAIN_X, RAIN_R).astype(np.uint8)
+    g = np.interp(a, RAIN_X, RAIN_G).astype(np.uint8)
+    b = np.interp(a, RAIN_X, RAIN_B).astype(np.uint8)
+    frac = np.sqrt(np.clip(a / RAIN_X[-1], 0.0, 1.0))
+    alpha = np.where(a >= RAIN_MIN, 140 + 80 * frac, 0.0).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(np.dstack([r, g, b, alpha])).save(buf, "PNG", optimize=True)
+    return buf.getvalue()
 
 
 def _utc_hour_floor() -> datetime:
@@ -107,10 +146,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
+    from huggingface_hub import (HfApi, CommitOperationAdd, CommitOperationDelete,
+                                 hf_hub_download)
     api = HfApi(token=hf_token())
-    stored = [f for f in api.list_repo_files(HF_REPO, repo_type="dataset")
-              if f.startswith(PREFIX)]
+    all_files = api.list_repo_files(HF_REPO, repo_type="dataset")
+    stored = [f for f in all_files if f.startswith(PREFIX)]
     have = {h for f in stored if (h := _parse_hour(f)) is not None}
 
     now = _utc_hour_floor()
@@ -122,6 +162,7 @@ def main() -> int:
             if (t := now - timedelta(hours=i)) not in have]
 
     ops, added, misses = [], [], 0
+    pqf_bytes: dict[datetime, bytes] = {}         # fresh hours, for frame render
     for t in want:
         data = fetch_hour(t)
         if data is None:
@@ -129,20 +170,51 @@ def main() -> int:
             continue
         ops.append(CommitOperationAdd(PREFIX + t.strftime(MEMBER_FMT), data))
         added.append(t)
+        pqf_bytes[t] = data
 
     cutoff = now - timedelta(days=args.keep_days)
     stale = [f for f in stored if ((h := _parse_hour(f)) is None or h < cutoff)]
     ops += [CommitOperationDelete(f) for f in stale]
 
+    # -- radar frames: render any 7-day hour that has a PQF but no PNG --------
+    frame_stored = [f for f in all_files if f.startswith(FRAME_PREFIX)]
+    frame_have = {h for f in frame_stored if (h := _parse_hour(f)) is not None}
+    fcut = now - timedelta(days=FRAME_KEEP_DAYS)
+    want_frames = sorted(((have | set(added)) - frame_have), reverse=True)
+    want_frames = [t for t in want_frames if t >= fcut]
+    n_frames, frame_errs = 0, 0
+    for t in want_frames:
+        try:
+            data = pqf_bytes.get(t)
+            if data is None:                      # backfill from the store
+                p = hf_hub_download(HF_REPO, PREFIX + t.strftime(MEMBER_FMT),
+                                    repo_type="dataset", token=hf_token())
+                with open(p, "rb") as fh:
+                    data = fh.read()
+            a, _, _, _, nod = _read_pqf(data)
+            ops.append(CommitOperationAdd(FRAME_PREFIX + t.strftime(FRAME_FMT),
+                                          render_frame(a, nod)))
+            n_frames += 1
+        except Exception as e:                    # one bad hour must not kill the run
+            frame_errs += 1
+            print(f"mrms_frames: {t:%Y%m%d%H} render failed: {e}")
+    frame_stale = [f for f in frame_stored
+                   if ((h := _parse_hour(f)) is None or h < fcut)]
+    ops += [CommitOperationDelete(f) for f in frame_stale]
+
     newest = max(have | set(added), default=None)
     if args.dry_run:
         print(f"mrms_recent: would add {len(added)}, prune {len(stale)} "
-              f"({misses} not on NCEP)")
+              f"({misses} not on NCEP); frames: +{n_frames}, -{len(frame_stale)}")
         return 0
     if ops:
         api.create_commit(repo_id=HF_REPO, repo_type="dataset", operations=ops,
                           commit_message=f"mrms_recent: +{len(added)} Pass1 hour(s)"
-                                         f", -{len(stale)} pruned")
+                                         f", -{len(stale)} pruned; frames "
+                                         f"+{n_frames}/-{len(frame_stale)}")
+    if n_frames or frame_stale or frame_errs:
+        print(f"mrms_frames: +{n_frames} PNG frame(s), {len(frame_stale)} pruned"
+              f"{f', {frame_errs} render failure(s)' if frame_errs else ''}")
     lag_h = (datetime.now(timezone.utc).replace(tzinfo=None) - newest
              ).total_seconds() / 3600 if newest else float("nan")
     print(f"mrms_recent: +{len(added)} Pass1 hour(s), {len(stale)} pruned, "

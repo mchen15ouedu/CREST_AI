@@ -660,6 +660,14 @@ def api_ungauged_now(w: float, s: float, e: float, n: float, limit: int = 200,
             else ungaugednow_store.for_bbox(w, s, e, n, limit))
 
 
+@app.get("/api/mrms_frames")
+def api_mrms_frames():
+    """Nowcast-mode rain-radar animation: which MRMS Pass1 PNG frames exist
+    (rolling 7 days, rendered hourly by the updater) + the CDN base URL."""
+    from hf_data import mrmsframes
+    return mrmsframes.frames()
+
+
 @app.get("/api/nowcast_hotspots")
 def api_nowcast_hotspots():
     """Ranked spatial clusters of flagged flood-risk gauges — the chat agent's
@@ -668,22 +676,74 @@ def api_nowcast_hotspots():
     return nowcaststore.hotspots()
 
 
+# V30 runner/dashboard split: when EVENT_RUNNER_URL points at the runner
+# Space, THIS Space is the pure-reader dashboard — event triggers proxy
+# there and the runner's live status is merged into /api/events. UI deploys
+# then never kill an in-flight solve or reset the tick clock.
+EVENT_RUNNER_URL = os.environ.get("EVENT_RUNNER_URL", "").rstrip("/")
+_runner_cache: dict = {"t": 0.0, "status": None}
+
+
+def _remote_runner_status():
+    import time as _time
+    if not EVENT_RUNNER_URL:
+        return None
+    if _time.time() - _runner_cache["t"] < 20:
+        return _runner_cache["status"]
+    try:
+        import requests
+        r = requests.get(f"{EVENT_RUNNER_URL}/api/events?full=0",
+                         timeout=15).json()
+        _runner_cache.update(t=_time.time(), status=r.get("runner"))
+    except Exception:
+        _runner_cache.update(t=_time.time(), status=None)
+    return _runner_cache["status"]
+
+
 @app.get("/api/events")
 def api_events(full: int = 0):
     """V25: published 2-D inundation events (CREST-iMAP v2) + runner state.
     Frame/manifest files resolve at {base}/<event_id>/<file>."""
-    from hf_data import eventsim, eventstore
-    return {"events": eventstore.load_index(), "runner": eventsim.status(bool(full)),
+    from hf_data import eventqueue, eventsim, eventstore
+    try:
+        q = eventqueue.queue_status()
+    except Exception:
+        q = []
+    runner = _remote_runner_status() or eventsim.status(bool(full))
+    return {"events": eventstore.load_index(), "queue": q,
+            "runner": runner,
             "base": (f"https://huggingface.co/datasets/{eventstore.REPO}/"
                      f"resolve/main/{eventstore.PREFIX}")}
+
+
+@app.get("/api/health")
+def api_health():
+    """V30 pipeline self-monitoring: nowcast/radar freshness, event-tick
+    liveness, queue depth + oldest unclaimed age, worker heartbeats, event
+    throughput — each with an ok flag. The daily review routine leads its
+    digest with this."""
+    from hf_data import health
+    return health.snapshot()
 
 
 @app.post("/api/event_tick")
 def api_event_tick():
     """Hourly auto-trigger (pinged by the updater after each data refresh):
     re-simulates every ACTIVE inundation episode at the fresh t0 and starts
-    newly flagged ones. An episode ends when the gauge's flow recedes to
-    normal (risk tier < EVENT_CONT_TIER), NOT when precipitation stops."""
+    newly flagged ones. An episode ends when observed flow recedes to
+    normal, NOT when precipitation stops. On the split dashboard
+    (EVENT_TICK=off) this forwards to the runner Space."""
+    if os.environ.get("EVENT_TICK", "1") != "1":
+        if EVENT_RUNNER_URL:
+            try:
+                import requests
+                return requests.post(f"{EVENT_RUNNER_URL}/api/event_tick",
+                                     timeout=30).json()
+            except Exception as e:
+                return JSONResponse({"ok": False, "reason":
+                                     f"runner unreachable: {type(e).__name__}"},
+                                    status_code=502)
+        return {"ok": False, "reason": "event tick disabled on this Space"}
     try:
         import crestimap  # noqa: F401
     except ImportError:
@@ -692,18 +752,38 @@ def api_event_tick():
                             status_code=501)
     from hf_data import eventsim
     if eventsim.status()["running"]:
-        return {"ok": False, "reason": "runner busy"}
+        # stamp liveness even here: the ping IS arriving, we are just busy.
+        # Without this a wedged runner looked identical to a dead tick loop.
+        eventsim.note_tick_attempt()
+        return {"ok": False, "reason": "runner busy",
+                "running": eventsim.status()["running"],
+                "busy_h": eventsim._busy_h()}
     import threading
     threading.Thread(target=eventsim.hourly_tick, daemon=True).start()
     return {"ok": True, "started": "tick"}
 
 
 @app.post("/api/event_run")
-def api_event_run(gid: str = ""):
+def api_event_run(gid: str = "", t0: str = "", defer: int = 0):
     """V25 manual/agent trigger: 2-D inundation event for `gid`, or
     auto-detect from the nowcast flood tier when gid is empty. The run takes
     minutes (EF5 + hydrodynamic solver) and executes in a worker thread;
-    poll /api/events for progress."""
+    poll /api/events for progress.
+    t0: backdate the event window ("YYYY-MM-DDTHH:MM" UTC) — refill a flood
+    the trigger pipeline missed; the window is [t0-backset, t0+horizon].
+    defer=1: enqueue for the GPU worker only (no CPU fallback) — the runner
+    stays free and the result publishes whenever the worker gets to it."""
+    if os.environ.get("EVENT_TICK", "1") != "1" and EVENT_RUNNER_URL:
+        try:                       # split dashboard: forward to the runner
+            import requests
+            return requests.post(
+                f"{EVENT_RUNNER_URL}/api/event_run",
+                params={"gid": gid, "t0": t0, "defer": defer},
+                timeout=30).json()
+        except Exception as e:
+            return JSONResponse({"ok": False, "reason":
+                                 f"runner unreachable: {type(e).__name__}"},
+                                status_code=502)
     try:
         import crestimap  # noqa: F401  (installed from the CREST-iMAP fork, v2)
     except ImportError:
@@ -715,13 +795,23 @@ def api_event_run(gid: str = ""):
     if st["running"]:
         return {"ok": False, "reason": "an event simulation is already running",
                 **st}
+    t0_dt = None
+    if t0:
+        import datetime as _dt
+        try:
+            t0_dt = _dt.datetime.strptime(t0, "%Y-%m-%dT%H:%M")
+        except ValueError:
+            return JSONResponse({"ok": False,
+                                 "reason": "t0 must be YYYY-MM-DDTHH:MM (UTC)"},
+                                status_code=422)
     import threading
     if gid:
-        threading.Thread(target=eventsim.run_one, args=(gid,),
-                         daemon=True).start()
+        threading.Thread(target=eventsim.run_one, args=(gid, t0_dt),
+                         kwargs={"defer": bool(defer)}, daemon=True).start()
     else:
         threading.Thread(target=eventsim.run_detected, daemon=True).start()
-    return {"ok": True, "started": gid or "auto-detect"}
+    return {"ok": True, "started": gid or "auto-detect", "t0": t0 or "now",
+            "defer": bool(defer)}
 
 
 @app.get("/api/upstream")
