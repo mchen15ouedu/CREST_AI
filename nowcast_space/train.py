@@ -123,8 +123,14 @@ def _obs_process(q: np.ndarray, rng, augment: bool):
 
 def build_dataset_v2(gauges: list[dict], months: list[str], val_months: list[str],
                      horizon: int = H, obs_dropout: float = 0.15, seed: int = 42,
-                     log=print):
+                     statics: dict[str, np.ndarray] | None = None,
+                     bake_statics: bool = True, log=print):
     """feat_version-2 dataset with per-window gauge indices.
+
+    bake_statics=False (feat_version 3 only) keeps the window tensors at the
+    5-channel v2 layout and returns the z-scored per-gauge static vectors as
+    a separate "statics_z" array [n_gauge, N_STATIC] instead — the trainer
+    concatenates them per batch, which cuts window memory ~4x at full scale.
 
     Training windows get (a) the outage-augmented obs stream from
     _obs_process and (b) window-level obs-channel dropout: a fraction
@@ -137,19 +143,39 @@ def build_dataset_v2(gauges: list[dict], months: list[str], val_months: list[str
 
     Returns dict(Xtr, Ytr, Gtr, Xva, Yva, Gva, stats, gauge_ids) or None.
     """
-    from data import load_series
+    from data import load_series_bulk
     la = [np.log10(max(g["area_km2"], 1.0)) for g in gauges]
     stats = {"la_mean": float(np.mean(la)), "la_std": float(np.std(la) or 1.0)}
     rng = np.random.default_rng(seed)
 
-    def one(g, mlist, stride, augment):
-        df = load_series(g["id"], mlist)
+    fv, zs = 2, {}
+    if statics is not None:
+        # z-score the raw static vectors over THIS gauge set; NaNs -> column
+        # median. Everything stored in stats so serving can reproduce it.
+        fv = 3
+        raw = np.stack([np.asarray(statics[g["id"]], "float64") for g in gauges])
+        med = np.nanmedian(raw, axis=0)
+        raw = np.where(np.isfinite(raw), raw, med[None, :])
+        mu, sd = raw.mean(0), np.maximum(raw.std(0), 1e-6)
+        stats.update(static_mean=mu.tolist(), static_std=sd.tolist(),
+                     static_median=med.tolist())
+        zs = {g["id"]: ((raw[i] - mu) / sd).astype("float32")
+              for i, g in enumerate(gauges)}
+    fv_bake = fv if bake_statics else min(fv, 2)     # channel layout of windows
+
+    gids = [g["id"] for g in gauges]
+    tr_frames = load_series_bulk(gids, months, log=log)
+    va_frames = load_series_bulk(gids, val_months, log=log)
+
+    def one(g, df, stride, augment):
         if df.empty or df["q"].notna().sum() < 500:
             return None
         q = df["q"].to_numpy()
         p = np.nan_to_num(df["p"].to_numpy(), nan=0.0)
         obs_ff, age = _obs_process(q, rng, augment)
-        feat = build_features(p, obs_ff, age, g["area_km2"], stats, feat_version=2)
+        feat = build_features(p, obs_ff, age, g["area_km2"], stats,
+                              feat_version=fv_bake,
+                              statics=zs.get(g["id"]) if fv_bake >= 3 else None)
         X, Y, _ = make_windows(feat, q, stride=stride, horizon=horizon)
         if augment and len(X) and obs_dropout > 0:
             k = rng.random(len(X)) < obs_dropout
@@ -160,8 +186,8 @@ def build_dataset_v2(gauges: list[dict], months: list[str], val_months: list[str
     Xtr, Ytr, Gtr, Xva, Yva, Gva = [], [], [], [], [], []
     gauge_ids = [g["id"] for g in gauges]
     for gi, g in enumerate(gauges):
-        tr = one(g, months, stride=3, augment=True)
-        va = one(g, val_months, stride=6, augment=False)
+        tr = one(g, tr_frames[g["id"]], stride=3, augment=True)
+        va = one(g, va_frames[g["id"]], stride=6, augment=False)
         if tr is not None and len(tr[0]):
             Xtr.append(tr[0]); Ytr.append(tr[1])
             Gtr.append(np.full(len(tr[0]), gi, "int32"))
@@ -172,15 +198,18 @@ def build_dataset_v2(gauges: list[dict], months: list[str], val_months: list[str
             f"val {0 if va is None else len(va[0])} windows")
     if not Xtr:
         return None
-    nf = n_feat_for(2)
-    return {"Xtr": np.concatenate(Xtr), "Ytr": np.concatenate(Ytr),
-            "Gtr": np.concatenate(Gtr),
-            "Xva": (np.concatenate(Xva) if Xva
-                    else np.zeros((0, L, nf), "float32")),
-            "Yva": (np.concatenate(Yva) if Yva
-                    else np.zeros((0, horizon), "float32")),
-            "Gva": np.concatenate(Gva) if Gva else np.zeros(0, "int32"),
-            "stats": stats, "gauge_ids": gauge_ids}
+    nf = n_feat_for(fv_bake)
+    out = {"Xtr": np.concatenate(Xtr), "Ytr": np.concatenate(Ytr),
+           "Gtr": np.concatenate(Gtr),
+           "Xva": (np.concatenate(Xva) if Xva
+                   else np.zeros((0, L, nf), "float32")),
+           "Yva": (np.concatenate(Yva) if Yva
+                   else np.zeros((0, horizon), "float32")),
+           "Gva": np.concatenate(Gva) if Gva else np.zeros(0, "int32"),
+           "stats": stats, "gauge_ids": gauge_ids}
+    if fv >= 3 and not bake_statics:
+        out["statics_z"] = np.stack([zs[g["id"]] for g in gauges])
+    return out
 
 
 def train_burst(dataset, ck: dict | None, seconds: float = 200.0,

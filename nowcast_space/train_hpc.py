@@ -99,17 +99,27 @@ def cpu_ckpt(model, opt, epoch, stats, val_nse_v, n_train,
             "when": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}
 
 
-def per_gauge_table(model, Xva, Yva, Gva, gauge_ids, dev, batch=4096):
+def per_gauge_table(model, Xva, Yva, Gva, gauge_ids, dev, batch=4096,
+                    statics_z=None):
     """Per-gauge val NSE, obs-fresh AND no-obs, plus a hallucination score:
     the 95th-percentile ratio of predicted to observed window-max flow under
-    no-obs (large = the model invents floods when the gauge goes dark)."""
+    no-obs (large = the model invents floods when the gauge goes dark).
+    statics_z [n_gauge, N_STATIC]: unbaked feat_version-3 static channels,
+    appended per batch (windows stay in the 5-channel layout)."""
+    S = (torch.from_numpy(statics_z).to(dev)
+         if statics_z is not None else None)
+
     def infer(X):
         outs = []
         model.eval()
         with torch.no_grad():
             for i in range(0, len(X), batch):
-                outs.append(model(torch.from_numpy(X[i:i + batch]).to(dev))
-                            .cpu().numpy())
+                xb = torch.from_numpy(X[i:i + batch]).to(dev)
+                if S is not None:
+                    g = torch.from_numpy(Gva[i:i + batch]).long().to(dev)
+                    xb = torch.cat(
+                        [xb, S[g][:, None, :].expand(-1, xb.shape[1], -1)], 2)
+                outs.append(model(xb).cpu().numpy())
         return itq(np.concatenate(outs))                      # real space [N, hor]
     y = itq(Yva)
     p_obs = infer(Xva)
@@ -156,7 +166,11 @@ def main():
                          "overrides --gauges. See select_gauges.py")
     ap.add_argument("--months", default=DEFAULT_MONTHS)
     ap.add_argument("--horizon", type=int, default=6, choices=(6, 12))
-    ap.add_argument("--feat-version", type=int, default=2, choices=(1, 2))
+    ap.add_argument("--feat-version", type=int, default=2, choices=(1, 2, 3))
+    ap.add_argument("--loss", default="mse", choices=("mse", "nse"),
+                    help="nse = per-gauge variance-normalized squared error "
+                         "(Kratzert et al. 2019), weights 1/(std_g+0.1)^2; "
+                         "needs feat_version >= 2 (per-window gauge indices)")
     ap.add_argument("--obs-dropout", type=float, default=0.15,
                     help="fraction of training windows rewritten to the "
                          "dead-gauge obs state (feat_version 2)")
@@ -166,7 +180,13 @@ def main():
                          "v1: dilstm.pt / dilstm_h12.pt")
     ap.add_argument("--max-epochs", type=int, default=5000)
     ap.add_argument("--patience", type=int, default=300,
-                    help="stop after this many epochs without val-NSE improvement")
+                    help="stop after this many evaluations without val-NSE "
+                         "improvement (evaluations happen once per epoch, plus "
+                         "every --val-every batches if set)")
+    ap.add_argument("--val-every", type=int, default=0,
+                    help="also evaluate every N training batches (0 = only at "
+                         "epoch end). At full scale an epoch is ~60k steps, so "
+                         "per-epoch evaluation misses the true val-NSE peak")
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=42)
@@ -187,7 +207,8 @@ def main():
     fv, hor = args.feat_version, args.horizon
     ckpt_name = args.ckpt_name or {
         (1, 6): "dilstm.pt", (1, 12): "dilstm_h12.pt",
-        (2, 6): "dilstm_v2.pt", (2, 12): "dilstm_h12_v2.pt"}[(fv, hor)]
+        (2, 6): "dilstm_v2.pt", (2, 12): "dilstm_h12_v2.pt",
+        (3, 6): "dilstm_v3.pt", (3, 12): "dilstm_h12_v3.pt"}[(fv, hor)]
     skill_name = f"skill_{os.path.splitext(ckpt_name)[0]}.parquet"
 
     gauge_spec = args.gauges
@@ -202,19 +223,41 @@ def main():
           f"{len(gauges)} gauges  months {months[0]}..{months[-1]}"
           f"  val {VAL_MONTHS[0]}..{VAL_MONTHS[-1]}")
 
+    if args.loss == "nse" and fv < 2:
+        sys.exit("--loss nse needs feat_version >= 2 (per-window gauge indices)")
+
+    statics = None
+    if fv >= 3:
+        import pandas as pd
+        sp = "gauge_statics.parquet"
+        if not os.path.exists(sp):
+            from huggingface_hub import hf_hub_download
+            sp = hf_hub_download("vincewin/CREST_nowcast_data",
+                                 "gauges/gauge_statics.parquet",
+                                 repo_type="dataset",
+                                 token=os.environ.get("HF_TOKEN"))
+        sdf = pd.read_parquet(sp).set_index("STAID")
+        scols = [c for c in sdf.columns if c != "hybas_id"]
+        statics = {gid: sdf.loc[gid, scols].to_numpy("float64")
+                   for gid in sdf.index}
+        print(f"statics: {len(scols)} attributes for {len(statics)} gauges")
+
     if fv >= 2:
         ds = T.build_dataset_v2(gauges, months, VAL_MONTHS, horizon=hor,
-                                obs_dropout=args.obs_dropout, seed=args.seed)
+                                obs_dropout=args.obs_dropout, seed=args.seed,
+                                statics=statics, bake_statics=False)
         if ds is None:
             sys.exit("no training data — run prep_hpc.py for these gauges/months first")
         Xtr, Ytr, Xva, Yva = ds["Xtr"], ds["Ytr"], ds["Xva"], ds["Yva"]
-        Gva, gauge_ids, stats = ds["Gva"], ds["gauge_ids"], ds["stats"]
+        Gtr, Gva, gauge_ids, stats = ds["Gtr"], ds["Gva"], ds["gauge_ids"], ds["stats"]
+        statics_z = ds.get("statics_z")          # fv3: unbaked static channels
     else:
         legacy = T.build_dataset(gauges, months, VAL_MONTHS)
         if legacy is None:
             sys.exit("no training data — run prep_hpc.py for these gauges/months first")
         Xtr, Ytr, Xva, Yva, stats = legacy
         Gva, gauge_ids = np.zeros(len(Xva), "int32"), [g["id"] for g in gauges]
+        statics_z = None
     if not len(Xva):
         sys.exit("no validation windows — early stopping needs the 2025 val months prepped")
     print(f"train {len(Xtr)} / val {len(Xva)} windows")
@@ -247,6 +290,38 @@ def main():
     Xv = torch.from_numpy(Xva).to(dev)
     yva_real = itq(Yva).ravel()
 
+    # unbaked feat_version-3 statics: windows carry 5 channels; the 16 static
+    # channels (constant per gauge) are appended per batch on the device
+    Gt = torch.from_numpy(Gtr.astype("int64")) if statics_z is not None else None
+    Gvt = (torch.from_numpy(Gva.astype("int64")).to(dev)
+           if statics_z is not None else None)
+    S = torch.from_numpy(statics_z).to(dev) if statics_z is not None else None
+
+    def with_statics(xb, g):
+        if S is None:
+            return xb
+        return torch.cat([xb, S[g][:, None, :].expand(-1, xb.shape[1], -1)], 2)
+
+    # per-gauge variance-normalized loss weights (Kratzert et al. 2019, HESS):
+    # w_g = 1/(std_g + 0.1)^2 with std_g over the gauge's tq targets, so
+    # high-variance gauges cannot dominate the gradient (the failure mode of
+    # plain MSE seen in the v1 full-gauge runs)
+    w_t = None
+    if args.loss == "nse":
+        stds = np.ones(len(gauge_ids), "float32")
+        for gi in range(len(gauge_ids)):
+            m = Gtr == gi
+            if m.any():
+                stds[gi] = max(float(Ytr[m].std()), 1e-3)
+        w = (1.0 / (stds + 0.1) ** 2).astype("float32")
+        # near-flat gauges (arid/regulated, std ~ 0) would get ~100x weight and
+        # destabilize full-scale training — cap at 25 (equivalent to std 0.1)
+        n_cap = int((w > 25.0).sum())
+        w = np.minimum(w, 25.0)
+        w_t = torch.from_numpy(w[Gtr])           # per-window, CPU; gathered per batch
+        print(f"NSE loss: gauge tq-std in [{stds.min():.3f}, {stds.max():.3f}], "
+              f"weight in [{w.min():.2f}, {w.max():.2f}] ({n_cap} gauges capped)")
+
     # persistence baseline: hold the last-known obs flat over the horizon —
     # the number the DI-LSTM has to beat for the skill to be real
     pers = np.repeat(itq(Xva[:, -1, 1])[:, None], hor, axis=1).ravel()
@@ -257,7 +332,9 @@ def main():
         outs = []
         with torch.no_grad():
             for i in range(0, len(Xv), 4096):
-                outs.append(model(Xv[i:i + 4096]).cpu().numpy())
+                xb = with_statics(Xv[i:i + 4096],
+                                  Gvt[i:i + 4096] if Gvt is not None else None)
+                outs.append(model(xb).cpu().numpy())
         model.train()
         return nse(itq(np.concatenate(outs)).ravel(), yva_real)
 
@@ -273,37 +350,66 @@ def main():
     best, best_ck, since_best = -np.inf, None, 0
     last_push, pushed_best = time.time(), -np.inf
     t0 = time.time()
-    model.train()
-    for _ in range(args.max_epochs):
-        perm = torch.randperm(n)
-        tot = 0.0
-        for i in range(0, n, bs):
-            idx = perm[i:i + bs]
-            xb, yb = Xt[idx].to(dev, non_blocking=True), Yt[idx].to(dev, non_blocking=True)
-            opt.zero_grad()
-            loss = torch.nn.functional.mse_loss(model(xb), yb)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            tot += float(loss.detach()) * len(idx)
-        epoch += 1
+    # val-NSE plateau -> halve LR; the v1 full-scale runs showed a flat 1e-3
+    # walks off the early optimum at ~60k steps/epoch and never recovers
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="max", factor=0.5, patience=12, min_lr=2e-5)
+    n_eval, stop = 0, False
+
+    def evaluate(seen, loss_avg):
+        nonlocal best, best_ck, since_best, last_push, pushed_best, n_eval, stop
         v = val_nse()
+        n_eval += 1
+        sched.step(v)
+        lr_now = opt.param_groups[0]["lr"]
+        tag = (f"eval {n_eval} (ep {epoch}+{seen / n:.2f}): train loss "
+               f"{loss_avg:.5f}, val NSE {v:.4f}, lr {lr_now:.1e}")
         if v > best + 1e-4:
             best, since_best = v, 0
             best_ck = cpu_ckpt(model, opt, epoch, stats, v, n, fv, hor)
-            print(f"epoch {epoch}: train MSE {tot / n:.5f}, val NSE {v:.4f}  * new best")
+            print(f"{tag}  * new best")
         else:
             since_best += 1
-            if epoch % 25 == 0:
-                print(f"epoch {epoch}: train MSE {tot / n:.5f}, val NSE {v:.4f} "
-                      f"(best {best:.4f}, {since_best} since)")
+            if n_eval % 25 == 0:
+                print(f"{tag} (best {best:.4f}, {since_best} since)")
         if (best_ck is not None and best > pushed_best
                 and time.time() - last_push > args.upload_every_min * 60):
             push(best_ck, f"periodic, epoch {best_ck['epoch']}")
             last_push, pushed_best = time.time(), best
         if since_best >= args.patience:
-            print(f"early stop: no improvement in {args.patience} epochs")
+            print(f"early stop: no improvement in {args.patience} evals")
+            stop = True
+
+    model.train()
+    for _ in range(args.max_epochs):
+        perm = torch.randperm(n)
+        tot, seen, since_eval = 0.0, 0, 0
+        for i in range(0, n, bs):
+            idx = perm[i:i + bs]
+            xb, yb = Xt[idx].to(dev, non_blocking=True), Yt[idx].to(dev, non_blocking=True)
+            if S is not None:
+                xb = with_statics(xb, Gt[idx].to(dev, non_blocking=True))
+            opt.zero_grad()
+            if w_t is None:
+                loss = torch.nn.functional.mse_loss(model(xb), yb)
+            else:
+                wb = w_t[idx].to(dev, non_blocking=True)
+                loss = (wb[:, None] * (model(xb) - yb) ** 2).mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tot += float(loss.detach()) * len(idx)
+            seen += len(idx)
+            since_eval += 1
+            if args.val_every and since_eval >= args.val_every:
+                since_eval = 0
+                evaluate(seen, tot / seen)
+                if stop:
+                    break
+        if stop:
             break
+        epoch += 1
+        evaluate(0, tot / max(seen, 1))
 
     if best_ck is not None and best > pushed_best:
         push(best_ck, f"final best, epoch {best_ck['epoch']}, val NSE {best:.4f}")
@@ -314,7 +420,8 @@ def main():
     if best_ck is not None:
         model.load_state_dict({k: v.to(dev) for k, v in best_ck["state_dict"].items()})
     model.eval()
-    rows, diag = per_gauge_table(model, Xva, Yva, Gva, gauge_ids, dev)
+    rows, diag = per_gauge_table(model, Xva, Yva, Gva, gauge_ids, dev,
+                                 statics_z=statics_z)
     print(f"\nval pooled NSE: obs-fresh {diag['pooled_nse']:.4f} | "
           f"no-obs {diag['pooled_nse_noobs']:.4f}")
     print(f"no-obs peak ratio (pred/true window max): "
@@ -327,7 +434,8 @@ def main():
         print(f"  low-skill gauge {r['gid']}: NSE {r['val_nse']:.3f} "
               f"(no-obs {r['val_nse_noobs']:.3f}, {r['n_windows']} windows)")
     if args.mc_eval > 0:
-        mu, sd = mc_predict(model, Xv[:4096], n=args.mc_eval)
+        mc_in = with_statics(Xv[:4096], Gvt[:4096] if Gvt is not None else None)
+        mu, sd = mc_predict(model, mc_in, n=args.mc_eval)
         cv = np.expm1(sd).mean() / max(np.expm1(mu).mean(), 1e-6)
         print(f"MC-dropout ({args.mc_eval} passes, first 4096 windows): "
               f"mean log-space std {sd.mean():.4f} (rough CV ~{cv:.3f})")

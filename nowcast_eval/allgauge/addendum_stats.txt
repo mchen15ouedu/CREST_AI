@@ -1,0 +1,7 @@
+training-set split: 6036 served gauges in the 6,036 training set, 3031 not (never seen by either model)
+ 6h in training set  n= 5561: median v1 0.464 v3f 0.312 age-rule 0.291 winner 0.588; v3f wins 2842/5561; frac>0 v1 0.68 v3f 0.61; frac>0.5 v1 0.48 v3f 0.42
+ 6h NOT in training n=  102: median v1 0.399 v3f 0.110 age-rule 0.100 winner 0.558; v3f wins 44/102; frac>0 v1 0.64 v3f 0.56; frac>0.5 v1 0.47 v3f 0.41
+12h in training set  n= 5564: median v1 0.230 v3f 0.143 age-rule 0.093 winner 0.375; v3f wins 2941/5564; frac>0 v1 0.61 v3f 0.57; frac>0.5 v1 0.35 v3f 0.33
+12h NOT in training n=  102: median v1 0.135 v3f -0.032 age-rule -0.143 winner 0.357; v3f wins 51/102; frac>0 v1 0.56 v3f 0.48; frac>0.5 v1 0.36 v3f 0.26
+fidelity v1_6: replayed vs archived operational, log space: r=0.9981 NSE=0.9962 n=26493774 (issues <= 2026-08-11 00Z: 487)
+fidelity v1_12: replayed vs archived operational, log space: r=0.9980 NSE=0.9961 n=52987548 (issues <= 2026-08-11 00Z: 487)

@@ -9,3 +9,7 @@ scripts/_narr_cache/
 ._cp/
 ._clip_test/
 .env
+
+# training / chain logs (nowcast_space)
+nowcast_space/*.log
+nowcast_space/gauge_statics.csv

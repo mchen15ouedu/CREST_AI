@@ -1,0 +1,2 @@
+v1 6h replay vs archived (v1 era, log space): r=0.9974, NSE=0.9936, n=1182803
+v1 12h replay vs archived: r=0.9973, NSE=0.9928, n=2365357

@@ -39,11 +39,14 @@ L = 72          # lookback hours
 H = 6           # forecast horizon hours (default; checkpoints carry their own)
 N_FEAT = 4      # feat_version 1
 N_FEAT_V2 = 5   # feat_version 2
+N_STATIC = 16   # feat_version 3: HydroBASINS-L7 catchment attributes
+N_FEAT_V3 = N_FEAT_V2 + N_STATIC
 AGE_CAP_H = 240.0   # obs older than this counts as missing (feat_version 2)
 
 
 def n_feat_for(feat_version: int) -> int:
-    return N_FEAT_V2 if int(feat_version) >= 2 else N_FEAT
+    v = int(feat_version)
+    return N_FEAT_V3 if v >= 3 else (N_FEAT_V2 if v == 2 else N_FEAT)
 
 
 class DILSTM(nn.Module):
@@ -71,7 +74,8 @@ def itq(y):                                     # inverse transform
 
 
 def build_features(precip: np.ndarray, obs_q: np.ndarray, obs_age_h: np.ndarray,
-                   area_km2: float, stats: dict, feat_version: int = 1) -> np.ndarray:
+                   area_km2: float, stats: dict, feat_version: int = 1,
+                   statics: np.ndarray | None = None) -> np.ndarray:
     """Stack the per-step feature matrix [T, n_feat]. All inputs length T;
     obs_q is the LAST-KNOWN observation at each step (forward-filled),
     obs_age_h its age in hours (large, e.g. 999+, when there has never been
@@ -88,6 +92,10 @@ def build_features(precip: np.ndarray, obs_q: np.ndarray, obs_age_h: np.ndarray,
         f[:, 2] = np.where(missing, AGE_CAP_H,
                            np.minimum(np.nan_to_num(age, nan=AGE_CAP_H), AGE_CAP_H)) / 24.0
         f[:, 4] = missing.astype("float32")
+        if int(feat_version) >= 3:
+            if statics is None or len(statics) != N_STATIC:
+                raise ValueError(f"feat_version 3 needs a {N_STATIC}-dim statics vector")
+            f[:, N_FEAT_V2:] = np.asarray(statics, "float32")[None, :]
     else:
         f[:, 1] = tq(obs_q)
         f[:, 2] = np.nan_to_num(age, nan=999.0).astype("float32") / 24.0

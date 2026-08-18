@@ -1,0 +1,11 @@
+all-gauge route table: 9067 served gauges, 511 issues 2026072115..2026081200
+6h: decided 5663/9067 gauges -> v1 2777, v3 2886; undecided 3404 (obs-age fallback)
+     median per-gauge NSE: v1-only 0.463 | v3-only 0.309 | obs-age rule 0.290 | per-gauge winner 0.588
+     frac gauges NSE>0: v1 0.67 v3 0.61 age-rule 0.59 winner 0.74
+     frac gauges NSE>0.5: v1 0.48 v3 0.42 age-rule 0.41 winner 0.55
+     stale-prone (frac_stale>0.1) n=88: v1 wins 45; fresh-feed n=5575: v1 wins 2732
+12h: decided 5666/9067 gauges -> v1 2674, v3 2992; undecided 3401 (obs-age fallback)
+     median per-gauge NSE: v1-only 0.228 | v3-only 0.142 | obs-age rule 0.090 | per-gauge winner 0.375
+     frac gauges NSE>0: v1 0.61 v3 0.57 age-rule 0.54 winner 0.69
+     frac gauges NSE>0.5: v1 0.35 v3 0.33 age-rule 0.31 winner 0.43
+     stale-prone (frac_stale>0.1) n=91: v1 wins 38; fresh-feed n=5575: v1 wins 2636

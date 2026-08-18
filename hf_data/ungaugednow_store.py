@@ -1,8 +1,22 @@
-"""Precomputed ungauged routed nowcasts — the ungauged analog of nowcaststore.
+"""Precomputed ungauged nowcasts — the ungauged analog of nowcaststore.
 
-The keep-warm Space (ungauged_space/runner.py) advances all 2,676 ungauged
-HydroBASINS points every hour with hf_data.routednow.compute and writes the
-result set to nowcast/ungauged_latest.parquet in vincewin/CREST_data:
+READ side serves the ungauged (virtual) points from, in order of preference:
+  1. nowcast/v3_virtual_latest.parquet — DI-LSTM v3 (statics + NSE loss,
+     trained on all 6,036 gauges) run hourly for all 2,676 points by the
+     updater Space (scripts/run_nowcast_all.py::_virtual_v3): q12_1..q12_12
+     from the 12-h model become q1..q12 here; `hist` is v3's own rolling
+     7-day 1-h-lead analysis series (there are no observations at these
+     points). Deployed 2026-08-17 — every point gets a nowcast, headwaters
+     included (v3 needs no upstream gauge).
+  2. nowcast/ungauged_latest<shard>.parquet — the EF5 routed feed below,
+     used only when the v3 file is absent (e.g. v3 checkpoints deleted).
+The response's "source" field ("dilstm_v3" | "ef5_routed") tells the
+frontend which one it got.
+
+The keep-warm Space (ungauged_space/runner.py) advances the ungauged
+HydroBASINS points that have an upstream USGS gauge every hour with
+hf_data.routednow.compute and writes the result set to
+nowcast/ungauged_latest.parquet in vincewin/CREST_data:
 
   vp                str    ungauged point id ("V" + HYRIV_ID)
   lat, lon          f32
@@ -33,6 +47,7 @@ REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")
 # One writer (a shard of the keep-warm fleet) publishes ungauged_latest<tag>.parquet;
 # the reader concatenates every shard file. tag="" for a single unsharded writer.
 LATEST_PREFIX = "nowcast/ungauged_latest"
+V3_LATEST = "nowcast/v3_virtual_latest.parquet"
 TTL_S = 240
 HORIZON_H = 12
 TS_FMT = "%Y-%m-%d %H:%M"
@@ -133,7 +148,45 @@ _lock = threading.Lock()
 _cache: dict = {"at": 0.0, "meta": None, "cols": None}
 
 
+def _load_v3():
+    """DI-LSTM v3 virtual-point file -> (meta, cols) in the store's layout, or
+    None if it is not published (then the EF5 routed shards are served)."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    token = os.environ.get("HF_TOKEN")
+    try:
+        p = hf_hub_download(REPO, V3_LATEST, repo_type="dataset", token=token,
+                            force_download=True)
+    except Exception:
+        return None
+    t = pq.read_table(p)
+    names = t.schema.names
+    q12 = sorted((n for n in names if n.startswith("q12_") and n[4:].isdigit()),
+                 key=lambda n: int(n[4:]))
+    q6 = sorted((n for n in names if n[0] == "q" and n[1:].isdigit()),
+                key=lambda n: int(n[1:]))
+    src = q12 or q6                       # 12-h model preferred (12-h horizon)
+    if not src or "vp" not in names:
+        return None
+    cols = {n: t.column(n).to_numpy(zero_copy_only=False)
+            for n in ("vp", "lat", "lon", "area_km2") if n in names}
+    for k, n in enumerate(src):
+        cols[f"q{k + 1}"] = t.column(n).to_numpy(zero_copy_only=False)
+    if "hist" in names:
+        cols["hist"] = t.column("hist").to_numpy(zero_copy_only=False)
+    m = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()
+         if not k.startswith(b"ARROW")}
+    meta = {"t0": m.get("t0", ""), "generated": m.get("generated") or m.get("t0", ""),
+            "horizon": str(len(src)), "n_points": str(len(cols["vp"])),
+            "source": "dilstm_v3", "model_file": m.get("model12_file") or m.get("model_file", ""),
+            "model_epoch": m.get("model12_epoch") or m.get("model_epoch", "")}
+    return meta, cols
+
+
 def _load():
+    v3 = _load_v3()
+    if v3 is not None:
+        return v3
     import pyarrow as pa
     import pyarrow.parquet as pq
     from huggingface_hub import HfApi, hf_hub_download
@@ -160,6 +213,7 @@ def _load():
             big = pa.concat_tables(tables, promote=True)
     cols = {name: big.column(name).to_numpy(zero_copy_only=False)
             for name in big.schema.names}
+    meta["source"] = "ef5_routed"
     return meta, cols
 
 
@@ -236,6 +290,7 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 200) -> dict:
     idx = idx[np.argsort(-cols["area_km2"][idx])][:max(1, limit)]
     t0 = issue_t0()
     return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
+            "source": meta.get("source"), "model_file": meta.get("model_file"),
             "n_in_view": total, "truncated": total > len(idx),
             "points": _select(cols, idx, t0)}
 
@@ -284,10 +339,13 @@ def by_ids(ids) -> dict:
     t0 = issue_t0()
     pts = _select(cols, idx, t0)
     have = {p["id"] for p in pts}
-    nu = _no_upstream_ids()
+    # "no_upstream" is only a reason under the EF5 routed feed; v3 needs no
+    # upstream gauge, so anything absent there is simply not produced yet
+    nu = _no_upstream_ids() if meta.get("source") != "dilstm_v3" else set()
     missing = {w: ("no_upstream" if w in nu else "pending")
                for w in want if w not in have}
     return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
+            "source": meta.get("source"), "model_file": meta.get("model_file"),
             "points": pts, "missing": missing}
 
 

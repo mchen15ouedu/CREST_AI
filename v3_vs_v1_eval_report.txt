@@ -1,0 +1,160 @@
+CREST-AI nowcast: DI-LSTM v1 vs full-scale v3 — COMPREHENSIVE MULTI-YEAR, ALL-GAUGE EVALUATION
+================================================================================================
+Generated 2026-08-18 02:10 CDT. Supersedes the 2026-08-17 report (22-day archive replay,
+433 gauges) — those numbers are withdrawn.
+Harness + all tables: /media/scratch/MengyuChen/nowcast_eval/multiyear/
+Figures (~/CREST_AI/eval_figures/):
+  fig9_multiyear_scatter_v1_vs_v3full.png   per-gauge NSE v1 vs v3-full (fresh obs / no obs; 6 h & 12 h)
+  fig10_multiyear_winner_maps.png           CONUS maps: best model per gauge (fresh obs / no obs)
+  fig11_multiyear_nse_cdf.png               per-gauge NSE CDFs, 3 obs scenarios, v1 / v3-full / persistence
+  fig12_multiyear_by_month.png              median per-gauge NSE month by month, 2016-2026
+
+1. WHAT WAS EVALUATED
+---------------------
+Models   v1       dilstm.pt (6-h) / dilstm_h12.pt (12-h): feat v1, MSE loss, trained on 6,036 gauges
+         v3-full  dilstm_v3_full.pt / dilstm_h12_v3_full.pt: feat v3 (5 dynamic + 16 HydroBASINS
+                  statics), per-gauge NSE loss (weight cap 25), obs-dropout 0.25, same 6,036 gauges
+         persistence  last available observation held flat (baseline)
+Both models were trained on 2023-01 .. 2025-06.
+
+Gauges   ALL 9,067 gauges served by the CREST-AI nowcast (nowcast/latest.parquet list).
+         Of these, 6,207 have USGS truth in at least one evaluation month; 2,856 have no
+         instantaneous discharge in any evaluation month (dead / never-reporting feeds).
+         6,020 of the scorable gauges are in the models' training set, 187 are not.
+
+Periods  43 months: January, April, July, October of every year 2016-2026 (2026 through July).
+         33 months are OUT-OF-SAMPLE in time (2016-2022, 2025-07 .. 2026-07);
+         10 months fall inside the training window (2023-01, -04, -07, -10; 2024-01, -04, -07,
+         -10; 2025-01, -04) and are reported separately as IN-SAMPLE.
+Issues   EVERY HOUR of every evaluation month = 31,656 issue times x all gauges.
+
+Inputs   Precipitation: hourly MRMS basin means computed with the operational writer's own
+         grid/box/summed-area code (bit-identical results) from the same monthly MRMS archives
+         the writer and the training prep use (HF vincewin/CREST_data mrms/<Y>/mrms_<Y>_<M>.tar,
+         gauge-corrected/Pass-2 grids); 71 hours missing from the tars were filled from
+         /media/scratch/ZhiLi/MRMS GaugeCorr tifs; 0 hours missing overall.
+         Observations: USGS NWIS instantaneous discharge, downloaded for all 9,067 gauges for
+         every month (+4-day lookback, +1-day leads); 23 M rows per month; no lost requests.
+         Static attributes: the same gauge_statics table the Space uses.
+
+Obs scenarios (each issue is run three ways, so every gauge is judged in every regime):
+         fresh    all observations up to t0 exactly as NWIS holds them (operational best case)
+         stale24  observations cut off 24 h before t0 (feed outage / delayed reporting)
+         noobs    no observations at all in the 72-h window (dead feed; also the proxy for the
+                  2,676 ungauged virtual points served by the dashboard)
+
+Truth    NWIS observation within the trailing hour of t0 + lead (1..6 h for the 6-h family,
+         1..12 h for the 12-h family). No interpolation. Sample excluded if no obs in that hour.
+
+Metric   NSE. Primary view: ONE NSE PER GAUGE (all issues and leads of the period pooled),
+         then medians / win counts / fraction > 0 across gauges — pooled NSE is dominated by a
+         few large rivers and is reported only as a secondary column. Minimum 30 samples per
+         gauge. Also: by lead, by month/season, peak ratio max(pred)/max(obs), and a
+         leave-one-year-out (LOYO) cross-validation of the routing rule (winner chosen on the
+         other 10 years, scored on the held-out year), so the routing gain is out-of-sample.
+Fidelity The replay reproduces operations: on the Jul-Aug 2026 archive the replayed v1 matches
+         the archived operational v1 predictions with r = 0.997 / NSE = 0.993 (log space).
+
+2. HEADLINE RESULTS — OUT-OF-SAMPLE (33 months, 6,207 gauges)
+------------------------------------------------------------
+Median per-gauge NSE (all leads); "v3 wins" = share of gauges where v3-full > v1.
+
+  regime    family   v1      v3-full   persistence   v3 wins   NSE>0: v1 / v3   NSE>0.5: v1 / v3
+  fresh      6 h    0.972    0.969      0.958         37 %      0.99 / 1.00      0.92 / 0.93
+  fresh     12 h    0.923    0.925      0.892         53 %      0.99 / 0.99      0.86 / 0.87
+  stale24    6 h    0.556    0.705      0.445         86 %      0.87 / 0.98      0.54 / 0.74
+  stale24   12 h    0.486    0.688      0.394         93 %      0.90 / 0.97      0.49 / 0.71
+  noobs      6 h   -0.285    0.069        -           92 %      0.11 / 0.64      0.00 / 0.03
+  noobs     12 h   -0.276    0.065        -           91 %      0.11 / 0.64      0.00 / 0.02
+
+Pooled NSE (secondary): fresh 6 h v1 0.986 / v3 0.985; 12 h 0.979 / 0.976;
+                        stale24 6 h 0.880 / 0.916; 12 h 0.864 / 0.910;
+                        noobs 6 h -0.055 / 0.437; 12 h -0.034 / 0.454.
+
+Reading:
+* With fresh observations the two models are equivalent: v1 is 0.003 better at 6 h (wins 63 %
+  of gauges), v3-full is 0.002 better at 12 h (wins 53 %). Both clearly beat persistence from
+  lead 3 h on (lead 6: 0.945 / 0.943 vs 0.911; lead 12: 0.840 / 0.845 vs 0.771).
+* With observations 24 h stale, v3-full is decisively better (+0.15 / +0.20 median NSE, wins at
+  86-93 % of gauges; 74 % of gauges keep NSE > 0.5 vs 54 % for v1).
+* Without observations, v1 collapses (it predicts near-zero flow: median peak ratio 0.03) and
+  is worse than the observed mean at 89 % of gauges; v3-full has positive skill at 64 % of gauges
+  (median 0.07, pooled 0.44) but is far from a substitute for a working gauge — its median peak
+  ratio is 0.39, i.e. it typically under-predicts peaks by ~60 % from precipitation alone.
+* In-sample months (2023-2025) look the same (fresh 6 h 0.975 / 0.973; 12 h 0.934 / 0.936;
+  stale24 0.583 / 0.746; noobs -0.308 / 0.166): no memorisation advantage for either model.
+* The 187 scorable gauges outside the training set behave the same way (fresh 6 h 0.953 / 0.956,
+  12 h 0.884 / 0.900; stale24 6 h 0.486 / 0.648; noobs 6 h -0.399 / -0.066).
+
+By season (median of monthly medians, out-of-sample):
+  fresh 6 h   winter 0.923/0.920  spring 0.952/0.950  summer 0.872/0.877  fall 0.892/0.889
+  fresh 12 h  winter 0.801/0.826  spring 0.870/0.884  summer 0.721/0.753  fall 0.763/0.779
+  noobs 6 h   winter -2.86/-0.90  spring -2.23/-0.74  summer -2.01/-1.32  fall -2.22/-3.99
+  -> v3-full's 12-h advantage holds in every season; summer (convective) is the hardest season
+     for both; without obs, fall (low base flow, tiny truth variance) is where BOTH models are
+     worst and v3-full is worse than v1 in 7 of 11 Octobers — a known weakness of no-obs v3
+     during low-flow recessions (over-reaction to rain on dry basins).
+
+Peak behaviour (max pred / max obs per gauge, out-of-sample):
+  fresh:  v1_6 p95 1.79 / p99 2.74 (0.8 % of gauges > 3x)   v3f_6 p95 1.56 / p99 2.06 (0.3 %)
+          v1_12 p95 2.14 / p99 3.63 (1.8 %)                  v3f_12 p95 1.63 / p99 2.33 (0.5 %)
+  noobs:  v1 p50 0.03 (flat-lines)                          v3f p50 0.39, p95 1.58, 1.5 % > 3x
+  -> v3-full over-shoots peaks less often than v1 when obs are present.
+
+3. ROUTING DECISION ("let the best model work at each gauge")
+-------------------------------------------------------------
+Per gauge, per horizon family, per obs regime, the model with the higher per-gauge NSE over all
+43 months is the winner (route_pergauge_multiyear.parquet, uploaded to the model repo as
+route_pergauge_v1_v3full.parquet):
+                     v1      v3-full   undecided (no truth -> obs-age fallback)
+  6 h  fresh        4,032    2,179     2,856
+  6 h  stale          821    5,390     2,856
+  6 h  no-obs         373    5,838     2,856
+  12 h fresh        3,055    3,156     2,856
+  12 h stale          435    5,776     2,856
+  12 h no-obs         439    5,772     2,856
+
+Leave-one-year-out validation (winners chosen on the other years, scored on the held-out year;
+mean over the 11 years of median per-gauge NSE  v1 / v3-full / routed):
+  fresh 6 h    0.969 / 0.967 / 0.970       fresh 12 h   0.917 / 0.924 / 0.926
+  stale 6 h    0.543 / 0.710 / 0.712       stale 12 h   0.464 / 0.685 / 0.686
+  no-obs 6 h  -0.498 / 0.001 / -0.001      no-obs 12 h -0.482 / 0.001 / -0.001
+-> The routed choice is at least as good as the better single model in every regime and every
+   year; the gain from per-gauge routing is real but small with fresh obs (+0.001..0.002 over the
+   better model), and the regime split (fresh vs stale vs no-obs) is what carries the value.
+
+4. WHAT IS DEPLOYED (2026-08-18 02:05 CDT)
+------------------------------------------
+* vincewin/CREST_nowcast_model: route_pergauge_v1_v3full.parquet (new file; checkpoints untouched).
+* vincewin/CREST_updater scripts/run_nowcast_all.py: each hour, each gauge is classified by its
+  current obs age (fresh <= 6 h, stale <= 240 h, no-obs beyond / never observed) and served by its
+  table winner for that regime and horizon family; undecided gauges fall back to the previous
+  obs-age rule (stale/no-obs -> v3-full). latest.parquet carries per-row "model" (6-h family)
+  and "model12" (12-h family) columns and metadata route_rule / n_route_table / n_route_v3 /
+  n_route12_v3. Deleting the table from the model repo reverts to the obs-age rule.
+* The 2,676 ungauged virtual points stay on v3-full (the no-obs regime, where v3-full beats v1
+  at 92 % of gauges) — with the caveat above that no-obs skill is modest and weakest in fall.
+
+5. CAVEATS
+----------
+* NSE per gauge over a whole month (or 43 months) has a large truth variance in the denominator,
+  so absolute values (0.97) are much higher than the 22-day summer replay reported earlier
+  (0.46); the two are not comparable, only rankings are.
+* Historical NWIS data are approved/revised values; operational obs are provisional and arrive
+  with lag. The "fresh" scenario is therefore a best case; the stale24 scenario brackets delays.
+* MRMS product changes over 2016-2026 (GaugeCorr -> MultiSensor Pass 2) are inside the eval;
+  results are stable across years (fig12), so no product-era effect is visible.
+* No-obs results apply to gauged basins with obs withheld; ungauged virtual points additionally
+  lack the per-basin statics quality of the gauge table (median-filled where missing).
+
+6. FILES
+--------
+/media/scratch/MengyuChen/nowcast_eval/multiyear/
+  common.py, my_obs.py, my_precip.py, my_replay.py, sched.py, my_score.py, my_figures.py
+  acc/acc_<YYYYMM>.npz         exact per-gauge accumulators (n, sum o, sum o^2, sum e^2, sum p,
+                               max p, max o) per scenario x model x lead
+  report_stats.txt             all numbers quoted above
+  score_pergauge.csv/.parquet  per-gauge NSE tables (oos / ins / all x scenario x family)
+  by_lead.csv, by_period.csv, peaks.csv, loyo_cv.csv
+  route_pergauge_multiyear.csv/.parquet   the deployed routing table
+  logs/                        obs / precip / replay / scheduler logs

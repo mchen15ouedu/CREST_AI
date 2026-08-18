@@ -427,7 +427,7 @@ function toggleGauge(id) {
   selected.has(id) ? selected.delete(id) : selected.add(id);
   refreshSelection();
   if (nowcastMode) {
-    // ungauged point: serve its precomputed routed nowcast from the store;
+    // ungauged point: serve its precomputed nowcast (DI-LSTM v3) from the store;
     // gauged points serve their instant precomputed DI-LSTM nowcast
     if (gaugeData[id] && gaugeData[id].virtual) {
       if (selected.has(id)) runRoutedNowcast(id);
@@ -1228,14 +1228,16 @@ function _hydroFig(rows, big, nc, splitT0, splitKind) {
     // that share the t0 point so they join seamlessly. Labels follow what
     // the line actually is: an event trigger gauge shows EF5's simulation
     // ("Sim Q"); an ungauged point shows its routed nowcast ("Routed").
-    const evt = splitKind === "event";
+    const evt = splitKind === "event", v3 = splitKind === "v3";
     const t0ms = _utcMs(splitT0);
     const past = rows.map((r) => (_utcMs(r.time) <= t0ms ? r.sim_q : null));
     const fut = rows.map((r) => (_utcMs(r.time) >= t0ms ? r.sim_q : null));
-    traces.push({ x, y: past, name: evt ? "Sim Q" : "Routed (obs upstream)",
+    // kind "v3": an ungauged point served by DI-LSTM v3 — the solid part is
+    // the model's own hourly 1-h-lead analysis, the dashed part its forecast
+    traces.push({ x, y: past, name: evt ? "Sim Q" : v3 ? "AI analysis (v3)" : "Routed (obs upstream)",
       mode: "lines", connectgaps: false,
       line: { color: "#4cc9a0", width: big ? 2.2 : 1.8, shape: "spline", smoothing: 0.8 } });
-    traces.push({ x, y: fut, name: evt ? "nowcast" : "🔮 Routed nowcast",
+    traces.push({ x, y: fut, name: evt ? "nowcast" : v3 ? "🔮 AI nowcast (v3)" : "🔮 Routed nowcast",
       mode: "lines", connectgaps: false,
       line: { color: "#ff9f43", width: big ? 2.4 : 2.0, dash: "dot", shape: "spline", smoothing: 0.8 } });
   } else {
@@ -2313,11 +2315,13 @@ function scheduleNowcast() {
 // their DI-LSTM nowcast) to it via EF5. Streams like a hindcast; the panel
 // hydrograph splits at t0 into routed-from-observed and routed-from-prediction.
 async function runRoutedNowcast(id) {
-  // Ungauged routed nowcasts are precomputed hourly by the keep-warm Space and
-  // published to CREST_data; serve the point instantly from that store (no live
-  // EF5 run). The line is the routed model itself: ~7 days of history from
-  // observed upstream flow (solid) then the 12-h prediction from the upstream
-  // AI nowcasts (dashed), split at t0.
+  // Ungauged nowcasts are precomputed hourly and published to CREST_data;
+  // serve the point instantly from that store. The server says which feed it
+  // is (d.source): "dilstm_v3" = DI-LSTM v3 run on rainfall + catchment
+  // attributes at every point (no upstream gauge needed) — solid = the model's
+  // own hourly analysis, dashed = its 12-h forecast; "ef5_routed" = the older
+  // EF5 routed feed (solid = routed from observed upstream flow), served only
+  // when the v3 file is absent.
   try {
     const r = await fetch(`/api/ungauged_now?w=0&s=0&e=0&n=0&ids=${encodeURIComponent(id)}`);
     const d = await r.json();
@@ -2330,7 +2334,7 @@ async function runRoutedNowcast(id) {
         ? `⚠️ <b>${escapeHtml(id)}</b> has no upstream USGS gauge draining to it, so ` +
           "there is no observed flow to route — the routed-nowcast design can’t serve " +
           "this point. Switch to 🕘 Hindcast to simulate it from rainfall."
-        : `⏳ <b>${escapeHtml(id)}</b>’s routed nowcast isn’t published yet — the hourly ` +
+        : `⏳ <b>${escapeHtml(id)}</b>’s nowcast isn’t published yet — the hourly ` +
           "precompute is still catching up on this point. Try again in a few minutes, " +
           "or switch to 🕘 Hindcast to simulate it now.", "status");
       selected.delete(id); refreshSelection();
@@ -2341,13 +2345,19 @@ async function runRoutedNowcast(id) {
     (p.history || []).forEach(([t, q]) => rows.push({ time: t, sim_q: q }));
     (p.forecast || []).forEach(([t, q]) => rows.push({ time: t, sim_q: q }));
     simHydro[id] = rows;
-    routedNowcast[id] = { t0: t0disp };
+    const isV3 = d.source === "dilstm_v3";
+    routedNowcast[id] = isV3 ? { t0: t0disp, kind: "v3" } : { t0: t0disp };
     gaugeState[id] = "done";
     delete gaugeResult[id];
-    addMsg(`🔮 <b>${id}</b> — routed nowcast issued <b>${t0disp} UTC</b> (refreshed hourly): ` +
-      "<b>7 days</b> of routed history (solid, from observed upstream flow) then the " +
-      "12-hour prediction (dashed orange past “now”, from the upstream AI nowcasts). " +
-      "There are no observations here, so the line is the routed model itself.", "status");
+    addMsg(isV3
+      ? `🔮 <b>${id}</b> — AI nowcast (DI-LSTM v3) issued <b>${t0disp} UTC</b> (refreshed hourly): ` +
+        "the model runs on radar rainfall + catchment attributes alone — no observations exist " +
+        "here — so the solid line is its own hourly analysis (up to 7 days) and the dashed " +
+        "orange line past “now” is its 12-hour prediction."
+      : `🔮 <b>${id}</b> — routed nowcast issued <b>${t0disp} UTC</b> (refreshed hourly): ` +
+        "<b>7 days</b> of routed history (solid, from observed upstream flow) then the " +
+        "12-hour prediction (dashed orange past “now”, from the upstream AI nowcasts). " +
+        "There are no observations here, so the line is the routed model itself.", "status");
     renderTabs();
     focusGauge(id);
     renderHydro(id);
