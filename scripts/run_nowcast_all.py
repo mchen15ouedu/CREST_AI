@@ -69,6 +69,17 @@ ROUTE_AGE_H = 6.0                         # obs older than this -> v3 (fallback 
 # back to the obs-age rule. Delete the file from the model repo to revert
 # to pure obs-age routing.
 ROUTE_TABLE = "route_pergauge_v1_v3full.parquet"
+# Gauge-health hysteresis (2026-08-18): v3 runs everywhere; v1 is DISPLAYED at a
+# gauge only while (a) the table says v1 is the better model there with fresh
+# obs and (b) the gauge is "healthy": no obs gap longer than GAP_H at any run
+# for PROBATION_D consecutive days. A gap (>GAP_H at two consecutive runs — a
+# single run can be a lost fetch chunk) puts the gauge on v3 immediately; it
+# returns to v1 only after a full clean month. State: STATE_PATH (clean_since
+# per gauge), rewritten hourly next to latest.parquet.
+GAP_H = 12.0
+PROBATION_D = 30
+STATE_PATH = "nowcast/route_state.parquet"
+NET_OUTAGE_FRAC = 0.8                     # >80 % of gauges dark = our fetch failed, not theirs
 RECENT_PREFIX = "mrms_recent/"
 MRMS_GRID = (-130.0, 20.0, 0.01, 3500, 7000, -9999.0)   # xll, yll, cell, nr, nc, nodata
 L, H = 72, 6                      # lookback; H is only the horizon fallback
@@ -611,38 +622,68 @@ def main() -> int:
     preds = _infer(model, feat6, hor)
     preds12 = _infer(model12, _assemble(ck12), hor12)
 
-    # routing: per-gauge winner table (v1 vs v3-full, multi-year all-gauge
-    # replay) chosen by the gauge's CURRENT obs regime — fresh (<=ROUTE_AGE_H),
-    # stale (<=AGE_CAP_H) or noobs (older / never observed); an undecided
-    # gauge falls back to the obs-age rule (stale/noobs -> v3).
-    age_route = obs_age > ROUTE_AGE_H
-    route = route12 = age_route
+    # ---- gauge health state (hysteresis) ------------------------------------
+    # clean_since: "" = gap in progress, "YYYY-mm-dd HH:MM" = start of the
+    # current clean streak, None = gauge unknown (starts probation now)
+    prev_cs, prev_health = {}, {}
+    try:
+        stt = pq.read_table(hf_hub_download(HF_REPO, STATE_PATH, repo_type="dataset",
+                                            token=token, force_download=True))
+        for g, cs, hl in zip(stt.column("gid").to_pylist(), stt.column("clean_since").to_pylist(),
+                             stt.column("obs_health").to_pylist()):
+            prev_cs[str(g).zfill(8)] = cs
+            prev_health[str(g).zfill(8)] = hl
+    except Exception as e:
+        print(f"nowcast: route state unavailable ({e}) — every gauge starts probation")
+    dark = obs_age > GAP_H
+    net_outage = bool(dark.mean() > NET_OUTAGE_FRAC)
+    if net_outage:
+        print(f"nowcast: {100 * dark.mean():.0f}% of gauges dark this run — treating as OUR "
+              f"fetch outage; gauge health state frozen")
+    t0s = t0.strftime("%Y-%m-%d %H:%M")
+    clean_since, health = [], np.empty(len(gid), dtype=object)
+    for i, g in enumerate(gid):
+        cs = prev_cs.get(g, None)
+        ph = prev_health.get(g, "")
+        if dark[i]:
+            if net_outage:
+                health[i] = "suspect"                       # keep streak, no v1 this hour
+            elif ph in ("suspect", "gap") or cs is None:
+                cs, health[i] = "", "gap"                   # confirmed: >GAP_H twice in a row
+            else:
+                health[i] = "suspect"                       # first dark hour: maybe a lost chunk
+        else:
+            if not cs:                                      # "" or None: data (back) -> new streak
+                cs = t0s
+            days = (t0 - datetime.strptime(cs, "%Y-%m-%d %H:%M")).total_seconds() / 86400.0
+            health[i] = "healthy" if days >= PROBATION_D else "probation"
+        clean_since.append(cs if cs is not None else "")
+    healthy_now = (health == "healthy")                     # implies not dark this hour
+
+    # ---- routing: v1 displayed only where it wins with fresh obs AND the gauge
+    # is healthy; everything else (v3 winners, probation, gap, dead, undecided) -> v3
     n_table = 0
+    w6 = np.full(len(gid), "", dtype=object); w12 = w6.copy()
     try:
         p = hf_hub_download(MODEL_REPO, ROUTE_TABLE, repo_type="model", token=token)
         rt = pq.read_table(p)
         rcols = set(rt.column_names)
-        regime = np.where(obs_age <= ROUTE_AGE_H, "fresh",
-                          np.where(obs_age <= AGE_CAP_H, "stale", "noobs"))
         g2i = {str(g).zfill(8): i for i, g in enumerate(rt.column("gid").to_pylist())}
         idx = np.array([g2i.get(g, -1) for g in gid])
 
         def _pick(fam):
+            col = f"winner_{fam}_fresh" if f"winner_{fam}_fresh" in rcols else f"winner_{fam}"
+            v = np.array([x or "" for x in rt.column(col).to_pylist()], dtype=object)
             w = np.full(len(gid), "", dtype=object)
-            for reg in ("fresh", "stale", "noobs"):
-                col = f"winner_{fam}_{reg}" if f"winner_{fam}_{reg}" in rcols else f"winner_{fam}"
-                if col not in rcols:
-                    continue
-                v = np.array([x or "" for x in rt.column(col).to_pylist()], dtype=object)
-                m = (regime == reg) & (idx >= 0)
-                w[m] = v[idx[m]]
+            w[idx >= 0] = v[idx[idx >= 0]]
             return w
         w6, w12 = _pick("6"), _pick("12")
-        route = np.where(w6 == "", age_route, w6 == "v3")
-        route12 = np.where(w12 == "", age_route, w12 == "v3")
         n_table = int(((w6 != "") | (w12 != "")).sum())
+        route = ~(healthy_now & (w6 == "v1"))
+        route12 = ~(healthy_now & (w12 == "v1"))
     except Exception as e:
-        print(f"nowcast: route table unavailable ({e}) — obs-age routing only")
+        print(f"nowcast: route table unavailable ({e}) — healthy gauges -> v1, others -> v3")
+        route = route12 = ~healthy_now
     v3 = None
     try:
         model3, ck3, mfile3 = _model_and_stats(token, (V3_FILES[0],))
@@ -725,11 +766,15 @@ def main() -> int:
           b"mc_n": str(mc_n).encode()}
     if v3 is not None:
         md[b"route_rule"] = (
-            f"per-gauge x obs-regime winner table ({ROUTE_TABLE}, {n_table} gauges decided) + "
-            f"obs_age_h>{ROUTE_AGE_H:g}->v3 fallback" if n_table
-            else f"obs_age_h>{ROUTE_AGE_H:g}->v3").encode()
+            f"v1 iff gauge healthy (no obs gap>{GAP_H:g}h for {PROBATION_D}d) AND fresh-obs "
+            f"winner==v1 in {ROUTE_TABLE} ({n_table} gauges decided); else v3").encode()
         md[b"n_route_table"] = str(n_table).encode()
         md[b"n_route12_v3"] = str(int(route12.sum())).encode()
+        md[b"n_healthy"] = str(int((health == "healthy").sum())).encode()
+        md[b"n_probation"] = str(int((health == "probation").sum())).encode()
+        md[b"n_gap"] = str(int((health == "gap").sum())).encode()
+        md[b"n_suspect"] = str(int((health == "suspect").sum())).encode()
+        md[b"net_outage"] = (b"1" if net_outage else b"0")
         md[b"model_v3_file"] = v3[2].encode()
         md[b"model_v3_epoch"] = str(v3[1].get("epoch")).encode()
         md[b"model_v3_val_nse"] = str(v3[1].get("val_nse")).encode()
@@ -740,7 +785,8 @@ def main() -> int:
             "lon": lon.astype("float32"), "area_km2": area.astype("float32"),
             "obs_last_time": obs_last_t, "obs_last_q": obs_last_q,
             "obs_age_h": obs_age, "model": model_col.tolist(),
-            "model12": model12_col.tolist()}
+            "model12": model12_col.tolist(), "obs_health": health.tolist(),
+            "obs_clean_since": clean_since}
     if skill_nse is not None:
         cols["val_nse_gauge"] = skill_nse
         cols["val_nse_noobs_gauge"] = skill_nse_noobs
@@ -768,13 +814,16 @@ def main() -> int:
             print(f"nowcast: v3 virtual-point nowcast failed: {e}")
 
     n_obs_fresh = int((obs_age <= 6).sum())
+    hstr = (f" | v3-displayed {int(route.sum())} (6h) / {int(route12.sum())} (12h) "
+            f"[healthy {int((health == 'healthy').sum())}, probation {int((health == 'probation').sum())}, "
+            f"gap {int((health == 'gap').sum())}, suspect {int((health == 'suspect').sum())}; table {n_table}]")
     summary = (f"nowcast: t0 {t0:%Y-%m-%d %H:00} UTC | {len(gid)} gauges "
                f"({n_obs_fresh} with obs <=6 h old) | precip hours: "
                f"{sum(1 for t in hours if f'h{t:%Y%m%d%H}' in cached)}/{L} "
                f"({computed} new, {from_pass2} via Pass2, {len(missing)} missing) | "
                f"models {mfile} h{hor} e{ck.get('epoch')} nse {ck.get('val_nse')} + "
                f"{mfile12} h{hor12} e{ck12.get('epoch')} nse {ck12.get('val_nse')}"
-               f"{f' | v3-routed {int(route.sum())} (6h) / {int(route12.sum())} (12h)' + (f' [table {n_table} + obs_age>{ROUTE_AGE_H:g}h fallback]' if n_table else f' (obs_age>{ROUTE_AGE_H:g}h)') if v3 is not None else ' | pure v1 (no v3 routing)'}"
+               f"{hstr if v3 is not None else ' | pure v1 (no v3 routing)'}"
                f"{' | skill table' if skill_nse is not None else ''}"
                f"{f' | mc_n {mc_n}' if mc_cv is not None else ''}"
                + vp_note)
@@ -785,14 +834,20 @@ def main() -> int:
     tmp = tempfile.mkdtemp()
     lp = os.path.join(tmp, "latest.parquet")
     cp = os.path.join(tmp, "precip_cache.parquet")
+    sp = os.path.join(tmp, "route_state.parquet")
     pq.write_table(latest, lp, compression="zstd")
     pq.write_table(cache_tbl, cp, compression="zstd")
+    pq.write_table(pa.table({"gid": gid.tolist(), "clean_since": clean_since,
+                             "obs_health": health.tolist()}).replace_schema_metadata(
+        {b"t0": t0s.encode(), b"gap_h": str(GAP_H).encode(),
+         b"probation_d": str(PROBATION_D).encode()}), sp, compression="zstd")
     # every issue is also archived (latest.parquet is overwritten hourly) so
     # forecasts can later be scored against the obs that actually arrived
     arch = f"nowcast/archive/{t0:%Y%m}/nc_{t0:%Y%m%d%H}.parquet"
     api.create_commit(repo_id=HF_REPO, repo_type="dataset",
                       operations=[CommitOperationAdd(LATEST_PATH, lp),
                                   CommitOperationAdd(CACHE_PATH, cp),
+                                  CommitOperationAdd(STATE_PATH, sp),
                                   CommitOperationAdd(arch, lp)] + vp_ops,
                       commit_message=f"nowcast {t0:%Y%m%d%H}: {len(gid)} gauges"
                                      + (" + v3 virtual" if vp_ops else ""))

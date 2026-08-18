@@ -123,17 +123,27 @@ mean over the 11 years of median per-gauge NSE  v1 / v3-full / routed):
    year; the gain from per-gauge routing is real but small with fresh obs (+0.001..0.002 over the
    better model), and the regime split (fresh vs stale vs no-obs) is what carries the value.
 
-4. WHAT IS DEPLOYED (2026-08-18 02:05 CDT)
-------------------------------------------
+4. WHAT IS DEPLOYED (2026-08-18; hysteresis rule 12:40 CDT)
+------------------------------------------------------------
 * vincewin/CREST_nowcast_model: route_pergauge_v1_v3full.parquet (new file; checkpoints untouched).
-* vincewin/CREST_updater scripts/run_nowcast_all.py: each hour, each gauge is classified by its
-  current obs age (fresh <= 6 h, stale <= 240 h, no-obs beyond / never observed) and served by its
-  table winner for that regime and horizon family; undecided gauges fall back to the previous
-  obs-age rule (stale/no-obs -> v3-full). latest.parquet carries per-row "model" (6-h family)
-  and "model12" (12-h family) columns and metadata route_rule / n_route_table / n_route_v3 /
-  n_route12_v3. Deleting the table from the model repo reverts to the obs-age rule.
+* vincewin/CREST_updater scripts/run_nowcast_all.py — gauge-health hysteresis routing:
+  - v3-full runs at every gauge every hour; v1 is DISPLAYED at a gauge/horizon family only if
+    (a) the table says v1 wins there with fresh obs (winner_{6,12}_fresh == v1) AND
+    (b) the gauge is HEALTHY: no observation gap > 12 h for 30 consecutive days.
+  - Gap monitor: obs older than 12 h at a run marks the gauge "suspect" (v3 for that hour, streak
+    kept — a single dark run can be a lost fetch chunk); dark again next run -> "gap": clean streak
+    reset, v3 until data are back AND a full 30-day clean streak has accrued ("probation").
+  - Network-wide dark runs (> 80 % of gauges) are treated as our own fetch outage: v3 for that
+    hour, gauge streaks frozen (no false probation).
+  - Everything else (v3 winners, probation, gap, dead, undecided) -> v3-full.
+  - State nowcast/route_state.parquet (gid, clean_since, obs_health) rewritten hourly in
+    CREST_data; bootstrapped from the 670 archived runs 2026-07-21..08-18 (5,773 clean streaks,
+    3,294 in gap). latest.parquet carries model / model12 / obs_health / obs_clean_since columns
+    and metadata route_rule, n_healthy, n_probation, n_gap, n_suspect, net_outage.
+  - Because the archive only reaches back 28 days, no gauge can prove a 30-day clean month until
+    ~2026-08-20; until then all gauges show v3-full (fresh-obs v1/v3 is a tie, so no skill cost).
 * The 2,676 ungauged virtual points stay on v3-full (the no-obs regime, where v3-full beats v1
-  at 92 % of gauges) — with the caveat above that no-obs skill is modest and weakest in fall.
+  at 92 % of gauges) — with the caveat that no-obs skill is modest and weakest in fall/West.
 
 5. CAVEATS
 ----------
@@ -158,3 +168,38 @@ mean over the 11 years of median per-gauge NSE  v1 / v3-full / routed):
   by_lead.csv, by_period.csv, peaks.csv, loyo_cv.csv
   route_pergauge_multiyear.csv/.parquet   the deployed routing table
   logs/                        obs / precip / replay / scheduler logs
+
+7. PATTERNS vs GAGES-II ATTRIBUTES (added 2026-08-18; nowcast_eval/multiyear/gages2_patterns.txt,
+   pergauge_with_gages2.csv; map fig13_noobs_skill_and_persistence_gain_maps.png)
+--------------------------------------------------------------------------------
+Join of the 6,211 decided gauges with GAGES-II (class, ecoregion, HUC2, area, climate, snow,
+BFI, dams, land cover, soils, disturbance).  Out-of-sample months, 6-h family unless noted.
+
+Fresh obs (v1 vs v3 nearly a coin flip, |median dNSE| <= 0.003):
+  v3 wins more at 12 h in small basins (<200 km2: 62-65 %), urban (>35 % developed: 67 %,
+  dNSE +0.011), permeable/groundwater basins (perm >8 in/hr: 77 %; BFI>60: 66 %), Great Lakes
+  HUC04 (70 %), Great Basin HUC16 (69 %), snow>50 % (64 %). v1 wins large rivers (>5,000 km2:
+  63-69 %) and the humid East Highlands / SE Plains (v3 only 24-34 %).
+Stale-24h obs (v3 wins 86-93 % everywhere; magnitude of v3 skill is geographic):
+  v3 NSE ~0.9 in snowmelt (>50 % snow 0.95), groundwater (BFI>60 0.91), big rivers (>20k km2
+  0.91), HUC09/14/16/17 (~0.9); collapses in flashy warm rain basins: HUC15 0.22, HUC12 0.47,
+  urban>35 % 0.43, BFI<30 0.53, WestPlains 0.50. v1 wins only in slow northern/regulated
+  systems (MxWdShld 22 %, HUC09 31 %, dam storage 500-5000 33 %).
+No obs (strongest geography = runoff-generation mechanism):
+  positive skill in humid rain-driven East + Pacific coast (EastHghlnds 85 % of gauges NSE>0,
+  SEPlains 83 %, NorthEast 83 %, HUC06 93 %; PPT>=100 cm 79-80 % vs <70 cm 37-45 %; rho PPT
+  +0.45, T_avg +0.31); negative in snow/energy-driven West interior and northern Plains (HUC16
+  22 %, 10U 29 %, HUC09 9 %, MxWdShld 27 %, snow>50 % 24 %; rho elev -0.35, snow -0.23), in
+  groundwater/karst/wetland systems (BFI>60 40 %; Florida peninsula), and on big rivers (>5,000
+  km2 30-34 %, median -0.05) vs small basins (<50 km2 80 %, median 0.17); urban basins are the
+  best no-obs case (>35 % developed 93 % positive, median 0.26). The 8 % of gauges where v1
+  "wins" without obs lie in the same failing regions (both models fail; v1's flat-line is nearer
+  the mean).
+Nowcast vs persistence (fresh obs): gains >=0.05 concentrate in Appalachians/Piedmont/Gulf
+  coast, Pacific coast, Texas Hill Country and metro areas (small, warm, rain-driven; rho T_avg
+  +0.32, area -0.32, BFI -0.32, snow -0.28); ~persistence across northern Plains, Rockies and
+  large rivers; 435 gauges worse than persistence, clustered in regulated / snowmelt /
+  diurnal-cycle basins.
+Implications: routing already exploits these regimes; the ungauged (grey) points deserve a
+  regime-based confidence tag (fig13 top is that mask); the no-obs weakness in the West calls
+  for temperature/snowpack (or longer memory) in a future v4, not more precipitation features.
