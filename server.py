@@ -718,10 +718,10 @@ def api_events(full: int = 0):
 
 @app.get("/api/health")
 def api_health():
-    """V30 pipeline self-monitoring: nowcast/radar freshness, event-tick
-    liveness, queue depth + oldest unclaimed age, worker heartbeats, event
-    throughput — each with an ok flag. The daily review routine leads its
-    digest with this."""
+    """V30 pipeline self-monitoring: nowcast/radar freshness, MRMS Pass2 /
+    PET / TEMP archive freshness, event-tick liveness, queue depth + oldest
+    unclaimed age, worker heartbeats, event throughput — each with an ok
+    flag. The daily review routine leads its digest with this."""
     from hf_data import health
     return health.snapshot()
 

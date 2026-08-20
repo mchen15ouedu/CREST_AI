@@ -9,6 +9,7 @@ failure detector was the user noticing missing events days later.
 Checks:
   nowcast   precomputed fleet nowcast issue age      (< 3 h)
   mrms      newest radar animation frame age          (< 3 h)
+  forcing   MRMS Pass2 / PET / TEMP archive age       (weekly updater)
   tick      last hourly event tick on THIS process    (< 2 h)
   queue     depth, oldest NEVER-PUBLISHED bundle age  (< 6 h unclaimed)
   workers   freshest claim heartbeat anywhere         (informational)
@@ -83,6 +84,16 @@ def snapshot() -> dict:
                        "ok": age is not None and age <= MRMS_MAX_H}
     except Exception as e:
         out["mrms"] = {"ok": False, "error": type(e).__name__}
+
+    # archive forcing the simulations actually integrate (MRMS Pass2/PET/TEMP).
+    # `mrms` above is the hourly Pass1 nowcasting feed, which the updater Space
+    # refreshes itself — these three only move when the weekly routine runs, so
+    # they need their own eyes (2026-08-20: PET a month stale, nothing said so).
+    try:
+        from . import forcingfresh
+        out["forcing"] = forcingfresh.snapshot()
+    except Exception as e:
+        out["forcing"] = {"ok": False, "error": type(e).__name__}
 
     # event tick + queue: local, or the runner Space's own report
     runner_url = os.environ.get("EVENT_RUNNER_URL", "").rstrip("/")
@@ -174,7 +185,7 @@ def snapshot() -> dict:
         out["events"] = {"error": type(e).__name__}
 
     out["ok"] = all(out.get(k, {}).get("ok", True)
-                    for k in ("nowcast", "mrms", "tick", "queue"))
+                    for k in ("nowcast", "mrms", "forcing", "tick", "queue"))
     with _lock:
         _cache.update(t=time.time(), snap=out)
     return out
