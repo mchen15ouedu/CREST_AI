@@ -1,0 +1,56 @@
+name: Data freshness alarm
+
+# Daily red-if-stale check on the CREST_demo data feeds. This is the piece
+# that was missing when PET silently rotted for 33 days (2026-07-19..08-20):
+# the weekly full-refresh job fired and reported "success" every Monday
+# because every curl is `|| true`, but PET's updater had hard-crashed on the
+# Space (fetching a big multi-day gap at once), nothing acted on the
+# "PET STALE" line, and no one was paged. GitHub emails the repo owner when a
+# scheduled workflow FAILS, so this job deliberately goes red on any stale
+# feed — turning a silent month-long rot into a next-day email.
+#
+# The updater Space now self-heals (auto-reruns any heavy feed the hourly
+# freshness check finds stalled), so this alarm should normally stay green;
+# it fires only when self-heal itself cannot recover (persistent crash, or
+# the Space asleep for long enough to accrue a gap the updater chokes on).
+
+on:
+  schedule:
+    - cron: '40 10 * * *'      # daily 10:40 UTC (after the Mon full-refresh window)
+  workflow_dispatch:
+
+concurrency:
+  group: crest-updater          # never overlap the refresh jobs
+  cancel-in-progress: false
+
+jobs:
+  freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Wake the Space and let a fresh check (+ self-heal) run
+        run: |
+          curl -sk -m 60 https://vincewin-crest-updater.hf.space/ -o /dev/null || true
+          # nudge a light cycle so freshness + self-heal are current, then wait idle
+          sleep 20
+          curl -sk -m 60 -X POST \
+            "https://vincewin-crest-updater.hf.space/api/run?feeds=mrms_recent" \
+            -o /dev/null || true
+          for i in $(seq 1 30); do        # up to ~15 min (self-heal can run pet/temp)
+            curl -sk -m 30 https://vincewin-crest-updater.hf.space/api/status \
+              | grep -q '"running":false' && break
+            sleep 30
+          done
+
+      - name: Assert every feed is fresh (fail -> email)
+        run: |
+          s=$(curl -sk -m 30 https://vincewin-crest-updater.hf.space/api/status)
+          echo "----- freshness -----"
+          echo "$s" | tr ',' '\n' | grep -oE '(MRMS recent|MRMS|PET|TEMP|USGS gauge)[^"]*(ok|STALE)[^"]*latest [0-9][^"\\]*' || \
+            echo "$s" | grep -o 'latest [0-9][^"]*'
+          if echo "$s" | grep -q 'STALE'; then
+            echo "::error::One or more CREST_demo data feeds are STALE — the updater self-heal did not recover. Check https://vincewin-crest-updater.hf.space/api/status"
+            echo "$s" | tr ',' '\n' | grep -i 'STALE' || true
+            exit 1
+          fi
+          echo "all feeds fresh"
