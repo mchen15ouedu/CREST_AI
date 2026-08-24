@@ -236,10 +236,14 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
               snow: str = "auto", timestep: str = "1h", warmup_days: int = WARMUP_DAYS,
               grids: bool = True, no_cache: bool = False,
               workdir: str | None = None, cancel=None, scheme: str = "full",
-              nowcast_t0: datetime | None = None):
+              nowcast_t0: datetime | None = None,
+              domain_bbox: tuple | None = None):
     """Per-gauge streaming run (map flow: gauge already chosen). Yields events.
     `cancel` (threading.Event) stops the run: the EF5 process is killed and the
-    (gauge, model) lock released, so a superseding run can start immediately."""
+    (gauge, model) lock released, so a superseding run can start immediately.
+    domain_bbox: raster extent EF5 must cover (w, s, e, n) — event runs pass
+    the gauge's HUC12-basin bounds so the whole catchment is carved (the
+    default √area square centred on the outlet clips elongated basins)."""
     g = gauge_info(gauge_id)
     if g is None:
         yield ("status", f"⚠️ gauge {gauge_id} not found")
@@ -289,14 +293,14 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
         yield from _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end,
                                    use_mock, overrides, snow, timestep,
                                    warmup_days, grids, no_cache, workdir, cancel,
-                                   scheme, nowcast_t0)
+                                   scheme, nowcast_t0, domain_bbox)
     finally:
         lock.release()
 
 
 def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                     overrides, snow, timestep, warmup_days, grids, no_cache, workdir,
-                    cancel=None, scheme="full", nowcast_t0=None):
+                    cancel=None, scheme="full", nowcast_t0=None, domain_bbox=None):
     """The actual per-gauge run — called with the (gauge, model) lock held.
 
     nowcast_t0 (UTC): route a NOWCAST at an ungauged point. The window runs to
@@ -306,7 +310,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     inflow, not new rain)."""
     work = workdir or tempfile.mkdtemp(prefix=f"crest_{g['id']}_")
     out_dir = os.path.join(work, "CREST_output")
-    bbox = basin_bbox(g)
+    bbox = tuple(domain_bbox) if domain_bbox else basin_bbox(g)
     # shared per-basin clip stores: repeat runs + calibration candidates reuse
     # the clipped terrain/param grids instead of re-reading the remote COGs
     basic_dir = basic.store_dir(bbox)

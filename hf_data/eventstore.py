@@ -95,7 +95,7 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
         prior = idx.pop(ev, None)
         summary = {k: manifest.get(k) for k in
                    ("bbox", "t0", "sim_start", "t_end", "model", "trigger",
-                    "generated", "gauge")}
+                    "generated", "gauge", "domain")}
         summary["engine"] = (manifest.get("provenance") or {}).get("engine")
         summary["n_frames"] = len(manifest.get("frames", []))
         summary["status"] = manifest.get("status", "active")

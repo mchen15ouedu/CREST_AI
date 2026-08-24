@@ -764,7 +764,8 @@ def api_event_tick():
 
 
 @app.post("/api/event_run")
-def api_event_run(gid: str = "", t0: str = "", defer: int = 0):
+def api_event_run(gid: str = "", t0: str = "", defer: int = 0,
+                  episode: str = "", cold: int = 0):
     """V25 manual/agent trigger: 2-D inundation event for `gid`, or
     auto-detect from the nowcast flood tier when gid is empty. The run takes
     minutes (EF5 + hydrodynamic solver) and executes in a worker thread;
@@ -772,13 +773,19 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0):
     t0: backdate the event window ("YYYY-MM-DDTHH:MM" UTC) — refill a flood
     the trigger pipeline missed; the window is [t0-backset, t0+horizon].
     defer=1: enqueue for the GPU worker only (no CPU fallback) — the runner
-    stays free and the result publishes whenever the worker gets to it."""
+    stays free and the result publishes whenever the worker gets to it.
+    episode=<event id>: re-simulate an EXISTING listed episode under its own
+    id (anchored at its recorded start; the folder is replaced in place) —
+    e.g. re-running the whole list after an engine/domain change.
+    cold=1 (with episode): no warm-start frame — the whole anchored span is
+    re-solved and every published frame replaced."""
     if os.environ.get("EVENT_TICK", "1") != "1" and EVENT_RUNNER_URL:
         try:                       # split dashboard: forward to the runner
             import requests
             return requests.post(
                 f"{EVENT_RUNNER_URL}/api/event_run",
-                params={"gid": gid, "t0": t0, "defer": defer},
+                params={"gid": gid, "t0": t0, "defer": defer,
+                        "episode": episode, "cold": cold},
                 timeout=30).json()
         except Exception as e:
             return JSONResponse({"ok": False, "reason":
@@ -805,13 +812,19 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0):
                                  "reason": "t0 must be YYYY-MM-DDTHH:MM (UTC)"},
                                 status_code=422)
     import threading
+    if episode and not gid:
+        gid = episode.split("_", 1)[-1]          # ids are <YYYYMMDDHH>_<gid>
     if gid:
         threading.Thread(target=eventsim.run_one, args=(gid, t0_dt),
-                         kwargs={"defer": bool(defer)}, daemon=True).start()
+                         kwargs={"defer": bool(defer),
+                                 "episode_id": episode or None,
+                                 "cold": bool(cold and episode)},
+                         daemon=True).start()
     else:
         threading.Thread(target=eventsim.run_detected, daemon=True).start()
     return {"ok": True, "started": gid or "auto-detect", "t0": t0 or "now",
-            "defer": bool(defer)}
+            "defer": bool(defer), "episode": episode or None,
+            "cold": bool(cold and episode)}
 
 
 @app.get("/api/upstream")

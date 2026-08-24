@@ -5,13 +5,16 @@ clusters pick trigger gauges -> EF5 nowcast-mode run over the basin with
 output_grids=streamflow|runoff|subrunoff -> crestimap well-balanced solver
 (3DEP DEM on demand) -> compact depth frames -> eventstore (one commit).
 
-CPU sizing: RESOLUTION IS FIXED at the DEM's native cell size; when the
-basin box exceeds EVENT_MAX_CELLS (default 400k) at that resolution, the
-solver WINDOW shrinks around the trigger gauge (_hires_window) — never the
-resolution. Full-basin native coverage = parallel/GPU milestone (subbasin
-decomposition + ghost-cell halo exchange). crestimap installs from the
-CREST-iMAP fork's v2 branch (Dockerfile); everything here degrades to a
-clear error if it's missing.
+DOMAIN = BASIN, NEVER A RECTANGLE (user directive 2026-08-18): the 2-D
+domain is the whole catchment contributing to the trigger gauge as a union
+of WBD HUC12 units (hf_data/hucdomain.py) — the solver integrates only those
+cells (the raster outside them is a sink) and the HUC12 units are the tiles
+the parallel tier spreads across devices. RESOLUTION IS FIXED at the DEM's
+native cell size. Workers get the full basin; the demoted CPU rung, when it
+must run, keeps only the HUC12 units nearest the gauge that fit
+EVENT_MAX_CELLS (hydrologic-unit trimming — still a basin, never a window).
+crestimap installs from the CREST-iMAP fork's v2 branch (Dockerfile);
+everything here degrades to a clear error if it's missing.
 """
 from __future__ import annotations
 
@@ -66,43 +69,12 @@ DEM_RES = os.environ.get("EVENT_DEM_RES", "1")
 DEM_CACHE = os.environ.get("EVENT_DEM_CACHE",
                            os.path.join(tempfile.gettempdir(), "dem_cache"))
 # RESOLUTION IS FIXED at the DEM's native cell size — a coarsened flood map
-# (one pixel = 10 street blocks) is useless information. When the basin box
-# exceeds the cell budget at native resolution, the SIMULATED WINDOW shrinks
-# around the trigger gauge instead (user directive 2026-08-12); covering the
-# full basin at native resolution is the parallel-computing milestone.
+# (one pixel = 10 street blocks) is useless information. When the basin
+# exceeds the CPU cell budget at native resolution, the CPU rung keeps the
+# HUC12 units nearest the gauge (hucdomain.build_domain(max_cells=...)) —
+# whole hydrologic units, never a window (user directive 2026-08-18); the
+# workers always get the whole basin.
 DEM_RES_DEG = {"1": 1.0 / 3600.0, "13": 1.0 / 10800.0}
-
-
-def _hires_window(bbox, gauge_ll, log=print):
-    """Crop the basin box to the largest window that fits EVENT_MAX_CELLS at
-    the DEM's NATIVE resolution, centered on the trigger gauge with a 25%
-    bias toward the basin-box center (the upstream side, where the flood
-    comes from). Returns bbox unchanged when it already fits."""
-    w, s, e, n = bbox
-    glat, glon = gauge_ll
-    res = DEM_RES_DEG.get(DEM_RES, 1.0 / 3600.0)
-    side_deg = math.sqrt(float(MAX_CELLS)) * res
-    if (n - s) <= side_deg and (e - w) <= side_deg:
-        return bbox
-    cy = glat + 0.25 * ((s + n) / 2.0 - glat)
-    cx = glon + 0.25 * ((w + e) / 2.0 - glon)
-    hl_lat = min(side_deg, n - s) / 2.0
-    hl_lon = min(side_deg, e - w) / 2.0
-    # the gauge must stay well inside the window (bias is a preference only);
-    # applying the gauge clamp BEFORE the box clamp keeps it inside even when
-    # the gauge sits near a basin-box edge
-    cy = min(max(cy, glat - 0.4 * hl_lat), glat + 0.4 * hl_lat)
-    cx = min(max(cx, glon - 0.4 * hl_lon), glon + 0.4 * hl_lon)
-    cy = min(max(cy, s + hl_lat), n - hl_lat)
-    cx = min(max(cx, w + hl_lon), e - hl_lon)
-    km = 111.0
-    coslat = max(0.2, math.cos(math.radians(glat)))
-    log(f"resolution-first window: {2 * hl_lon * km * coslat:.0f} x "
-        f"{2 * hl_lat * km:.0f} km around the gauge at native ~"
-        f"{res * 111000:.0f} m (basin box {(e - w) * km * coslat:.0f} x "
-        f"{(n - s) * km:.0f} km exceeds the {MAX_CELLS} cell budget; "
-        f"full-basin native coverage needs the parallel/GPU tier)")
-    return (cx - hl_lon, cy - hl_lat, cx + hl_lon, cy + hl_lat)
 
 _running: dict = {"id": None, "status": None, "log": [], "last": None,
                   "started": None}
@@ -292,7 +264,8 @@ def _basin_outline(ef5_dir: str, gauge_ll=None, max_pts: int = 1200, log=print):
 
 def run_one(gid: str, t0: datetime.datetime | None = None,
             trigger: dict | None = None, episode_id: str | None = None,
-            defer: bool = False, force_cpu: bool = False) -> dict:
+            defer: bool = False, force_cpu: bool = False,
+            cold: bool = False) -> dict:
     """Full event pipeline for one trigger gauge. Blocking (minutes-long);
     call from a worker thread. Returns the manifest (raises on failure).
     episode_id: re-simulate an ongoing episode under its original id (the
@@ -302,7 +275,11 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     force_cpu: solve locally even in queue mode "on" — the tick passes this
     when an event has sat unclaimed/unpublished past EVENT_CPU_FALLBACK_H
     (V30: the CPU rung is demoted to that last resort; a fresh enqueue no
-    longer burns hours of runner CPU on a solve a worker replaces anyway)."""
+    longer burns hours of runner CPU on a solve a worker replaces anyway).
+    cold: do NOT carry the episode's previous depth frame into the bundle as
+    a warm start — the workers re-solve the whole anchored span from the
+    channel pre-wet, and publish replaces every frame (a full re-run, e.g.
+    after the engine/domain changed; the box-era frames must not survive)."""
     from crestimap import EventConfig, run_event   # needs the v2 package
     from . import eventqueue, eventstore, nowcaststore, pipeline
 
@@ -351,6 +328,25 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                         started=datetime.datetime.utcnow().strftime(
                             "%Y-%m-%dT%H:%M:%SZ"))
     try:
+        # EF5's raster EXTENT must contain the WHOLE basin: the default
+        # √area square centred on the outlet gauge clips elongated
+        # catchments (Spoon R 3,884 of 4,241 km²; Pope Ck 199 of 449 — the
+        # gauge sits at the basin's downstream end). Use the HUC12 basin
+        # bounds, unioned with the default so the extent never shrinks. EF5
+        # still carves the catchment inside it (nodata outside).
+        from . import hucdomain
+        ef5_bbox = None
+        try:
+            hb = hucdomain.basin_bounds(g)
+            sq = pipeline.basin_bbox(g)
+            ef5_bbox = (min(hb[0], sq[0]), min(hb[1], sq[1]),
+                        max(hb[2], sq[2]), max(hb[3], sq[3]))
+            grew = any(abs(a - b) > 1e-6 for a, b in zip(ef5_bbox, sq))
+            log(f"EF5 extent from the HUC12 basin bounds "
+                f"{'(wider than the default square)' if grew else '(default square already covers it)'}")
+        except Exception as e:
+            log(f"EF5 extent: HUC12 bounds unavailable ({type(e).__name__}: "
+                f"{e}) — default square")
         log(f"EF5 nowcast-mode run {t_start:%m-%d %H}Z -> {t_end:%m-%d %H}Z "
             f"with gridded runoff output")
         meta = {}
@@ -366,7 +362,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         for kind, payload in pipeline.run_gauge(
                 gid, t_start, t_end, model="auto", use_mock=False,
                 grids=EVENT_TOKENS, workdir=work, nowcast_t0=t0,
-                warmup_days=WARMUP_D):
+                warmup_days=WARMUP_D, domain_bbox=ef5_bbox):
             if kind == "meta":
                 meta = payload
             elif kind == "status":
@@ -401,20 +397,17 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                 if kinds:
                     log(f"workdir {root}/: {dict(sorted(kinds.items())[:8])}")
 
-        basin_ring = None
-        try:            # true watershed ring (map overlay + worker job spec)
-            basin_ring = _basin_outline(out_dir, gauge_ll=(g["lat"], g["lon"]),
-                                        log=log)
-            if basin_ring:
-                log(f"basin outline: {len(basin_ring)} vertices")
-        except Exception as e:
-            log(f"basin outline skipped ({type(e).__name__}: {e})")
-
-        # EF5 keeps the FULL basin (routing needs the whole catchment; its
-        # routed channel stage carries upstream water INTO the window); only
-        # the 2-D solver domain is cropped to hold native resolution
-        basin_bbox = tuple(pipeline.basin_bbox(g))
-        solver_bbox = _hires_window(basin_bbox, (g["lat"], g["lon"]), log=log)
+        # THE DOMAIN IS THE BASIN: the whole catchment contributing to the
+        # gauge as a union of HUC12 units, written into the EF5 dir as
+        # domain_huc.tif (+ domain.geojson) so the queue bundle carries it
+        # and every engine solves the same basin. No box anywhere: a gauge
+        # with no basin geometry is an error, not a rectangle.
+        from . import hucdomain
+        with _lock:
+            _running["status"] = "domain"
+        dom = hucdomain.build_domain(g, out_dir, dem_res=DEM_RES, log=log)
+        basin_ring = dom["basin"]
+        basin_bbox = tuple(dom["bbox"])        # raster extent of the union
         # worker spec = full anchored span (fixed episode window); the local
         # CPU fallback still solves only the fresh 24-h slice — its frames
         # merge into the fixed-start record at publish
@@ -428,7 +421,10 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         # is dropped into the forcing dir as init_depth.tif — the enqueue
         # tars every .tif, so workers get it too, and run_event/chunkrun
         # auto-discover it (h0 = max(channel pre-wet, previous depth)).
-        if episode_id:
+        if episode_id and cold:
+            log("cold re-run: no warm-start frame — the whole anchored span "
+                "is re-solved and every published frame replaced")
+        elif episode_id:
             try:
                 pm = eventstore._prior_manifest(ev_id) or {}
                 js = sim_start_local.strftime("%Y-%m-%dT%H:%MZ")
@@ -464,7 +460,14 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                     "gauge": {"id": gid, "lat": g["lat"], "lon": g["lon"],
                               "area_km2": g.get("area")},
                     "bbox_basin": list(basin_bbox),
-                    "bbox_window": list(solver_bbox),
+                    # basin domain summary (units, area, active/bbox cells);
+                    # the label raster itself rides in the forcing tar
+                    "domain": {k: v for k, v in dom.items() if k != "basin"},
+                    "huc12s": [h["huc12"] for h in dom["hucs"]],
+                    # cold re-run stamp: workers drop any resident session
+                    # for this episode and re-solve from the anchor
+                    "cold": (datetime.datetime.utcnow().strftime(
+                        "%Y-%m-%dT%H:%M:%SZ") if cold else None),
                     "t0": t0.strftime("%Y-%m-%dT%H:%MZ"),
                     "t_end": t_end.strftime("%Y-%m-%dT%H:%MZ"),
                     "sim_start": sim_start.strftime("%Y-%m-%dT%H:%MZ"),
@@ -530,12 +533,21 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                         f"local CPU solve exceeded EVENT_CPU_MAX_H="
                         f"{CPU_MAX_H:g} h ({s})")
 
+        # CPU rung domain: the HUC12 units nearest the gauge that fit the CPU
+        # cell budget at native resolution — hydrologic units, never a
+        # window. Written to its own dir so the full-basin domain already
+        # bundled for the workers is untouched.
+        cpu_dom_dir = os.path.join(work, "cpu_domain")
+        cpu_dom = hucdomain.build_domain(g, out_dir, dem_res=DEM_RES,
+                                         out_dir=cpu_dom_dir,
+                                         max_cells=MAX_CELLS, log=log)
         cfg = EventConfig(
-            event_id=ev_id, bbox=solver_bbox,
+            event_id=ev_id, bbox=tuple(cpu_dom["bbox"]),
             t0=t0, t_end=t_end, ef5_output_dir=out_dir,
             out_dir=os.path.join(work, "event_out"), model=wb_model,
             sim_start=sim_start_local,
             dem_res=DEM_RES, dem_cache=DEM_CACHE, max_cells=MAX_CELLS,
+            domain_path=os.path.join(cpu_dom_dir, "domain_huc.tif"),
             trigger={**(trigger or {}), "gauge": gid}, progress=solve_log)
         try:
             manifest = run_event(cfg)
@@ -553,7 +565,16 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         manifest["gauge"] = gid
         manifest["hydro"] = [hydro[k] for k in sorted(hydro)]
         manifest["status"] = "active"
-        manifest["basin"] = basin_ring     # computed above, pre-queue
+        manifest["basin"] = basin_ring     # HUC12 union outline (whole basin)
+        manifest["huc12s"] = [h["huc12"] for h in dom["hucs"]]
+        # domain summary = builder facts (units, area) + solver facts (cells)
+        manifest["domain"] = {**{k: v for k, v in dom.items()
+                                 if k not in ("basin", "hucs")},
+                              **(manifest.get("domain") or {})}
+        if cpu_dom.get("trimmed"):
+            manifest["cpu_trimmed"] = {"n_hucs": cpu_dom["n_hucs"],
+                                       "area_km2": cpu_dom["area_km2"],
+                                       "of_n_hucs": dom["n_hucs"]}
 
         with _lock:
             _running["status"] = "archive"

@@ -24,6 +24,7 @@ the store repos ARE the state.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -52,6 +53,48 @@ AUTO_FEEDS = [f for f in os.environ.get("UPDATER_AUTO_FEEDS", ",".join(FEEDS)).s
               if f in SCRIPTS and f != "check"] or FEEDS
 AUTO_DELAY_S = float(os.environ.get("UPDATER_AUTO_DELAY_S", "20"))
 KEY = os.environ.get("UPDATER_KEY", "")
+
+# --- self-heal ------------------------------------------------------------
+# The light hourly wake (AUTO_FEEDS = mrms_recent,nowcast) does NOT refresh the
+# heavy store feeds (temp/pet/mrms); those used to rely on an external weekly
+# /api/run that silently stopped, so PET rotted 33 days (2026-07-19 .. 08-20)
+# while the freshness check flagged STALE into the void every hour. Fix: every
+# wake ends with `check`, which reports each feed's lag — parse it and refresh
+# any heavy feed that has fallen further behind than its own source lag allows.
+# Store IS the state, so the decision is stateless (restart-safe); a per-feed
+# cooldown just avoids re-hammering a source that is itself behind.
+SELF_HEAL = os.environ.get("UPDATER_SELF_HEAL", "1") == "1"
+HEAL_COOLDOWN_H = float(os.environ.get("UPDATER_HEAL_COOLDOWN_H", "3"))
+# heal a feed when its store lag (days) exceeds this — set just above each
+# source's real publish lag (PET ~1 d, MRMS Pass2 ~2-3 d, NARR temp ~2-3 wk),
+# so a healthy feed never triggers but a stalled updater is caught within hours
+HEAL_THRESH_D = {
+    "pet":  float(os.environ.get("UPDATER_HEAL_PET_D", "2")),
+    "mrms": float(os.environ.get("UPDATER_HEAL_MRMS_D", "4")),
+    "temp": float(os.environ.get("UPDATER_HEAL_TEMP_D", "30")),
+}
+_last_heal: dict[str, float] = {}
+_FRESH_LINE = re.compile(
+    r"(MRMS recent|MRMS|PET|TEMP)\s+\S+\s+latest.*\(lag\s+([\d.]+)\s*([hd])\)")
+_LABEL_TO_FEED = {"MRMS": "mrms", "PET": "pet", "TEMP": "temp"}
+
+
+def _lags_from_freshness(lines: list[str]) -> dict[str, float]:
+    """{feed: lag_in_days} parsed from check_forcing_freshness output.
+    Only the heavy store feeds (mrms/pet/temp); 'MRMS recent' and USGS are
+    ignored — the former is already in the hourly auto-run, the latter is a
+    live probe with no store to refresh."""
+    out: dict[str, float] = {}
+    for l in lines:
+        m = _FRESH_LINE.search(l)
+        if not m:
+            continue
+        feed = _LABEL_TO_FEED.get(m.group(1))
+        if not feed:                              # 'MRMS recent'
+            continue
+        lag = float(m.group(2)) / (24.0 if m.group(3) == "h" else 1.0)
+        out[feed] = lag
+    return out
 
 app = FastAPI(title="CREST_updater")
 _lock = threading.Lock()
@@ -111,6 +154,28 @@ def _run_all(feeds: list[str]):
         rc, lines = _run_script("check")          # always end with the freshness report
         _state["freshness"] = lines
         _state["exit_codes"]["check"] = rc
+
+        # self-heal any heavy store feed the check found stalled (see notes at
+        # HEAL_THRESH_D). Runs the same updater the weekly refresh would, then
+        # re-checks so the reported freshness reflects the repair.
+        if SELF_HEAL:
+            lags = _lags_from_freshness(lines)
+            now = time.time()
+            heal = [f for f, thr in HEAL_THRESH_D.items()
+                    if lags.get(f, 0.0) > thr and f not in feeds
+                    and now - _last_heal.get(f, 0.0) > HEAL_COOLDOWN_H * 3600]
+            if heal:
+                _log(f"self-heal: {', '.join(f'{f} {lags[f]:.1f}d' for f in heal)} "
+                     f"exceed refresh threshold — running their updaters")
+                for f in heal:
+                    _last_heal[f] = now
+                    rc, hlines = _run_script(f)
+                    _state["results"][f] = hlines
+                    _state["exit_codes"][f] = rc
+                rc, lines = _run_script("check")  # freshness after the repair
+                _state["freshness"] = lines
+                _state["exit_codes"]["check"] = rc
+
         _log("=== run complete ===")
         _ping_event_tick()                        # V25: hourly inundation tick
     except Exception as e:                        # keep the app alive whatever happens

@@ -167,7 +167,15 @@ def get_series(site: str, t_start: datetime, t_end: datetime,
                 if info is not None:
                     info["fetch_error"] = str(e)
                 continue                     # gap stays uncovered -> retry later
-            rows.update(dict(got))
+            got = dict(got)
+            # replace, don't merge: USGS scrubs bad provisional values by
+            # DELETING them, so cached rows in the refetched window that the
+            # fresh answer no longer carries must go too (seen live: a phantom
+            # 38,400 cfs flood at a dry TX gauge survived in the store — and
+            # the scorecard — long after NWIS had removed it)
+            for t in [t for t in rows if a <= t <= b and t not in got]:
+                del rows[t]
+            rows.update(got)
             # even an empty answer is an answer (gauge has no record there) —
             # mark covered so we stop hammering NWIS, but never inside the
             # provisional tail

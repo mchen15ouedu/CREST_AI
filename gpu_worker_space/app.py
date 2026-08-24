@@ -202,9 +202,15 @@ def _scan():
             age = 0.0
         if age < delay:
             continue
+        if not spec.get("domain"):
+            # pre-basin bundle (rectangular-window era): never solved as a
+            # rectangle — the runner re-enqueues it with a HUC12 basin domain
+            log(f"skip {ev}: no basin domain in spec — awaiting re-enqueue")
+            continue
         w, s, e, n = spec["bbox_basin"]
         res = DEM_RES_DEG["1"]
-        cells = int(round((n - s) / res)) * int(round((e - w) / res))
+        cells = int((spec.get("domain") or {}).get("n_bbox") or
+                    int(round((n - s) / res)) * int(round((e - w) / res)))
         if cells > MAX_CELLS:
             log(f"skip {ev}: {cells / 1e6:.1f} M cells > "
                 f"{MAX_CELLS / 1e6:.1f} M budget (never coarsen)")
@@ -257,14 +263,17 @@ def _start_job(job):
             return False
 
     rec = W["sessions"].get(ev)
-    if rec and rec["bbox"] != spec["bbox_basin"]:
-        log(f"{ev}: bbox changed — dropping resident session")
+    if rec and (rec["bbox"] != spec["bbox_basin"]
+                or rec.get("cold") != spec.get("cold")):
+        log(f"{ev}: {'cold re-run requested' if rec.get('cold') != spec.get('cold') else 'bbox changed'}"
+            f" — dropping resident session")
         shutil.rmtree(rec["root"], ignore_errors=True)
         W["sessions"].pop(ev, None)
         rec = None
     if rec is None:
         rec = {"session": None, "root": tempfile.mkdtemp(prefix=f"sess_{ev}_"),
-               "bbox": spec["bbox_basin"], "visits": 0, "last": time.time()}
+               "bbox": spec["bbox_basin"], "cold": spec.get("cold"),
+               "visits": 0, "last": time.time()}
     W["sessions"][ev] = rec        # registered now so _fail_job cleans it up
     n = rec["visits"] + 1
     forcing = os.path.join(rec["root"], f"forcing_{n}")
@@ -321,6 +330,10 @@ def _finish_job():
         manifest["hydro"] = spec.get("hydro") or []
         manifest["status"] = "active"
         manifest["basin"] = spec.get("basin")
+        manifest["huc12s"] = spec.get("huc12s")
+        manifest["domain"] = {**{k: v for k, v in (spec.get("domain") or {}).items()
+                                 if k != "hucs"},
+                              **(manifest.get("domain") or {})}
         from hf_data import eventsim, eventstore
         eventsim._update_archive(out_dir, manifest, log)
         if not manifest.get("archive_frames"):

@@ -2654,10 +2654,11 @@ function enterEventsMode() {
   document.getElementById("q-legend").classList.add("hidden");
   map.setView([39, -98], 5, { animate: false });   // CONUS overview: event pins
   addMsg("<b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
-         "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the basin " +
-         "in 2-D: blue shading is simulated water depth (darker = deeper). Map pins " +
-         "mark every stored event — click one (or the list) to load it; the basin " +
-         "boundary and simulated domain are outlined so you can see the area, and " +
+         "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the whole " +
+         "basin contributing to that gauge in 2-D — the domain is the basin itself, " +
+         "built from HUC12 hydrologic units: blue shading is simulated water depth " +
+         "(darker = deeper). Map pins mark every stored event — click one (or the " +
+         "list) to load it; the basin outline and its HUC12 units are drawn, and " +
          "the right panel shows the trigger gauge's simulated streamflow against " +
          "USGS observations.", "status");
   loadEvents();
@@ -2726,24 +2727,48 @@ function renderEventPins(d) {
   })).addTo(map);
 }
 
-// selected event: trigger-gauge pin, true watershed ring (from the manifest,
-// derived from EF5's catchment mask), and the simulated-domain rectangle
+// selected event: trigger-gauge pin + the SIMULATED DOMAIN, which is the
+// basin itself — the union of HUC12 hydrologic units contributing to the
+// gauge (domain.geojson published with the event: unit boundaries thin,
+// basin outline bold). The manifest's basin ring is the fallback. There is
+// deliberately NO rectangle: the domain is never a box (user directive
+// 2026-08-18).
 function drawEventSite(man) {
   if (evtSiteLayer) { try { map.removeLayer(evtSiteLayer); } catch (_) {} }
   evtSiteLayer = L.layerGroup().addTo(map);
   const gid = (man.trigger && man.trigger.gauge) || man.gauge || "";
-  const bb = man.bbox;                                 // [w, s, e, n]
-  if (Array.isArray(bb) && bb.length === 4) {
-    L.rectangle([[bb[1], bb[0]], [bb[3], bb[2]]],
-      { color: "#9ecbff", weight: 1.2, dashArray: "6 5", fill: false, opacity: 0.7 })
-      .bindTooltip("Simulated domain", { sticky: true }).addTo(evtSiteLayer);
-  }
-  if (Array.isArray(man.basin) && man.basin.length > 3) {
-    L.polygon(man.basin, { color: "#ffd23f", weight: 2, fill: true,
-      fillColor: "#ffd23f", fillOpacity: 0.05, opacity: 0.9 })
-      .bindTooltip(`Basin draining to gauge ${gid}`, { sticky: true })
-      .addTo(evtSiteLayer);
-  }
+  const dom = man.domain || {};
+  const nU = dom.n_units || (man.huc12s && man.huc12s.length) || 0;
+  const areaTxt = dom.area_km2 ? ` · ${Math.round(dom.area_km2).toLocaleString()} km²` : "";
+  const label = nU
+    ? `Simulated domain: basin of gauge ${gid} — ${nU} HUC12 unit${nU > 1 ? "s" : ""}${areaTxt}`
+    : `Simulated domain: basin draining to gauge ${gid}`;
+  const drawRing = () => {
+    if (Array.isArray(man.basin) && man.basin.length > 3) {
+      L.polygon(man.basin, { color: "#ffd23f", weight: 2.2, fill: true,
+        fillColor: "#ffd23f", fillOpacity: 0.04, opacity: 0.95 })
+        .bindTooltip(label, { sticky: true }).addTo(evtSiteLayer);
+    }
+  };
+  if (dom.geojson && man._id) {
+    fetch(`${evtBase}/${man._id}/${dom.geojson}`).then((r) => r.json()).then((gj) => {
+      if (!evtManifest || evtManifest._id !== man._id) return;   // event changed
+      L.geoJSON(gj, {
+        style: () => ({ color: "#ffd23f", weight: 0.8, opacity: 0.55,
+                        fill: true, fillColor: "#ffd23f", fillOpacity: 0.03 }),
+        onEachFeature: (f, lyr) => {
+          const p = f.properties || {};
+          lyr.bindTooltip(`HUC12 ${p.huc12 || ""} ${p.name || ""}` +
+            `${p.area_km2 ? ` · ${p.area_km2} km²` : ""}`, { sticky: true });
+        },
+      }).addTo(evtSiteLayer);
+      if (gj.union) {
+        L.geoJSON({ type: "Feature", geometry: gj.union },
+          { style: () => ({ color: "#ffd23f", weight: 2.4, opacity: 0.95, fill: false }) })
+          .bindTooltip(label, { sticky: true }).addTo(evtSiteLayer);
+      } else drawRing();
+    }).catch(drawRing);
+  } else drawRing();
   const ll = evtLatLon(man);
   if (ll) {
     L.marker(ll).bindTooltip(`Trigger gauge ${gid}`, { direction: "top" })
@@ -2880,10 +2905,20 @@ function renderEvtCtl() {
   ctl.style.cssText = "margin-top:8px;border-top:1px solid #33475e;padding-top:7px";
   const gr = man.grid || {};
   const grTxt = (gr.nx && gr.ny)
-    ? ` · grid ${gr.nx}×${gr.ny} @ ~${Math.round(gr.dx_m || 0)} m` : "";
+    ? ` · ~${Math.round(gr.dx_m || 0)} m cells` : "";
+  // the domain IS the basin: say so in hydrologic units, not grid boxes
+  const dom = man.domain || {};
+  const nU = dom.n_units || (man.huc12s && man.huc12s.length) || 0;
+  const domTxt = nU
+    ? `<div style="opacity:.85">basin domain: ${nU} HUC12 unit${nU > 1 ? "s" : ""}` +
+      `${dom.area_km2 ? ` · ${Math.round(dom.area_km2).toLocaleString()} km²` : ""}` +
+      `${dom.n_active ? ` · ${(dom.n_active / 1e6).toFixed(2)} M cells` : ""}` +
+      `${man.cpu_trimmed ? ` <span style="opacity:.8">(CPU rung: ${man.cpu_trimmed.n_hucs} of ` +
+        `${man.cpu_trimmed.of_n_hucs} units nearest the gauge)</span>` : ""}</div>`
+    : "";
   ctl.innerHTML =
     `<b>${id}</b><br><span style="opacity:.8">depth scale 0–${man.depth_cap_m || 3} m` +
-    `${grTxt}</span><br>` +
+    `${grTxt}</span>${domTxt}<br>` +
     `<button id="evt-max" style="margin:5px 4px 0 0">max depth</button>` +
     (canAnim ? `<span style="opacity:.75">time scroll: use the bar below the map</span>`
       : `<div style="opacity:.75;margin-top:4px">older event — hourly frames ` +

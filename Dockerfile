@@ -11,7 +11,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 # ---- System dependencies (EF5 build + geo stack + report tooling) ----
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt hardening (2026-08-18: HF's builder lost archive.ubuntu.com for an hour
+# — three consecutive BUILD_ERRORs at this step): retries + a second mirror
+# tried before the primary, so one dead host does not fail the build.
+RUN echo 'Acquire::Retries "5"; Acquire::http::Timeout "45";' \
+        > /etc/apt/apt.conf.d/80-retries \
+ && sed -i 's|http://archive.ubuntu.com/ubuntu|http://us.archive.ubuntu.com/ubuntu|g' \
+        /etc/apt/sources.list \
+ && (apt-get update || (sleep 20 && apt-get update)) \
+ && apt-get install -y --no-install-recommends \
     git gcc g++ build-essential make \
     autoconf automake libtool dh-autoreconf autotools-dev pkg-config \
     libgeotiff-dev libtiff-dev zlib1g-dev \
@@ -48,9 +56,12 @@ RUN pip3 install --no-cache-dir --upgrade pip \
 # torch from the CPU wheel index FIRST so crestimap's "torch" dep is already
 # satisfied (PyPI default would pull multi-GB CUDA wheels). The fork is ~2 GB
 # (v1 case data), so clone blobless+sparse: only crestimap/ is materialized.
+# CRESTIMAP_REF pins the fork commit: bump it to deploy a new engine (a bare
+# "origin/v2" checkout sits in a cached layer and silently keeps the old code)
+ARG CRESTIMAP_REF=678cbf17
 RUN pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
  && git clone --filter=blob:none --no-checkout https://github.com/mchen15ouedu/CREST-iMAP.git /opt/crest-imap \
- && git -C /opt/crest-imap checkout origin/v2 -- crestimap \
+ && git -C /opt/crest-imap checkout ${CRESTIMAP_REF} -- crestimap \
  && test -f /opt/crest-imap/crestimap/__init__.py \
  && cp -r /opt/crest-imap/crestimap "$(python3 -c 'import site; print(site.getsitepackages()[0])')/" \
  && rm -rf /opt/crest-imap \
