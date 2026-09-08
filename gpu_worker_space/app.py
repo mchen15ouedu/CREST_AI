@@ -101,11 +101,14 @@ if _tok:
 
 MAX_SESSIONS = int(os.environ.get("ZERO_MAX_SESSIONS", "6"))
 EVICT_IDLE_H = float(os.environ.get("ZERO_EVICT_IDLE_H", "12"))
+# cadence of the server-side tick loop (see _self_drive); matches the old
+# gr.Timer(5) so idle polling behaviour is unchanged
+SELF_TICK_S = float(os.environ.get("ZERO_SELF_TICK_S", "5"))
 
 LOG: list[str] = []
 W = {"phase": "idle", "job": None, "runner": None, "chunk_sim_s": CHUNK0_SIM_S,
      "last_poll": 0.0, "last_hb": 0.0, "queued": "", "workdir": None,
-     "done": set(), "solved": [], "t_wall0": 0.0,
+     "done": set(), "solved": [], "t_wall0": 0.0, "last_tick": 0.0,
      # P1.6 resident sessions: ev -> {"session", "bbox", "visits", "last",
      # "root"}. RAM-only; a Space rebuild recovers via the bundle's
      # init_depth (state-hierarchy level 2).
@@ -479,6 +482,11 @@ def _status():
             "total_h": (round(s.visit["t_end_rel"] / 3600, 1)
                         if s and s.visit else None),
             "chunk_sim_min": round(W["chunk_sim_s"] / 60, 1),
+            # seconds since the server-side loop last completed a tick — the
+            # liveness signal: if this grows without bound the worker is idle
+            # even though the container reads RUNNING (the 2026-08-24 failure)
+            "tick_age_s": (round(time.time() - W["last_tick"], 1)
+                           if W["last_tick"] else None),
             "sessions": {ev: {"visits": r["visits"],
                               "held_at": (r["session"].state_time()
                                           .strftime("%m-%d %H:%MZ")
@@ -498,7 +506,43 @@ def _keep_awake():
             pass
 
 
+def _self_drive():
+    """Server-side tick loop — the worker's actual engine.
+
+    gr.Timer is a FRONTEND timer: it only fires while a browser session has
+    the Space open, and demo.load only fires on a page load. _keep_awake's
+    plain GET keeps the container off sleep but opens no Gradio session, so
+    with nobody watching this worker sat RUNNING and completely idle — found
+    2026-08-24: 59 min of silence between boot and the first externally
+    triggered /tick, and every past ZeroGPU solve coincided with someone
+    polling it. The fleet/ungauged workers self-drive with a plain thread;
+    this brings the GPU worker in line.
+
+    The tick is driven through the Space's own /tick API over localhost
+    rather than by calling tick() inline, so the state machine advances on
+    exactly the request path it was built for (queue single-flight, and the
+    @spaces.GPU allocation happens inside a normal Gradio request)."""
+    from gradio_client import Client
+    base = f"http://127.0.0.1:{os.environ.get('GRADIO_SERVER_PORT', '7860')}"
+    client = None
+    while True:
+        try:
+            if client is None:
+                client = Client(base, verbose=False)
+                log("self-drive: local tick loop connected "
+                    f"({SELF_TICK_S:.0f} s cadence)")
+            client.predict(api_name="/tick")     # blocks for the GPU chunk
+            W["last_tick"] = time.time()
+        except Exception as e:                    # server still booting, etc.
+            client = None
+            log(f"self-drive: {type(e).__name__} — retrying")
+            time.sleep(15)
+            continue
+        time.sleep(SELF_TICK_S)
+
+
 threading.Thread(target=_keep_awake, daemon=True).start()
+threading.Thread(target=_self_drive, daemon=True).start()
 log(f"boot: {IDENT} publish={PUBLISH} zero={HAS_ZERO} "
     f"delay={ZERO_DELAY_S:.0f}s budget={MAX_CELLS / 1e6:.1f}M cells")
 

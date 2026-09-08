@@ -83,6 +83,18 @@ def _load_profile(username: str) -> dict:
         return {}
 
 
+# ---- admin role: HF usernames allowed to browse the FULL result archive -----
+# (user directive 2026-09-08: the owner's Hugging Face account only, for now;
+# widen with the ADMIN_USERS Space variable, comma-separated usernames)
+ADMIN_USERS = {u.strip().lower() for u in
+               os.environ.get("ADMIN_USERS", "vincewin").split(",") if u.strip()}
+
+
+def _is_admin(request: Request) -> bool:
+    u = request.session.get("user") or {}
+    return bool(u.get("username")) and u["username"].lower() in ADMIN_USERS
+
+
 @app.middleware("http")
 async def _error_recorder(request: Request, call_next):
     """Error watchdog: every unhandled server error is recorded with context."""
@@ -285,8 +297,9 @@ def logout(request: Request):
 def api_me(request: Request):
     u = request.session.get("user")
     if not u:
-        return {"user": None, "oauth": _oauth is not None}
-    return {"user": u, "profile": _load_profile(u["username"]), "oauth": _oauth is not None}
+        return {"user": None, "oauth": _oauth is not None, "admin": False}
+    return {"user": u, "profile": _load_profile(u["username"]), "oauth": _oauth is not None,
+            "admin": _is_admin(request)}
 
 
 class ProfileUpdate(BaseModel):
@@ -714,6 +727,32 @@ def api_events(full: int = 0):
             "runner": runner,
             "base": (f"https://huggingface.co/datasets/{eventstore.REPO}/"
                      f"resolve/main/{eventstore.PREFIX}")}
+
+
+@app.get("/api/admin/archive")
+def api_admin_archive(request: Request, refresh: int = 0):
+    """Admin only: every stored 2-D inundation result — the listed events plus
+    those that rolled off the public list (results kept RESULTS_MAX_AGE_D)."""
+    if not _is_admin(request):
+        return JSONResponse({"error": "admin only"}, status_code=403)
+    from hf_data import eventstore
+    return eventstore.archive_index(force=bool(refresh))
+
+
+@app.get("/api/riskprobe/{event_id}")
+def api_riskprobe(event_id: str, lat: float, lon: float, t: str = ""):
+    """Risk-view lens probe: per-PIXEL depth/speed/flow-direction, DEFRA
+    hazard class, WorldPop 2026-2030 population, and OSM infrastructure
+    values for the solver cell at (lat, lon) of a published event. `t`
+    (frame timestamp from the manifest) reads that frame's depth; default
+    is the episode max. Returns the pixel's footprint for the highlight."""
+    from hf_data import riskprobe
+    try:
+        return riskprobe.probe(event_id, lat, lon, t)
+    except Exception as e:
+        crashlog.capture("riskprobe", e, event=event_id)
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"},
+                            status_code=500)
 
 
 @app.get("/api/health")

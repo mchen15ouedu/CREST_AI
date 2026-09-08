@@ -58,7 +58,7 @@ RUN pip3 install --no-cache-dir --upgrade pip \
 # (v1 case data), so clone blobless+sparse: only crestimap/ is materialized.
 # CRESTIMAP_REF pins the fork commit: bump it to deploy a new engine (a bare
 # "origin/v2" checkout sits in a cached layer and silently keeps the old code)
-ARG CRESTIMAP_REF=678cbf17
+ARG CRESTIMAP_REF=e8652781
 RUN pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
  && git clone --filter=blob:none --no-checkout https://github.com/mchen15ouedu/CREST-iMAP.git /opt/crest-imap \
  && git -C /opt/crest-imap checkout ${CRESTIMAP_REF} -- crestimap \

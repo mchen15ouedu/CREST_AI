@@ -10,6 +10,11 @@ Storage discipline (HF limits):
     event is ~10-30 MB. KEEP_EVENTS caps steady-state usage (< ~1 GB).
   * No DEM/forcing archive: DEM comes from public 3DEP on demand; runoff
     grids are reproducible from the MRMS archive already in CREST_data.
+  * Animation cleanup (monthly): while an event is on the list it stays fully
+    animatable; when it rolls off (KEEP_EVENTS / MAX_AGE_D) only its animation
+    files (depth_* frames + archive.parquet) are cleared, and the simulation
+    RESULTS (manifest + max-depth map + final product + DEM) stay in the store
+    as a lightweight archive until RESULTS_MAX_AGE_D.
 """
 from __future__ import annotations
 
@@ -17,19 +22,48 @@ import datetime
 import io
 import json
 import os
+import re
 import threading
+import time
 
 REPO = os.environ.get("CREST_DATA_REPO", "vincewin/CREST_data")
 PREFIX = "events"
 # tiered retention: newest KEEP_FULL events keep their full frame stacks;
 # older ones are demoted to manifest + maxdepth (tif+png) only; beyond
-# KEEP_EVENTS the folder is deleted. ~8 x 35 MB + 32 x ~1.5 MB < 350 MB.
-# Independently of the count caps, MAX_AGE_D bounds how long the event LIST
-# grows: events older than this are removed entirely (folder + index entry)
-# by the hourly retention_sweep, so the panel stays a rolling ~month.
-KEEP_FULL = int(os.environ.get("EVENT_KEEP_FULL", "8"))
+# KEEP_EVENTS the folder is deleted. Independently of the count caps,
+# MAX_AGE_D bounds how long the event LIST grows: events older than this are
+# removed entirely (folder + index entry) by the hourly retention_sweep, so
+# the panel stays a rolling ~month.
+# KEEP_FULL defaults to KEEP_EVENTS (user directive 2026-08-21): every event
+# still on the list keeps its depth frames, so the time scrubber works for
+# ALL of them. Demotion at 8 was silently deleting the frames of ended
+# episodes within hours (active events re-publish each tick and bounce to the
+# front, pushing ended re-run episodes past position 8), leaving them
+# max-depth-only with no scrubber. ~40 full events ~= 1-1.4 GB on the HF
+# dataset, well within limits. Set EVENT_KEEP_FULL below EVENT_KEEP to
+# re-enable demotion of the oldest listed events if storage ever needs it.
 KEEP_EVENTS = int(os.environ.get("EVENT_KEEP", "40"))
+KEEP_FULL = int(os.environ.get("EVENT_KEEP_FULL", str(KEEP_EVENTS)))
 MAX_AGE_D = float(os.environ.get("EVENT_MAX_AGE_D", "30"))
+# when an event rolls OFF the list (count cap or MAX_AGE_D age), we clear only
+# its ANIMATION files and KEEP the simulation results (manifest + max-depth map
+# + final product + DEM) in the store — a monthly animation cleanup that leaves
+# a permanent lightweight result archive (user directive 2026-08-21). The kept
+# results are ~1.5 MB/event; RESULTS_MAX_AGE_D is the far horizon past which
+# even the result is removed entirely, so the archive can't grow without bound.
+RESULTS_MAX_AGE_D = float(os.environ.get("EVENT_RESULTS_MAX_AGE_D", "365"))
+# animation = the scrubbable per-frame depth grids + the compact frame archive;
+# everything else in an event folder is the "simulation result" we keep
+_ANIM_RE = re.compile(r"^(?:depth_\d+\.(?:png|tif)|archive\.parquet)$")
+
+
+def _anim_delete_ops(allfiles, ev):
+    """Delete ops for just the animation files of event `ev` (keeps manifest,
+    maxdepth.*, final.json, dem.tif, domain.geojson)."""
+    from huggingface_hub import CommitOperationDelete
+    pre = f"{PREFIX}/{ev}/"
+    return [CommitOperationDelete(f) for f in allfiles
+            if f.startswith(pre) and _ANIM_RE.match(os.path.basename(f))]
 
 _lock = threading.Lock()
 
@@ -150,26 +184,30 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
             p = os.path.join(local_dir, fn)
             if os.path.isfile(p):
                 ops.append(CommitOperationAdd(f"{PREFIX}/{ev}/{fn}", p))
-        # demote events beyond KEEP_FULL: drop the frame stacks, keep
-        # manifest + maxdepth + dem (validation/archive tier)
+        # demote events beyond KEEP_FULL (default = KEEP_EVENTS, so normally
+        # none): strip the animation, keep the results, stay listed.
         demote = [d for d in list(idx.keys())[KEEP_FULL:]
                   if not idx[d].get("demoted")]
-        if demote:
+        # events leaving the list (count cap or aged out): keep their
+        # simulation RESULTS, clear only the animation files — unless they are
+        # older than RESULTS_MAX_AGE_D, then remove the result too.
+        strip = [d for d in drop if (_age_days(d) or 0.0) <= RESULTS_MAX_AGE_D]
+        purge = [d for d in drop if d not in strip]
+        allfiles = []
+        if demote or strip:
             try:
                 allfiles = api.list_repo_files(REPO, repo_type="dataset")
             except Exception:
-                allfiles, demote = [], []
-            for d in demote:
-                for f in allfiles:
-                    base = os.path.basename(f)
-                    if (f.startswith(f"{PREFIX}/{d}/")
-                            and base.startswith("depth_")):
-                        ops.append(CommitOperationDelete(f))
-                idx[d]["demoted"] = True
+                allfiles, demote, strip = [], [], []   # leave folders for the sweep
+        for d in demote:
+            ops += _anim_delete_ops(allfiles, d)
+            idx[d]["demoted"] = True
+        for d in strip:
+            ops += _anim_delete_ops(allfiles, d)        # keep results, drop anim
         ops.append(CommitOperationAdd(
             f"{PREFIX}/index.json",
             io.BytesIO(json.dumps(idx).encode())))
-        for d in drop:
+        for d in purge:
             ops.append(CommitOperationDelete(f"{PREFIX}/{d}/", is_folder=True))
         try:
             api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
@@ -378,30 +416,54 @@ def finalize_episodes(event_ids, log=print) -> int:
 
 
 def retention_sweep() -> int:
-    """Remove events older than EVENT_MAX_AGE_D (folder + index entry) in one
-    commit. Called from the hourly tick so the list ages out even during
-    quiet stretches with no new events; almost always a no-op. Returns the
-    number of events removed (0 on no-op or failure)."""
+    """Hourly retention: events past EVENT_MAX_AGE_D roll OFF the list, keeping
+    their simulation results (only the animation files are cleared); result
+    folders past EVENT_RESULTS_MAX_AGE_D are removed entirely. One commit,
+    almost always a no-op. Returns the number of events touched.
+
+    Runs even during quiet stretches so the list ages out with no new events;
+    it is also what clears the animations of events that left the list without
+    a subsequent publish_event to do it (the store keeps the result folder)."""
     from huggingface_hub import CommitOperationAdd, CommitOperationDelete
     api = _api()
     if api is None:
         return 0
     with _lock:
         idx = load_index()
-        aged = _aged_out(idx)
-        if not aged:
-            return 0
-        for e in aged:
+        aged = _aged_out(idx)                       # leaving the list this pass
+        try:
+            allfiles = api.list_repo_files(REPO, repo_type="dataset")
+        except Exception:
+            allfiles = []
+        # event ids with a result folder in the store but no longer listed
+        stored = {f.split("/")[1] for f in allfiles
+                  if f.startswith(f"{PREFIX}/") and f.count("/") >= 2}
+        orphans = stored - set(idx.keys()) - set(aged)
+
+        ops, stripped, purged = [], 0, 0
+        for e in aged:                              # keep result, clear animation
             idx.pop(e, None)
-        ops = [CommitOperationDelete(f"{PREFIX}/{e}/", is_folder=True)
-               for e in aged]
+            new = _anim_delete_ops(allfiles, e)
+            ops += new
+            stripped += bool(new)
+        for e in orphans:                           # already off-list archives
+            if (_age_days(e) or 0.0) > RESULTS_MAX_AGE_D:
+                ops.append(CommitOperationDelete(f"{PREFIX}/{e}/", is_folder=True))
+                purged += 1
+            else:
+                extra = _anim_delete_ops(allfiles, e)   # clear any stray animation
+                ops += extra
+                stripped += bool(extra)
+        if not ops:
+            return 0
         ops.append(CommitOperationAdd(f"{PREFIX}/index.json",
                                       io.BytesIO(json.dumps(idx).encode())))
         try:
             api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
-                              commit_message=f"retention: -{len(aged)} events "
-                                             f"older than {MAX_AGE_D:g} d")
-            return len(aged)
+                              commit_message=f"retention: {stripped} animation(s) "
+                                             f"cleared (results kept), {purged} "
+                                             f"result(s) purged > {RESULTS_MAX_AGE_D:g} d")
+            return stripped + purged
         except Exception:
             return 0
 
@@ -409,3 +471,96 @@ def retention_sweep() -> int:
 def event_url(event_id: str, filename: str) -> str:
     return (f"https://huggingface.co/datasets/{REPO}/resolve/main/"
             f"{PREFIX}/{event_id}/{filename}")
+
+
+# ---- admin archive: EVERY stored result folder, listed or not ---------------
+# The public list is a rolling ~month (KEEP_EVENTS / MAX_AGE_D); the store keeps
+# each result for RESULTS_MAX_AGE_D with only the animation cleared. The owner
+# reaches those through /api/admin/archive (user directive 2026-09-08).
+_ARCH_TTL_S = float(os.environ.get("EVENT_ARCHIVE_TTL_S", "600"))
+_arch = {"built": 0.0, "building": False, "events": {}, "error": None}
+_arch_lock = threading.Lock()
+_ANIM_FILE = re.compile(r"^depth_\d+\.(?:png|tif)$")
+
+
+def _arch_summary(ev: str, m: dict, files: list, listed: dict | None) -> dict:
+    tr = m.get("trigger") or {}
+    dom = m.get("domain") or {}
+    pv = m.get("provenance") or {}
+    fin = m.get("final") or (listed or {}).get("final")
+    frames_stored = sum(1 for f in files if _ANIM_FILE.match(f) and f.endswith(".png"))
+    return {
+        "id": ev, "listed": listed is not None,
+        "gauge": tr.get("gauge") or m.get("gauge"), "gauge_name": tr.get("name"),
+        "lat": tr.get("lat"), "lon": tr.get("lon"),
+        "t0": m.get("t0"), "sim_start": m.get("sim_start"), "t_end": m.get("t_end"),
+        "generated": m.get("generated"), "status": m.get("status"),
+        "model": m.get("model"),
+        "engine": pv.get("engine") or (listed or {}).get("engine"),
+        "crestimap": pv.get("crestimap"),
+        "area_km2": dom.get("area_km2"),
+        "n_hucs": dom.get("n_hucs") or len(m.get("huc12s") or []),
+        "depth_cap_m": m.get("depth_cap_m"), "bounds": m.get("bounds"),
+        "n_frames_manifest": len(m.get("frames") or []),
+        "frames_stored": frames_stored,
+        "has_flux": bool(m.get("maxspeed")),
+        "has_maxdepth": (m.get("maxdepth_png") or "maxdepth.png") in files,
+        "peak_depth_m": fin.get("peak_depth_m") if isinstance(fin, dict) else None,
+        # result files present (animation excluded) -> the UI offers downloads
+        "files": sorted(f for f in files
+                        if not _ANIM_FILE.match(f) and f != "archive.parquet"),
+    }
+
+
+def _arch_build():
+    from concurrent.futures import ThreadPoolExecutor
+    from huggingface_hub import HfApi, hf_hub_download
+    tok = os.environ.get("HF_TOKEN")
+    try:
+        allfiles = HfApi(token=tok).list_repo_files(REPO, repo_type="dataset")
+        idx = load_index()
+        per: dict = {}
+        for f in allfiles:
+            if f.startswith(f"{PREFIX}/") and f.count("/") >= 2:
+                ev, name = f.split("/", 2)[1:]
+                per.setdefault(ev, []).append(name)
+
+        def one(ev):
+            try:                      # HF-cached: re-downloaded only on change
+                p = hf_hub_download(REPO, f"{PREFIX}/{ev}/manifest.json",
+                                    repo_type="dataset", token=tok)
+                with open(p, encoding="utf-8") as fp:
+                    m = json.load(fp)
+            except Exception:
+                m = {}
+            return ev, _arch_summary(ev, m, per[ev], idx.get(ev))
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            out = dict(ex.map(one, sorted(per)))
+        with _arch_lock:
+            _arch.update(events=out, built=time.time(), error=None)
+    except Exception as e:
+        with _arch_lock:
+            _arch["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        with _arch_lock:
+            _arch["building"] = False
+
+
+def archive_index(force: bool = False) -> dict:
+    """Admin view of every result folder in the store. Returns the current
+    snapshot immediately; a stale or missing snapshot refreshes in the
+    background (the caller polls while "building")."""
+    with _arch_lock:
+        stale = force or (time.time() - _arch["built"]) > _ARCH_TTL_S
+        if stale and not _arch["building"]:
+            _arch["building"] = True
+            threading.Thread(target=_arch_build, daemon=True).start()
+        evs = sorted(_arch["events"].values(),
+                     key=lambda s: s.get("t0") or "", reverse=True)
+        return {"events": evs, "n": len(evs),
+                "n_listed": sum(1 for e in evs if e["listed"]),
+                "building": _arch["building"], "built": _arch["built"],
+                "error": _arch["error"], "results_max_age_d": RESULTS_MAX_AGE_D,
+                "base": (f"https://huggingface.co/datasets/{REPO}/resolve/main/"
+                         f"{PREFIX}")}

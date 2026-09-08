@@ -1623,6 +1623,14 @@ async function initAuth() {
     const pic = d.user.picture ? `<img src="${d.user.picture}" alt="">` : "👤";
     el.innerHTML = `<button class="tb-btn" id="auth-btn">${pic} ${escapeHtml(d.user.name || d.user.username)}</button>`;
     document.getElementById("auth-btn").onclick = () => openProfile(d);
+    if (d.admin) {                    // owner account: the full result archive
+      const b = document.createElement("button");
+      b.className = "tb-btn"; b.id = "admin-btn";
+      b.title = "Admin — every stored 2-D inundation result (listed + rolled-off)";
+      b.textContent = "🗄 Archive";
+      b.onclick = openArchive;
+      el.prepend(b);
+    }
     userSignedIn = true;
     loadFavorites();                  // registered-user benefit: focused basins
     zoomToUserLocation();             // registered-user benefit: open at home
@@ -2667,6 +2675,7 @@ function enterEventsMode() {
 function leaveEventsMode() {
   if (!eventsMode) return;
   stopEvtPlay();
+  if (window.RiskView && RiskView.isOpen()) RiskView.close();
   eventsMode = false;
   document.getElementById("mode-evt").classList.remove("on");
   evtReleaseAnimBar();
@@ -2920,6 +2929,7 @@ function renderEvtCtl() {
     `<b>${id}</b><br><span style="opacity:.8">depth scale 0–${man.depth_cap_m || 3} m` +
     `${grTxt}</span>${domTxt}<br>` +
     `<button id="evt-max" style="margin:5px 4px 0 0">max depth</button>` +
+    `<button id="evt-risk" style="margin:5px 4px 0 0">🎯 risk view</button>` +
     (canAnim ? `<span style="opacity:.75">time scroll: use the bar below the map</span>`
       : `<div style="opacity:.75;margin-top:4px">older event — hourly frames ` +
         `pruned by retention; showing the maximum-depth footprint</div>`);
@@ -2932,11 +2942,30 @@ function renderEvtCtl() {
   }
   const mx = document.getElementById("evt-max");
   if (mx) mx.onclick = () => showEvtFrame(-1);
+  const rk = document.getElementById("evt-risk");
+  if (rk) {
+    const on = window.RiskView && RiskView.isOpen();
+    rk.style.background = on ? "#3a6ea5" : "";
+    rk.onclick = () => {
+      if (!window.RiskView) return;
+      if (RiskView.isOpen()) { RiskView.close(); rk.style.background = ""; return; }
+      rk.style.background = "#3a6ea5";
+      RiskView.open(map, id, { depthCap: man.depth_cap_m || 3,
+                               frameT: evtFrameIdx >= 0 && man.frames[evtFrameIdx]
+                                 ? man.frames[evtFrameIdx].t : "" });
+      addMsg("🎯 <b>Risk view</b> — pan the map: the pixel under the lens center " +
+        "lights up and its values fill the three arms (inundation depth/speed/" +
+        "direction, WorldPop population in that cell, OSM infrastructure). " +
+        "The balloon's color is the DEFRA hazard class from depth × velocity.",
+        "status");
+    };
+  }
   showDepthLegend(man);
 }
 
 async function selectEvent(id, summary) {
   stopEvtPlay();
+  if (window.RiskView && RiskView.isOpen()) RiskView.close();
   let man = null;
   try { man = await (await fetch(`${evtBase}/${id}/manifest.json`)).json(); }
   catch (_) { addMsg("⚠️ Couldn't load that event's manifest.", "status"); return; }
@@ -3033,6 +3062,9 @@ function showEvtFrame(i) {
   const lab = document.getElementById("anim-time");
   if (lab && eventsMode) {
     lab.textContent = i < 0 ? "max depth" : man.frames[i].t.slice(5, 16).replace("T", " ");
+  }
+  if (window.RiskView && RiskView.isOpen()) {
+    RiskView.setFrame(i >= 0 && man.frames[i] ? man.frames[i].t : "");
   }
   const sl = document.getElementById("anim-slider");
   if (sl && eventsMode && i >= 0) sl.value = String(i);
@@ -3206,3 +3238,91 @@ document.getElementById("mode-now").onclick = () => {
   if (!nowcastMode) setMode(true);
   else document.getElementById("mode-now").classList.add("on");
 };
+
+// ---- admin: the FULL result archive (every stored event, listed or not) ----
+// Only the owner's HF account is admin (ADMIN_USERS on the Space). The public
+// event list is a rolling ~month; the store keeps every result for a year with
+// just the hourly animation cleared — this table is how those are reached.
+let arData = null;
+let arPoll = null;
+
+function openArchive() {
+  document.getElementById("archive-modal").classList.remove("hidden");
+  loadArchive(false);
+}
+
+function closeArchive() {
+  document.getElementById("archive-modal").classList.add("hidden");
+  if (arPoll) { clearTimeout(arPoll); arPoll = null; }
+}
+
+async function loadArchive(refresh) {
+  const note = document.getElementById("ar-note");
+  try {
+    const r = await fetch(`/api/admin/archive${refresh ? "?refresh=1" : ""}`);
+    if (r.status === 403) { note.textContent = "admin only — sign in with the owner account"; return; }
+    arData = await r.json();
+  } catch (_) { note.textContent = "couldn't reach the archive"; return; }
+  renderArchive();
+  if (arPoll) clearTimeout(arPoll);
+  arPoll = null;
+  if (arData.building) {              // first scan / re-scan runs server-side
+    note.textContent = arData.n ? "re-scanning the store…" : "scanning the result store…";
+    arPoll = setTimeout(() => loadArchive(false), 3000);
+  } else {
+    note.textContent = arData.error ? `scan error: ${arData.error}`
+      : (arData.built ? `scanned ${new Date(arData.built * 1000).toISOString().slice(11, 16)} UTC` : "");
+  }
+}
+
+function renderArchive() {
+  if (!arData) return;
+  const q = (document.getElementById("ar-filter").value || "").toLowerCase().trim();
+  const rows = (arData.events || []).filter((e) => !q ||
+    [e.id, e.gauge, e.gauge_name, e.model, e.engine].join(" ").toLowerCase().includes(q));
+  document.getElementById("ar-count").textContent =
+    `${arData.n} stored · ${arData.n_listed} listed · ${arData.n - arData.n_listed} archive-only`;
+  const eng = (s) => !s ? "–" : s.startsWith("hpc") ? "HPC" : s.startsWith("zerogpu") ? "ZeroGPU" : s;
+  const tb = document.getElementById("ar-rows");
+  if (!rows.length) {
+    tb.innerHTML = `<tr><td colspan="9"><i class="pm-sub">${arData.building ? "scanning…" : "no matching results"}</i></td></tr>`;
+    return;
+  }
+  tb.innerHTML = rows.map((e, i) => {
+    const files = (e.files || []).map((f) =>
+      `<a href="${arData.base}/${e.id}/${f}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${f}</a>`).join("");
+    const fr = (e.frames_stored ? `<span class="ar-badge ok">${e.frames_stored} frames</span>`
+      : `<span class="ar-badge dim">results only</span>`) +
+      (e.has_maxdepth ? "" : ` <span class="ar-badge dim" title="the store has no max-depth map for this event">no max-depth map</span>`);
+    return `<tr data-i="${i}"><td>${(e.t0 || "").replace("T", " ").replace("Z", "").slice(0, 16)}</td>` +
+      `<td>${escapeHtml(e.gauge || "")}${e.gauge_name ? ` <span class="pm-sub">${escapeHtml(e.gauge_name)}</span>` : ""}</td>` +
+      `<td>${escapeHtml(e.model || "")}</td>` +
+      `<td title="${escapeHtml(e.engine || "")}${e.crestimap ? " · CREST-iMAP " + escapeHtml(String(e.crestimap).slice(0, 8)) : ""}">` +
+        `${eng(e.engine)}${e.has_flux ? " ⚡" : ""}</td>` +
+      `<td>${e.area_km2 ? Math.round(e.area_km2).toLocaleString() + " km²" : "–"}${e.n_hucs ? ` · ${e.n_hucs} HUC12` : ""}</td>` +
+      `<td>${e.peak_depth_m != null ? (+e.peak_depth_m).toFixed(1) + " m" : "–"}</td>` +
+      `<td>${fr}</td><td>${e.listed ? "✓" : `<span class="pm-sub">off</span>`}</td><td>${files}</td></tr>`;
+  }).join("");
+  tb.querySelectorAll("tr[data-i]").forEach((tr) => {
+    tr.onclick = () => openArchivedEvent(rows[+tr.dataset.i]);
+  });
+}
+
+// open any stored result on the map — the public list only knows the listed
+// events, so this drives the events-mode viewer directly from the archive row
+async function openArchivedEvent(e) {
+  closeArchive();
+  if (!eventsMode) enterEventsMode();           // loadEvents() re-renders the
+  if (!evtBase) evtBase = arData.base;          // controls once the panel is up
+  const partial = e.frames_stored === 0 || e.frames_stored < e.n_frames_manifest;
+  await selectEvent(e.id, { demoted: partial, final: null });
+  if (!e.listed) {
+    addMsg(`🗄 <b>${e.id}</b> is an archived result (off the public list): ` +
+      `max-depth footprint and file downloads only.`, "status");
+  }
+}
+
+document.getElementById("ar-close").onclick = closeArchive;
+document.getElementById("ar-refresh").onclick = () => loadArchive(true);
+document.getElementById("ar-filter").oninput = renderArchive;
+document.getElementById("archive-modal").onclick = (ev) => { if (ev.target.id === "archive-modal") closeArchive(); };

@@ -347,3 +347,46 @@ body.font-xl #depth-legend { zoom: 1.4; }
   60%  { transform: translateY(2px); }
   100% { transform: translateY(0); }
 }
+
+
+/* ---- risk view (three-armed risk lens; adapted from map_visual) ------- */
+#riskview { position: absolute; inset: 0; z-index: 720; pointer-events: none;
+  display: flex; align-items: center; justify-content: center; }
+#riskview svg { overflow: visible; }
+.rv-balloon { fill: rgba(58,110,165,.18); stroke: #6b7f94; stroke-width: 3;
+  transition: stroke .3s, fill .3s; }
+.rv-haz-class { font: 700 20px system-ui, sans-serif; text-anchor: middle;
+  fill: #cfe0ee; }
+.rv-haz-val { font: 12px system-ui, sans-serif; text-anchor: middle; fill: #cfe0ee; }
+.rv-haz-basis { font: 10px system-ui, sans-serif; text-anchor: middle; fill: #8aa2ba; }
+.rv-axis { stroke: rgba(207,224,238,.5); stroke-width: 1.4; }
+.rv-caption { font: 600 15px system-ui, sans-serif; fill: #dfe9f5;
+  paint-order: stroke; stroke: rgba(10,15,22,.75); stroke-width: 3px; }
+.rv-slot-label { font: 10.5px system-ui, sans-serif; fill: #9fc4e8; text-anchor: middle;
+  paint-order: stroke; stroke: rgba(10,15,22,.8); stroke-width: 3px; }
+.rv-val { font: 11px system-ui, sans-serif; fill: #dfe9f5;
+  paint-order: stroke; stroke: rgba(10,15,22,.8); stroke-width: 3px; }
+.rv-note { font: italic 11px system-ui, sans-serif; fill: #ffd23f; text-anchor: middle;
+  paint-order: stroke; stroke: rgba(10,15,22,.8); stroke-width: 3px; }
+.rv-mf { font: 10px system-ui, sans-serif; fill: #8aa2ba; }
+.rv-bar { stroke: #4cc9a0; stroke-width: 12; stroke-linecap: round; }
+.rv-bar-male { stroke: #3a86ff; stroke-width: 12; stroke-linecap: round; }
+.rv-bar-female { stroke: #ef476f; stroke-width: 12; stroke-linecap: round; }
+.rv-compass-ring { fill: rgba(17,23,31,.8); stroke: #9fc4e8; stroke-width: 1.5; }
+.rv-compass-arrow { fill: #ffd23f; }
+
+/* ---- admin archive (every stored 2-D result) ---- */
+.modal-card.archive-card { width: min(1180px, 96vw); }
+.ar-tools { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
+.ar-tools input { flex: 1; padding: 6px 8px; background: #0d141c; color: #dfe9f5; border: 1px solid #33475e; border-radius: 6px; }
+.ar-wrap { overflow: auto; max-height: 62vh; border: 1px solid #33475e; border-radius: 8px; }
+.ar-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.ar-table th { position: sticky; top: 0; background: #1a2433; color: #7fd4b0; text-align: left; padding: 6px 8px; font-weight: 600; }
+.ar-table td { padding: 5px 8px; border-top: 1px solid #22303f; white-space: nowrap; }
+.ar-table tbody tr { cursor: pointer; }
+.ar-table tbody tr:hover { background: #1c2a3a; }
+.ar-badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 11px; background: #23364a; color: #9fc5e8; }
+.ar-badge.ok { background: #1f4b3a; color: #9fdcc0; }
+.ar-badge.dim { background: #2a2f36; color: #97a4b3; }
+.ar-table a { color: #7db8ff; text-decoration: none; margin-right: 6px; }
+.ar-table a:hover { text-decoration: underline; }
