@@ -37,12 +37,24 @@ REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")
 FEEDS = {
     "mrms": ("MRMS Pass2", float(os.environ.get("HEALTH_PASS2_MAX_D", "14"))),
     "pet": ("PET", float(os.environ.get("HEALTH_PET_MAX_D", "14"))),
-    "temp": ("TEMP", float(os.environ.get("HEALTH_TEMP_MAX_D", "30"))),
+    "temp": ("TEMP", float(os.environ.get("HEALTH_TEMP_MAX_D", "45"))),
 }
 # months of archive lag tolerated before coverage itself is called stale: the
 # current month's tar may legitimately not exist yet on day 1, so one month
 # behind is normal and two is a gap.
 MONTHS_MAX = int(os.environ.get("HEALTH_FORCING_MONTHS_MAX", "1"))
+# ...except TEMP, whose source publishes far later than the others. NOAA PSL
+# mirrors NARR one yearly file at a time: seen 2026-09-09 the 2026 file was
+# written 2026-08-24 and still ended 2026-07-31 21z, i.e. ~3.5 weeks of publish
+# lag on top of monthly-ish writes. Early in a month that leaves the newest
+# temp tar two months back with the store PERFECTLY caught up to its source,
+# which the shared limits reported as STALE every hour. Three months back is
+# still a real gap. Same reason the write-age above is 45 d: our updater
+# commits nothing when the source added nothing, so a healthy TEMP feed can sit
+# a month between commits. A genuinely stalled temp updater is caught by the
+# updater Space instead (UPDATER_HEAL_TEMP_D), which re-runs the feed and whose
+# log distinguishes "NARR has no data for them yet" from a failure.
+MONTHS_MAX_BY_VAR = {"temp": int(os.environ.get("HEALTH_TEMP_MONTHS_MAX", "2"))}
 TTL_S = float(os.environ.get("HEALTH_FORCING_TTL_S", "1800"))
 
 _lock = threading.Lock()
@@ -56,6 +68,7 @@ def _months_between(a: tuple[int, int], b: tuple[int, int]) -> int:
 def _check(api, var: str, now: datetime.datetime) -> dict:
     """Newest month tar for one feed + the commit that wrote it."""
     label, max_d = FEEDS[var]
+    months_max = MONTHS_MAX_BY_VAR.get(var, MONTHS_MAX)
     year = now.year
     rows = []
     for y in (year, year - 1):                 # January: last year's dir wins
@@ -89,9 +102,10 @@ def _check(api, var: str, now: datetime.datetime) -> dict:
                         if written is not None else None),
             "updated_age_d": age_d,
             "max_age_d": max_d,
+            "max_months_behind": months_max,
             # unknown write date is not proof of trouble (an old client may not
             # expand commits) — coverage still decides in that case
-            "ok": (age_d is None or age_d <= max_d) and behind <= MONTHS_MAX}
+            "ok": (age_d is None or age_d <= max_d) and behind <= months_max}
 
 
 def snapshot() -> dict:
