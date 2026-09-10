@@ -11,6 +11,9 @@ Checks:
   mrms      newest radar animation frame age          (< 3 h)
   forcing   MRMS Pass2 / PET / TEMP archive age       (weekly updater)
   tick      last hourly event tick on THIS process    (< 2 h)
+            (restart-aware: a container younger than the
+             threshold reports "warming", not STALE, and a
+             fresh event publish counts as proof it ran)
   queue     depth, oldest NEVER-PUBLISHED bundle age  (< 6 h unclaimed)
   workers   freshest claim heartbeat anywhere         (informational)
   events    active episodes, publishes in last 24 h   (informational)
@@ -37,6 +40,11 @@ UNCLAIMED_MAX_H = float(os.environ.get("HEALTH_UNCLAIMED_MAX_H", "6"))
 
 _cache = {"t": 0.0, "snap": None}
 _lock = threading.Lock()
+# tick liveness lives in eventsim's process memory, so a Space that
+# slept and cold-started reports last_tick=None even though the
+# hourly ping is arriving fine (seen 2026-09-10). Uptime tells
+# "no ping YET" from "no ping AT ALL".
+_PROC_START = time.time()
 
 
 def _age_h(ts: str, fmt: str) -> float | None:
@@ -53,6 +61,20 @@ def _oldest_queued(rows) -> float | None:
             for r in rows]
     ages = [a for a in ages if a is not None]
     return max(ages) if ages else None
+
+
+def _newest_publish_h() -> float | None:
+    """Age of the freshest event publish [h] — the only tick evidence that
+    OUTLIVES a container restart, since the tick stamps `generated` on every
+    episode it re-simulates. None when the index is empty or unreadable."""
+    try:
+        from . import eventstore
+        ages = [_age_h(s.get("generated") or "", "%Y-%m-%dT%H:%M:%SZ")
+                for s in eventstore.load_index().values()]
+        ages = [a for a in ages if a is not None]
+        return min(ages) if ages else None
+    except Exception:
+        return None
 
 
 def snapshot() -> dict:
@@ -117,12 +139,29 @@ def snapshot() -> dict:
             lt = eventsim._running.get("last_tick")
             age = _age_h(lt or "", "%Y-%m-%dT%H:%M:%SZ")
             busy = eventsim._busy_h()
-            out["tick"] = {"last": lt, "age_h": age,
-                           "running": eventsim._running.get("id"),
-                           "busy_h": busy,
-                           "wedged": busy is not None and busy > WEDGE_MAX_H,
-                           "ok": age is not None and age <= TICK_MAX_H
-                           and not (busy is not None and busy > WEDGE_MAX_H)}
+            wedged = busy is not None and busy > WEDGE_MAX_H
+            uptime_h = round((time.time() - _PROC_START) / 3600.0, 2)
+            tick = {"last": lt, "age_h": age,
+                    "running": eventsim._running.get("id"),
+                    "busy_h": busy, "wedged": wedged,
+                    "uptime_h": uptime_h}
+            if age is not None:
+                tick["ok"] = age <= TICK_MAX_H and not wedged
+            else:
+                # no ping since this container booted: fall back to the last
+                # publish, then to uptime. Only call it dead once the process
+                # has been up long enough that a ping was actually due.
+                pub = _newest_publish_h()
+                tick["last_publish_h"] = pub
+                if pub is not None and pub <= TICK_MAX_H:
+                    tick["ok"] = not wedged
+                    tick["via"] = "publish"
+                elif uptime_h < TICK_MAX_H:
+                    tick["ok"] = not wedged
+                    tick["warming"] = True
+                else:
+                    tick["ok"] = False
+            out["tick"] = tick
         except Exception as e:
             out["tick"] = {"ok": False, "error": type(e).__name__}
         try:
