@@ -43,8 +43,19 @@ PREFIX = "events"
 # dataset, well within limits. Set EVENT_KEEP_FULL below EVENT_KEEP to
 # re-enable demotion of the oldest listed events if storage ever needs it.
 KEEP_EVENTS = int(os.environ.get("EVENT_KEEP", "40"))
-KEEP_FULL = int(os.environ.get("EVENT_KEEP_FULL", str(KEEP_EVENTS)))
+# Demotion is CLAMPED OFF unless EVENT_DEMOTE=1 is set explicitly: a worker
+# environment still carrying EVENT_KEEP_FULL=8 (the HPC launch env, found
+# 2026-09-11) had silently stripped the animations of 25 of 33 listed events
+# — the scrubber showed nothing but the manifests still listed every frame.
+_kf = os.environ.get("EVENT_KEEP_FULL")
+KEEP_FULL = (int(_kf) if _kf and os.environ.get("EVENT_DEMOTE") == "1"
+             else KEEP_EVENTS)
 MAX_AGE_D = float(os.environ.get("EVENT_MAX_AGE_D", "30"))
+# calendar-month list (user directive 2026-09-11): the public list is cleared
+# monthly — an ended event whose t_end falls before the first day of the
+# current UTC month rolls off (results kept, exactly like the age roll-off).
+# MAX_AGE_D stays as the outer bound. EVENT_LIST_MONTHLY=0 disables.
+LIST_MONTHLY = os.environ.get("EVENT_LIST_MONTHLY", "1") != "0"
 # when an event rolls OFF the list (count cap or MAX_AGE_D age), we clear only
 # its ANIMATION files and KEEP the simulation results (manifest + max-depth map
 # + final product + DEM) in the store — a monthly animation cleanup that leaves
@@ -55,6 +66,7 @@ RESULTS_MAX_AGE_D = float(os.environ.get("EVENT_RESULTS_MAX_AGE_D", "365"))
 # animation = the scrubbable per-frame depth grids + the compact frame archive;
 # everything else in an event folder is the "simulation result" we keep
 _ANIM_RE = re.compile(r"^(?:depth_\d+\.(?:png|tif)|archive\.parquet)$")
+_FRAME_RE = re.compile(r"^depth_\d+\.(?:png|tif)$")
 
 
 def _anim_delete_ops(allfiles, ev):
@@ -77,11 +89,43 @@ def _age_days(event_id: str) -> float | None:
         return None
 
 
+def _month_start() -> str:
+    return datetime.datetime.utcnow().strftime("%Y-%m-01T00:00Z")
+
+
+def _ended_before_month(event_id: str, summary: dict | None) -> bool:
+    """True when the event's t_end (index summary; id hour as fallback) is
+    before the first day of the current UTC month. Both sides are
+    'YYYY-MM-DDTHH:MMZ' strings, so a plain comparison orders them."""
+    t_end = str((summary or {}).get("t_end") or "")
+    if not t_end:
+        try:
+            t_end = datetime.datetime.strptime(
+                str(event_id)[:10], "%Y%m%d%H").strftime("%Y-%m-%dT%H:%MZ")
+        except ValueError:
+            return False
+    return t_end[:16] < _month_start()[:16]
+
+
 def _aged_out(idx: dict, keep: str | None = None) -> list[str]:
     return [e for e in idx
             if e != keep
             and idx[e].get("status") != "active"
-            and (_age_days(e) or 0.0) > MAX_AGE_D]
+            and ((_age_days(e) or 0.0) > MAX_AGE_D
+                 or (LIST_MONTHLY and _ended_before_month(e, idx[e])))]
+
+
+def _serviceable(frames: list, local: set, stored: set) -> list:
+    """Frames whose depth file AND overlay png exist (or are about to be
+    uploaded) — the only ones a manifest may list. Anything else is a 404
+    blank in the player."""
+    have = local | stored
+    out = []
+    for f in frames or []:
+        fn, png = f.get("file"), f.get("png")
+        if fn in have and (not png or png in have):
+            out.append(f)
+    return out
 
 
 def _api():
@@ -145,41 +189,57 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
             idx.pop(d, None)
 
         ops = []
+        local = {fn for fn in os.listdir(local_dir)
+                 if os.path.isfile(os.path.join(local_dir, fn))}
         if prior is not None:
             # FIXED EPISODE WINDOW (user directive 2026-08-14): a re-publish
             # replaces only what this run re-simulated — frames OLDER than
             # its sim_start are carried forward, so the episode record always
             # starts at trigger-minus-backset and never slides (03190000's
             # crest was lost to the old replace-the-folder behavior).
-            local = set(os.listdir(local_dir))
             new_start = str(manifest.get("sim_start") or "")
-            carried = []
+            stored = None                     # this event's files on the store
             try:
                 allfiles = api.list_repo_files(REPO, repo_type="dataset")
+                stored = {os.path.basename(f) for f in allfiles
+                          if f.startswith(f"{PREFIX}/{ev}/")}
             except Exception:
-                allfiles = None
-            if allfiles is None or not new_start:
-                ops.append(CommitOperationDelete(f"{PREFIX}/{ev}/",
-                                                 is_folder=True))
-            else:
-                pm = _prior_manifest(ev)
-                carried = [f for f in (pm or {}).get("frames", [])
-                           if f.get("t", "") < new_start]
-                keep = {f.get("file") for f in carried} | \
-                       {f.get("png") for f in carried}
-                for f in allfiles:
-                    if not f.startswith(f"{PREFIX}/{ev}/"):
+                stored = None
+            pm = _prior_manifest(ev) if new_start else None
+            carried = [f for f in (pm or {}).get("frames", [])
+                       if f.get("t", "") < new_start]
+            if carried:
+                manifest["frames"] = carried + manifest.get("frames", [])
+                manifest["episode_start"] = carried[0].get("t")
+            if stored is not None:
+                # list only frames the store will actually serve after this
+                # commit (a prior publish may have lost files — see below)
+                n0 = len(manifest.get("frames") or [])
+                manifest["frames"] = _serviceable(manifest.get("frames"),
+                                                  local, stored)
+                if len(manifest["frames"]) < n0:
+                    manifest["n_frames_dropped"] = n0 - len(manifest["frames"])
+                referenced = set()
+                for f in manifest["frames"]:
+                    referenced.add(f.get("file"))
+                    referenced.add(f.get("png"))
+                for base in stored:
+                    if base in local:
+                        # replaced IN PLACE by the Add below. NEVER pair it
+                        # with a Delete: huggingface_hub silently drops an Add
+                        # whose bytes already match the store, so Delete+Add
+                        # of an unchanged file nets to a DELETE — that is how
+                        # every same-hour re-solve and the first (identical)
+                        # hour of each catch-up visit lost its frames while
+                        # the manifest still listed them (found 2026-09-11).
                         continue
-                    base = os.path.basename(f)
-                    if base in local or base not in keep:
-                        ops.append(CommitOperationDelete(f))
-                if carried:
-                    manifest["frames"] = carried + manifest.get("frames", [])
-                    manifest["episode_start"] = carried[0].get("t")
-                    summary["n_frames"] = len(manifest["frames"])
-                    with open(os.path.join(local_dir, "manifest.json"),
-                              "w") as fp:
-                        json.dump(manifest, fp)
+                    if _FRAME_RE.match(base) and base not in referenced:
+                        ops.append(CommitOperationDelete(
+                            f"{PREFIX}/{ev}/{base}"))     # re-simulated span
+            summary["n_frames"] = len(manifest.get("frames") or [])
+            with open(os.path.join(local_dir, "manifest.json"),
+                      "w") as fp:
+                json.dump(manifest, fp)
         for fn in sorted(os.listdir(local_dir)):
             p = os.path.join(local_dir, fn)
             if os.path.isfile(p):
@@ -466,6 +526,65 @@ def retention_sweep() -> int:
             return stripped + purged
         except Exception:
             return 0
+
+
+def reconcile_store(dry_run: bool = False, log=print) -> int:
+    """Maintenance (one commit): make every stored manifest list only the
+    frames whose depth file + overlay png are actually in the store, and
+    fix the index's n_frames to match. Repairs the 404-blank frames left by
+    the Delete+Add publish bug and by animation stripping. Returns the
+    number of manifests rewritten."""
+    from huggingface_hub import CommitOperationAdd, hf_hub_download
+    api = _api()
+    if api is None:
+        return 0
+    with _lock:
+        allfiles = api.list_repo_files(REPO, repo_type="dataset")
+        by_ev: dict[str, set] = {}
+        for f in allfiles:
+            parts = f.split("/")
+            if len(parts) >= 3 and parts[0] == PREFIX and parts[1] != "queue":
+                by_ev.setdefault(parts[1], set()).add(parts[-1])
+        idx = load_index()
+        ops, touched = [], 0
+        for ev in sorted(by_ev):
+            files = by_ev[ev]
+            if "manifest.json" not in files:
+                continue
+            try:
+                mp = hf_hub_download(REPO, f"{PREFIX}/{ev}/manifest.json",
+                                     repo_type="dataset",
+                                     token=os.environ.get("HF_TOKEN"))
+                with open(mp, encoding="utf-8") as fp:
+                    man = json.load(fp)
+            except Exception as e:
+                log(f"{ev}: manifest unreadable ({type(e).__name__})")
+                continue
+            frames = man.get("frames") or []
+            keep = _serviceable(frames, set(), files)
+            if len(keep) == len(frames):
+                continue
+            man["frames"] = keep
+            man["n_frames_dropped"] = (man.get("n_frames_dropped") or 0) + \
+                len(frames) - len(keep)
+            log(f"{ev}: {len(frames)} -> {len(keep)} frames "
+                f"({len(frames) - len(keep)} listed but not stored)")
+            touched += 1
+            if dry_run:
+                continue
+            ops.append(CommitOperationAdd(
+                f"{PREFIX}/{ev}/manifest.json",
+                io.BytesIO(json.dumps(man).encode())))
+            if ev in idx:
+                idx[ev]["n_frames"] = len(keep)
+        if dry_run or not ops:
+            return touched
+        ops.append(CommitOperationAdd(f"{PREFIX}/index.json",
+                                      io.BytesIO(json.dumps(idx).encode())))
+        api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
+                          commit_message=f"reconcile: {touched} manifest(s) "
+                                         f"trimmed to stored frames")
+        return touched
 
 
 def event_url(event_id: str, filename: str) -> str:

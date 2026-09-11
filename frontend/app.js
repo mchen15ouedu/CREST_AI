@@ -3068,6 +3068,14 @@ function showEvtFrame(i) {
   }
   const sl = document.getElementById("anim-slider");
   if (sl && eventsMode && i >= 0) sl.value = String(i);
+  // smooth playback: each frame is its own CDN fetch, so warm the next few
+  // (otherwise a 400 ms step shows a blank overlay while the png is in flight)
+  if (i >= 0) {
+    for (let k = 1; k <= 4; k++) {
+      const nx = man.frames[i + k];
+      if (nx) new Image().src = `${evtBase}/${man._id}/${nx.png}`;
+    }
+  }
   // keep the hydrograph's time marker in step with the slider/play scrub
   if (i >= 0) {
     try { updateHydroMarker(man.frames[i].t.replace("T", " ").replace("Z", "")); }
