@@ -87,6 +87,11 @@ PRESSURE_N = int(os.environ.get("ZERO_PRESSURE_N", "4"))
 STALE_S = float(os.environ.get("ZERO_STALE_S", "600"))
 HB_S = float(os.environ.get("ZERO_HB_S", "240"))
 POLL_S = float(os.environ.get("ZERO_POLL_S", "60"))
+# ZeroGPU quota exhaustion is NOT a poison job: release the claim (the HPC
+# or a later quota window takes the bundle) and stop claiming for a while.
+# Without this (seen 2026-09-11) the backup rung claimed a bundle, hit
+# "Space app has reached its GPU limit", and CONSUMED it as failed.
+QUOTA_BACKOFF_S = float(os.environ.get("ZERO_QUOTA_BACKOFF_S", "3600"))
 MAX_CELLS = int(os.environ.get("ZERO_MAX_CELLS", "2000000"))
 PUBLISH = os.environ.get("PUBLISH", "0") == "1"
 CHUNK0_SIM_S = float(os.environ.get("ZERO_CHUNK0_SIM_S", "300"))
@@ -373,10 +378,29 @@ def _finish_job():
         W.update(job=None, runner=None, workdir=None, phase="idle")
 
 
+def _is_quota_error(exc) -> bool:
+    m = f"{type(exc).__name__}: {exc}".lower()
+    return "gpu limit" in m or "quota" in m
+
+
 def _fail_job(exc):
     job = W["job"]
     ev, queued = job["id"], W["queued"]
     tb = "\n".join(traceback.format_exc().strip().splitlines()[-8:])
+    if _is_quota_error(exc):
+        # not this job's fault: hand it back untouched and back off
+        W["quota_until"] = time.time() + QUOTA_BACKOFF_S
+        log(f"{ev}: ZeroGPU quota exhausted — releasing the claim, no "
+            f"claims for {QUOTA_BACKOFF_S / 60:.0f} min ({exc})")
+        if PUBLISH:
+            from huggingface_hub import CommitOperationDelete
+            _commit([CommitOperationDelete(f"{QPREFIX}/{ev}.claim")],
+                    f"zero-worker quota — released {ev}")
+        rec = W["sessions"].pop(ev, None)      # mid-visit state is untrustworthy
+        if rec:
+            shutil.rmtree(rec["root"], ignore_errors=True)
+        W.update(job=None, runner=None, workdir=None, phase="idle")
+        return                                  # NOT added to done: retryable
     log(f"{ev}: FAILED — {type(exc).__name__}: {exc}")
     if PUBLISH:                                   # shadow held no claim
         from huggingface_hub import CommitOperationAdd, CommitOperationDelete
@@ -430,7 +454,7 @@ def tick():
     try:
         now = time.time()
         if W["phase"] == "idle":
-            if now - W["last_poll"] >= POLL_S:
+            if now - W["last_poll"] >= POLL_S and now >= W.get("quota_until", 0.0):
                 W["last_poll"] = now
                 _evict_sessions()
                 job = _scan()
