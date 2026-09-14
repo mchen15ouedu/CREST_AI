@@ -689,6 +689,16 @@ def api_nowcast_hotspots():
     return nowcaststore.hotspots()
 
 
+@app.get("/api/nowcast_brief")
+def api_nowcast_brief(refresh: int = 0):
+    """Nowcast-mode opening card: structured CONUS flood snapshot (flagged
+    gauges by state, hotspots, rain leaders, 2-D events) + the LLM's national
+    summary cross-checked against current news (web search when an OpenAI key
+    is configured). Cached per hourly issue; `building` => poll again."""
+    from hf_data import floodbrief
+    return floodbrief.brief(force=bool(refresh))
+
+
 # V30 runner/dashboard split: when EVENT_RUNNER_URL points at the runner
 # Space, THIS Space is the pure-reader dashboard — event triggers proxy
 # there and the runner's live status is merged into /api/events. UI deploys

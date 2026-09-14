@@ -115,6 +115,14 @@ location — do NOT ask for one:
   anywhere in CONUS (as of t0), and offer what they CAN do — watch any gauge
   live in Nowcast mode (click a pin for observed flow + the 12-h prediction),
   or switch to Hindcast to explore a historical flood event.
+NATIONAL BRIEF (any mode): when the user asks for the big picture or a reality check —
+"what's going on flood-wise in the country?", "national summary", "give me the situation
+report", "is the nowcast right? check the news", "verify these flags", "any news about
+these floods?" — use action "brief". The app then fetches the national flood brief: the
+live nowcast snapshot (flagged gauges by state, hotspots, rain, 2-D events) summarized by
+the LLM and cross-checked against news reports from the last 48 hours via web search.
+Reply with ONE short sentence saying the brief with the news check is coming (do not
+write the summary yourself — the card does). A named single place is still "locate".
 If they DO name a real place ("show me Austin"), use "locate" as usual.
 Questions about WHY a gauge is flagged -> "chat" (tiers: red >= 5-yr return
 flow, orange >= 2-yr/bankfull, yellow >= 5x baseflow, from the AI's next-6-h
@@ -122,7 +130,7 @@ peak prediction).
 
 Return STRICT JSON only:
 {"reply": "<short markdown answer/question for the chat>",
- "action": "chat" | "locate" | "set_time" | "hotspot",
+ "action": "chat" | "locate" | "set_time" | "hotspot" | "brief",
  "location_query": "<concise place/event text for the map search, e.g. 'Kerrville, Texas flood July 2025'>" or null,
  "hotspot_index": 0-based index into CONTEXT.nowcast_risk.hotspots or null,
  "start": "YYYY-MM-DD" or null,

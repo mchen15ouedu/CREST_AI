@@ -781,7 +781,77 @@ function mdLite(t) {
   return escapeHtml(t)
     .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
     .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/^#{1,4}\s+(.+)$/gm, "<b>$1</b>")          // headings -> bold lines
+    .replace(/^\s*[-*]\s+/gm, "• ")                     // list items -> bullets
+    .replace(/^_(.+)_$/gm, "<i>$1</i>")                  // footer line
+    .replace(/_\(([^)]*)\)_/g, "<i>($1)</i>")             // inline _(note)_
     .replace(/\n/g, "<br>");
+}
+
+// ---- Nowcast mode: national flood brief + news cross-check --------------------
+// One card per hourly nowcast issue: the structured snapshot renders at once
+// (counts by state, worst gauges, 2-D events); the LLM summary with the web
+// news check streams in when the server finishes building it (polled).
+let briefT0Shown = null;
+let briefPollTimer = null;
+async function loadNationalBrief(force) {
+  clearTimeout(briefPollTimer);
+  const head = `<div class="news-h">🛰 National flood picture</div>`;
+  let card = null;
+  const url = `/api/nowcast_brief${force ? "?refresh=1" : ""}`;
+  const render = (d) => {
+    const s = d.snapshot || {};
+    const total = (s.n_flood || 0) + (s.n_minor || 0) + (s.n_elevated || 0);
+    const states = (s.states || []).slice(0, 6).map((x) =>
+      `${escapeHtml(x.state)} ${x.flood ? `🔴${x.flood} ` : ""}${x.minor ? `🟠${x.minor} ` : ""}${x.elevated ? `🟡${x.elevated}` : ""}`.trim()).join(" · ");
+    const worst = (s.gauges || []).slice(0, 4).map((g) =>
+      `${g.tier === 3 ? "🔴" : g.tier === 2 ? "🟠" : "🟡"} <b>${escapeHtml(g.name || g.id)}</b>` +
+      `${g.x_bankfull_q2 ? ` · ${g.x_bankfull_q2}× bankfull` : ""}${g.peak_time_utc ? ` · peak ${g.peak_time_utc.slice(5, 16)}Z` : ""}`).join("<br>");
+    const evs = (s.events || []).filter((e) => e.status === "active").map((e) =>
+      `🌊 ${escapeHtml(e.name || e.gauge)}${e.peak_depth_m ? ` (${e.peak_depth_m} m)` : ""}`).join("<br>");
+    let body = `<div class="brief-data">` +
+      (total ? `${s.n_flood || 0} 🔴 · ${s.n_minor || 0} 🟠 · ${s.n_elevated || 0} 🟡 of ${s.n_rated || "?"} gauges flagged` +
+               (states ? ` — ${states}` : "") : "AI nowcast flags no flood risk anywhere in CONUS") +
+      (worst ? `<br>${worst}` : "") + (evs ? `<br>${evs}` : "") + `</div>`;
+    if (d.text) {
+      const src = (d.sources || []).slice(0, 6).map((x) =>
+        `<a href="${escapeHtml(x.url)}" target="_blank" rel="noopener">${escapeHtml(x.title || x.url)}</a>`).join(" · ");
+      body += `<div class="brief-text">${mdLite(d.text)}</div>` +
+              (src ? `<div class="brief-foot">📰 sources (from the web search): ${src}</div>` : "") +
+              `<div class="brief-foot">${d.verified ? "✅ cross-checked against news via web search" : "⚠️ news check unverified (no citable sources)"}` +
+              `${d.provider ? ` · ${escapeHtml(d.provider)}` : ""} · <a href="#" class="brief-refresh">🔄 refresh</a></div>`;
+    } else if (d.building) {
+      body += `<div class="brief-foot"><i>✍️ writing the summary and checking news reports…</i></div>`;
+    } else if (!d.llm) {
+      body += `<div class="brief-foot"><i>no LLM configured — structured snapshot only</i></div>`;
+    } else if (d.error) {
+      body += `<div class="brief-foot"><i>summary unavailable (${escapeHtml(d.error)})</i> · <a href="#" class="brief-refresh">🔄 retry</a></div>`;
+    }
+    card.innerHTML = head + body;
+    const rb = card.querySelector(".brief-refresh");
+    if (rb) rb.onclick = (e) => { e.preventDefault(); briefT0Shown = null; loadNationalBrief(true); };
+  };
+  try {
+    let d = await (await fetch(url)).json();
+    if (!d.ok) {
+      if (force) addMsg(`⚠️ National brief unavailable: ${escapeHtml(d.reason || "no nowcast issue yet")}.`, "status");
+      return;
+    }
+    if (!force && briefT0Shown === (d.snapshot || {}).t0) return;   // same issue, card already up
+    briefT0Shown = (d.snapshot || {}).t0;
+    card = addMsg(head + "<i>reading the live nowcast…</i>", "news");
+    render(d);
+    let tries = 0;
+    const poll = async () => {
+      if (!d.building || tries++ > 40) return;            // ~2.5 min cap
+      try { d = await (await fetch("/api/nowcast_brief")).json(); } catch (_) { return; }
+      if (d.ok) render(d);
+      if (d.building) briefPollTimer = setTimeout(poll, 4000);
+    };
+    if (d.building) briefPollTimer = setTimeout(poll, 4000);
+  } catch (_) {
+    if (card) card.innerHTML = head + "<i>(brief unavailable — network)</i>";
+  }
 }
 function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1607,6 +1677,10 @@ async function handleChat(text) {
     runQuery(d.location_query, ud || (d.start ? { start: d.start, end: d.end || null } : null), false);
   } else if (d.action === "hotspot") {
     zoomToHotspot(d.hotspot_index || 0);
+  } else if (d.action === "brief") {
+    if (!nowcastMode) setMode(true);      // the brief is the nowcast's national view
+    briefT0Shown = null;
+    loadNationalBrief(true);
   } else if (d.event_info) {
     lastEventInfoLabel = null;            // user explicitly asked -> refresh the card
     fetchEventInfo();
@@ -2301,6 +2375,7 @@ function setMode(nc) {
            "overlays MRMS rainfall and animates the last 24 h–7 days. " +
            "<b>Experimental</b>; gauge points only (2-D maps stay in Hindcast).", "status");
     loadNowcastRisk();
+    loadNationalBrief(false);          // opening card: national picture + news check
     scheduleAutoView();
   } else {
     addMsg("🕘 <b>Hindcast mode</b> — historical CREST simulations (pick gauges and a time window). " +

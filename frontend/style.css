@@ -390,3 +390,9 @@ body.font-xl #depth-legend { zoom: 1.4; }
 .ar-badge.dim { background: #2a2f36; color: #97a4b3; }
 .ar-table a { color: #7db8ff; text-decoration: none; margin-right: 6px; }
 .ar-table a:hover { text-decoration: underline; }
+
+/* national flood brief card (nowcast mode) */
+.msg.news .brief-data{margin:4px 0 6px;font-size:.92em;line-height:1.45}
+.msg.news .brief-text{border-top:1px solid rgba(255,255,255,.12);padding-top:6px;line-height:1.45}
+.msg.news .brief-foot{margin-top:6px;font-size:.82em;opacity:.75}
+.msg.news .brief-foot a{color:inherit}
