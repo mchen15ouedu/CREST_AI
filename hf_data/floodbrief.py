@@ -212,7 +212,8 @@ Write for a duty forecaster in <= 230 words of markdown:
    flash-flood warnings, heavy rain or storms in the flagged states/regions, AND for any
    major US flooding the nowcast does NOT flag. One bullet per top region:
    "✅ corroborated — <what the report says>" with a markdown link,
-   "⚠️ unverified — no recent reports found" (the AI flag stands unconfirmed), or
+   "⚠️ unverified — no recent reports found" (the AI flag stands unconfirmed; NO link
+   on an unverified line — a generic safety page is not evidence), or
    "ℹ️ related weather — <warning / forecast context>" with a link.
    At most 4 links total, only URLs you actually retrieved. Never invent gauges,
    numbers, places or links. If nothing is flagged, say the nowcast is quiet and still
