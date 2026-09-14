@@ -132,6 +132,10 @@ def main():
     ap.add_argument("--shard", default="",
                     help='"K/N": run only gauges with catalog-index %% N == K — '
                          "N parallel runners split the catalog disjointly")
+    ap.add_argument("--order", choices=["area", "catalog"],
+                    default=os.environ.get("FLEET_QUEUE_ORDER", "area"),
+                    help="todo order within the slice: smallest drainage area "
+                         "first (default) or catalog order")
     args = ap.parse_args()
 
     if not os.path.exists(os.path.join("EF5", "bin", "ef5")):
@@ -166,6 +170,19 @@ def main():
         print(f"shard {k}/{n}: {len(ids)} gauges in this slice", flush=True)
     done = _done_keys()
     todo = [g for g in ids if not any(k.startswith(g + "_") for k in done)]
+    if args.order == "area":
+        # smallest basins first: within-gauge resume lives in the container's
+        # local cache, so a huge basin that outlives the (free-tier) container
+        # restarts from zero — at the head of the queue it livelocks both
+        # workers and starves every small gauge behind it
+        try:
+            from hf_data import gauges as G
+            cat = G.load_catalog()
+            area = dict(zip((str(s).zfill(8) for s in cat["STAID"]),
+                            cat["DRAIN_SQKM"]))
+            todo.sort(key=lambda g: area.get(g, float("inf")))
+        except Exception as e:
+            print(f"area ordering unavailable ({e}) — catalog order", flush=True)
     if args.reverse:
         todo.reverse()
     if args.limit:
