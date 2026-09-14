@@ -257,44 +257,103 @@ def _enforce_links(text: str, sources: list[dict]) -> str:
     return _MD_LINK.sub(fix, text)
 
 
+_STATE_NAMES = {
+    "AL": "Alabama", "AZ": "Arizona", "AR": "Arkansas", "CA": "California", "CO": "Colorado",
+    "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky",
+    "LA": "Louisiana", "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan",
+    "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri", "MT": "Montana", "NE": "Nebraska",
+    "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon",
+    "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina", "SD": "South Dakota",
+    "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont", "VA": "Virginia",
+    "WA": "Washington", "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "DC"}
+NEWS_REGIONS = int(os.environ.get("BRIEF_NEWS_REGIONS", "3"))
+
+
+def _search_news(client, model: str, query: str) -> tuple[str, list[dict]]:
+    """One FORCED web search (tool_choice) — the model may not skip it. Returns
+    (findings markdown with the tool's own citations, citations)."""
+    r = client.responses.create(
+        model=model,
+        tools=[{"type": "web_search_preview", "search_context_size": "medium"}],
+        tool_choice={"type": "web_search_preview"},
+        instructions=("You are a news researcher. Use the web search tool, then report "
+                      "ONLY what the retrieved pages say, as 2-4 short bullets: outlet, "
+                      "date, what happened / what is warned, with a markdown link to each "
+                      "page you cite. Prefer the last 48 hours; say so if reports are "
+                      "older. If nothing relevant was found, answer exactly: "
+                      "'No relevant reports found.'"),
+        input=query)
+    return (getattr(r, "output_text", "") or "").strip(), _citations(r)
+
+
+def _news_queries(snap: dict) -> list[tuple[str, str]]:
+    """(label, query) per top region + one national sweep."""
+    now = datetime.utcnow().strftime("%B %d, %Y")
+    out = []
+    for s in (snap.get("states") or [])[:NEWS_REGIONS]:
+        st = _STATE_NAMES.get(s["state"], s["state"])
+        rivers = [g["name"] for g in snap.get("gauges") or [] if g.get("state") == s["state"]][:2]
+        hint = f" ({'; '.join(rivers)})" if rivers else ""
+        out.append((st, f"Flooding, flash flood warning or heavy rain in {st}{hint} — "
+                        f"news from the last 48 hours as of {now}"))
+    out.append(("United States", f"Major flooding or flash flood emergencies anywhere in the "
+                                 f"United States — news from the last 48 hours as of {now}"))
+    return out
+
+
 def _build(snap: dict) -> None:
     t0 = snap.get("t0")
     text, provider, verified, sources = None, None, False, []
     try:
         key = os.environ.get("OPENAI_API_KEY")
+        news_md = None
         if key:
-            try:                                 # web-grounded (Responses API)
+            # Step 1 — DETERMINISTIC news research: one forced web search per top
+            # region + a national sweep. A single "you may search" call was
+            # skipped by the model (12-s run, zero citations) and it then
+            # invented links; forcing the tool and collecting the tool's own
+            # url_citation annotations is the only reliable grounding.
+            try:
                 from openai import OpenAI
-                r = OpenAI(api_key=key, timeout=LLM_TIMEOUT_S).responses.create(
-                    model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
-                    tools=[{"type": "web_search_preview"}],
-                    instructions=_SYSTEM,
-                    input=_compose(snap))
-                txt = (getattr(r, "output_text", "") or "").strip()
-                if txt:
-                    # ONLY links the search tool itself returned survive: the
-                    # model will otherwise invent plausible-looking URLs (a
-                    # non-resolving "weatherreports.com" link on the first
-                    # live run, 2026-09-14). Citations come from the response
-                    # annotations, never from the prose.
-                    sources = _citations(r)
-                    text = _enforce_links(txt, sources)
-                    provider = "openai+web"
-                    verified = bool(sources)
-                    if not sources:
-                        text += ("\n\n⚠️ _The web search returned no citable "
-                                 "sources — treat the news check as unverified._")
+                client = OpenAI(api_key=key, timeout=LLM_TIMEOUT_S)
+                model = os.environ.get("OPENAI_MODEL", "gpt-4o")
+                parts = []
+                for label, q in _news_queries(snap):
+                    try:
+                        found, cites = _search_news(client, model, q)
+                        sources += [c for c in cites if c["url"] not in {s["url"] for s in sources}]
+                        parts.append(f"### {label}\n{found or 'No relevant reports found.'}")
+                    except Exception as e:
+                        parts.append(f"### {label}\n_search failed: {type(e).__name__}_")
+                news_md = "\n\n".join(parts)
+                provider = "openai+web"
             except Exception as e:
                 _cache["error"] = f"web search unavailable: {type(e).__name__}"
-        if text is None:
-            sys_p = _SYSTEM + ("\nNOTE: you have NO web access in this run — skip the "
-                               "search, write the News check section as a single line "
-                               "'⚠️ news check not available in this deployment', and "
-                               "put 'not available' in the footer.")
-            text, provider = llm.chat([{"role": "system", "content": sys_p},
-                                       {"role": "user", "content": _compose(snap)}],
-                                      temperature=0.3, max_tokens=700)
-            text = (text or "").strip()
+        # Step 2 — compose from SNAPSHOT + NEWS FINDINGS (any provider); the
+        # writer may only link URLs that appear in the findings.
+        sys_p = _SYSTEM
+        if news_md is not None:
+            user = (_compose(snap) + "\n\nNEWS FINDINGS (from web searches just run; the ONLY "
+                    "links you may use, copied verbatim):\n" + news_md)
+            sys_p += ("\nThe News check must be written from the NEWS FINDINGS block only "
+                      "(do not search again, do not add links that are not in it). Put "
+                      "'web search' in the footer.")
+        else:
+            user = _compose(snap)
+            sys_p += ("\nNOTE: you have NO web access in this run — skip the search, write "
+                      "the News check section as a single line '⚠️ news check not "
+                      "available in this deployment', and put 'not available' in the footer.")
+        txt, prov = llm.chat([{"role": "system", "content": sys_p},
+                              {"role": "user", "content": user}],
+                             temperature=0.3, max_tokens=800)
+        text = _enforce_links((txt or "").strip(), sources)
+        provider = provider or prov
+        verified = bool(sources)
+        if news_md is not None and not sources:
+            text += ("\n\n⚠️ _The web searches returned no citable sources — treat the "
+                     "news check as unverified._")
     except Exception as e:
         with _lock:
             _cache.update(building=False, error=f"{type(e).__name__}: {str(e)[:160]}")
