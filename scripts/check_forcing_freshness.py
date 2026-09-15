@@ -58,6 +58,35 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+# TEMP's source: NOAA PSL mirrors NARR 2-m air temperature as one yearly file
+# that is appended weeks after the fact and at irregular intervals (the 2026
+# file was written 2026-08-24 and still ended 2026-07-31 21z on 2026-09-15; the
+# 2025 file got its last write on 2026-03-20). A calendar-lag limit therefore
+# alarms on a store that is PERFECTLY caught up (2026-09-15: lag 45.8 d > 45).
+# Instead, ask the source how far it goes — two tiny OPeNDAP requests (.dds for
+# the time length, .ascii for the last value) — and call TEMP stale only when
+# NARR has data we have not ingested.
+NARR_DODS = "https://psl.noaa.gov/thredds/dodsC/Datasets/NARR/monolevel/air.2m.{year}.nc"
+
+
+def narr_source_end(now: datetime):
+    """Last time step NOAA PSL has published for NARR air.2m (UTC), or None."""
+    import re as _re
+    import urllib.request
+    for year in (now.year, now.year - 1):       # January: last year's file
+        base = NARR_DODS.format(year=year)
+        try:
+            dds = urllib.request.urlopen(base + ".dds", timeout=30).read().decode()
+            n = int(_re.search(r"time\s*=\s*(\d+)", dds).group(1))
+            asc = urllib.request.urlopen(f"{base}.ascii?time[{n - 1}:1:{n - 1}]",
+                                         timeout=30).read().decode()
+            hours = float(_re.findall(r"[-\d.]+", asc.rsplit("time", 1)[-1])[-1])
+            return datetime(1800, 1, 1) + timedelta(hours=hours)   # "hours since 1800-1-1"
+        except Exception:
+            continue
+    return None
+
+
 def _latest_member(names, var) -> datetime | None:
     """Newest timestep among a tar's member names, or None."""
     best = None
@@ -170,7 +199,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mrms-days", type=float, default=14)   # weekly cadence + a missed run
     ap.add_argument("--pet-days", type=float, default=14)
-    ap.add_argument("--temp-days", type=float, default=45)   # NARR itself lags weeks
+    ap.add_argument("--temp-days", type=float, default=45)   # fallback when the source probe fails
+    ap.add_argument("--temp-source-gap-days", type=float, default=5)   # stale = NARR has > this much we lack
+    ap.add_argument("--temp-hard-days", type=float, default=120)       # even caught-up: a dead source is news
     ap.add_argument("--usgs-hours", type=float, default=12)
     ap.add_argument("--recent-hours", type=float, default=4)   # hourly cadence + ~2 h source lag + margin
     args = ap.parse_args()
@@ -184,11 +215,31 @@ def main() -> int:
 
     ok = True
     store_lat = {}
-    for var, days in (("mrms", args.mrms_days), ("pet", args.pet_days),
-                      ("temp", args.temp_days)):
+    for var, days in (("mrms", args.mrms_days), ("pet", args.pet_days)):
         latest, err = check_store_var(api, var)
         store_lat[var] = latest
         ok &= _report(var.upper(), latest, err, now, timedelta(days=days), "d")
+
+    # TEMP: judged against its SOURCE, not the calendar (see narr_source_end)
+    latest, err = check_store_var(api, "temp")
+    store_lat["temp"] = latest
+    src = narr_source_end(now) if latest is not None else None
+    if latest is not None and src is not None:
+        gap_d = (src - latest).total_seconds() / 86400.0
+        lag_d = (now - latest).total_seconds() / 86400.0
+        stale = gap_d > args.temp_source_gap_days or lag_d > args.temp_hard_days
+        tag = "STALE " if stale else "ok    "
+        why = (f"NARR source ends {src:%Y-%m-%d %H:%M} UTC — "
+               + (f"{gap_d:.1f} d not yet ingested" if gap_d > args.temp_source_gap_days
+                  else "store caught up to the source"
+                  if lag_d <= args.temp_hard_days
+                  else f"source itself silent > {args.temp_hard_days:g} d"))
+        # keep "(lag N d)" intact: the updater Space parses it for self-heal
+        print(f"  {'TEMP':12s} {tag} latest {latest:%Y-%m-%d %H:%M} UTC "
+              f"(lag {lag_d:.1f} d) · {why}")
+        ok &= not stale
+    else:
+        ok &= _report("TEMP", latest, err, now, timedelta(days=args.temp_days), "d")
 
     latest, err = check_mrms_recent(api)
     ok &= _report("MRMS recent", latest, err, now,

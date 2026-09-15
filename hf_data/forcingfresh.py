@@ -56,6 +56,42 @@ MONTHS_MAX = int(os.environ.get("HEALTH_FORCING_MONTHS_MAX", "1"))
 # log distinguishes "NARR has no data for them yet" from a failure.
 MONTHS_MAX_BY_VAR = {"temp": int(os.environ.get("HEALTH_TEMP_MONTHS_MAX", "2"))}
 TTL_S = float(os.environ.get("HEALTH_FORCING_TTL_S", "1800"))
+# TEMP is finally judged against its SOURCE: NOAA PSL appends the NARR yearly
+# file weeks late and irregularly (2026-09-15: file written 08-24, still ending
+# 07-31 21z, lag 45.8 d), so any calendar limit eventually alarms on a store
+# that is perfectly caught up. The probe below (two tiny OPeNDAP requests,
+# cached NARR_TTL_S) returns the source's last time step; a temp store whose
+# newest month covers that month is fresh whatever the write-age says — unless
+# the source itself has been silent past HEALTH_TEMP_HARD_D, which is news.
+NARR_DODS = "https://psl.noaa.gov/thredds/dodsC/Datasets/NARR/monolevel/air.2m.{year}.nc"
+NARR_TTL_S = float(os.environ.get("HEALTH_NARR_TTL_S", "21600"))
+TEMP_HARD_D = float(os.environ.get("HEALTH_TEMP_HARD_D", "120"))
+_narr: dict = {"t": 0.0, "end": None}
+
+
+def _narr_source_end(now: datetime.datetime):
+    """Last published NARR air.2m time step (UTC) from NOAA PSL, or None."""
+    import urllib.request
+    with _lock:
+        if _narr["end"] is not None and time.time() - _narr["t"] < NARR_TTL_S:
+            return _narr["end"]
+    end = None
+    for year in (now.year, now.year - 1):
+        base = NARR_DODS.format(year=year)
+        try:
+            dds = urllib.request.urlopen(base + ".dds", timeout=20).read().decode()
+            n = int(re.search(r"time\s*=\s*(\d+)", dds).group(1))
+            asc = urllib.request.urlopen(f"{base}.ascii?time[{n - 1}:1:{n - 1}]",
+                                         timeout=20).read().decode()
+            hours = float(re.findall(r"[-\d.]+", asc.rsplit("time", 1)[-1])[-1])
+            end = datetime.datetime(1800, 1, 1) + datetime.timedelta(hours=hours)
+            break
+        except Exception:
+            continue
+    if end is not None:
+        with _lock:
+            _narr.update(t=time.time(), end=end)
+    return end
 
 _lock = threading.Lock()
 _cache: dict = {"t": 0.0, "snap": None}
@@ -95,17 +131,30 @@ def _check(api, var: str, now: datetime.datetime) -> dict:
     if written is not None:
         age_d = round((now - written.replace(tzinfo=None)).total_seconds()
                       / 86400.0, 1)
-    return {"label": label,
-            "newest_month": f"{month[0]}-{month[1]:02d}",
-            "months_behind": behind,
-            "updated": (written.strftime("%Y-%m-%d")
-                        if written is not None else None),
-            "updated_age_d": age_d,
-            "max_age_d": max_d,
-            "max_months_behind": months_max,
-            # unknown write date is not proof of trouble (an old client may not
-            # expand commits) — coverage still decides in that case
-            "ok": (age_d is None or age_d <= max_d) and behind <= months_max}
+    out = {"label": label,
+           "newest_month": f"{month[0]}-{month[1]:02d}",
+           "months_behind": behind,
+           "updated": (written.strftime("%Y-%m-%d")
+                       if written is not None else None),
+           "updated_age_d": age_d,
+           "max_age_d": max_d,
+           "max_months_behind": months_max,
+           # unknown write date is not proof of trouble (an old client may not
+           # expand commits) — coverage still decides in that case
+           "ok": (age_d is None or age_d <= max_d) and behind <= months_max}
+    if var == "temp":
+        src = _narr_source_end(now)
+        if src is not None:
+            caught_up = month >= (src.year, src.month)
+            src_age_d = (now - src).total_seconds() / 86400.0
+            out.update(source_end=src.strftime("%Y-%m-%d %H:%M"),
+                       caught_up=caught_up,
+                       ok=caught_up and src_age_d <= TEMP_HARD_D)
+            if not caught_up:
+                out["note"] = "NARR has published data the store has not ingested"
+            elif src_age_d > TEMP_HARD_D:
+                out["note"] = f"NARR source itself silent > {TEMP_HARD_D:g} d"
+    return out
 
 
 def snapshot() -> dict:
