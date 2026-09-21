@@ -45,12 +45,20 @@ jobs:
       - name: Assert every feed is fresh (fail -> email)
         run: |
           s=$(curl -sk -m 30 https://vincewin-crest-updater.hf.space/api/status)
-          echo "----- freshness -----"
-          echo "$s" | tr ',' '\n' | grep -oE '(MRMS recent|MRMS|PET|TEMP|USGS gauge)[^"]*(ok|STALE)[^"]*latest [0-9][^"\\]*' || \
-            echo "$s" | grep -o 'latest [0-9][^"]*'
-          if echo "$s" | grep -q 'STALE'; then
+          # judge ONLY the latest check (.freshness). The status also carries
+          # log_tail, the history of earlier hourly checks; grepping the whole
+          # JSON let one flaky hour hours ago turn the alarm red (2026-09-19).
+          f=$(echo "$s" | jq -r '.freshness[]?' 2>/dev/null)
+          if [ -z "$f" ]; then
+            echo "::error::Updater status unreadable or has no freshness block: https://vincewin-crest-updater.hf.space/api/status"
+            echo "$s" | head -c 600
+            exit 1
+          fi
+          echo "----- latest freshness check -----"
+          echo "$f"
+          if echo "$f" | grep -qE 'STALE|FAILED'; then
             echo "::error::One or more CREST_demo data feeds are STALE — the updater self-heal did not recover. Check https://vincewin-crest-updater.hf.space/api/status"
-            echo "$s" | tr ',' '\n' | grep -i 'STALE' || true
+            echo "$f" | grep -E 'STALE|FAILED'
             exit 1
           fi
           echo "all feeds fresh"

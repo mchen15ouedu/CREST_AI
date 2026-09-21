@@ -91,7 +91,9 @@ def _narr_source_end(now: datetime.datetime):
     if end is not None:
         with _lock:
             _narr.update(t=time.time(), end=end)
-    return end
+        return end
+    with _lock:                      # probe down: the source only moves forward,
+        return _narr["end"]          # so the last known end is still a valid floor
 
 _lock = threading.Lock()
 _cache: dict = {"t": 0.0, "snap": None}
@@ -144,7 +146,12 @@ def _check(api, var: str, now: datetime.datetime) -> dict:
            "ok": (age_d is None or age_d <= max_d) and behind <= months_max}
     if var == "temp":
         src = _narr_source_end(now)
-        if src is not None:
+        if src is None:
+            # source unknown and never seen: the calendar rule above is known to
+            # misfire on NARR's publish lag — only the hard limit decides
+            out.update(ok=age_d is None or age_d <= TEMP_HARD_D,
+                       note="NARR source probe unavailable; hard limit only")
+        else:
             caught_up = month >= (src.year, src.month)
             src_age_d = (now - src).total_seconds() / 86400.0
             out.update(source_end=src.strftime("%Y-%m-%d %H:%M"),

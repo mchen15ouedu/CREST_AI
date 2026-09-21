@@ -69,22 +69,56 @@ def _now() -> datetime:
 NARR_DODS = "https://psl.noaa.gov/thredds/dodsC/Datasets/NARR/monolevel/air.2m.{year}.nc"
 
 
-def narr_source_end(now: datetime):
-    """Last time step NOAA PSL has published for NARR air.2m (UTC), or None."""
+# Last successful probe, persisted across the hourly runs (each check is a
+# fresh subprocess). PSL's THREDDS server has outages (seen 2026-09-19: failed
+# on some hourly checks, fine on others); a remembered source end stays valid
+# because the source only ever moves forward.
+NARR_CACHE = os.environ.get(
+    "NARR_SOURCE_CACHE",
+    os.path.join(__import__("tempfile").gettempdir(), "narr_source_end.json"))
+
+
+def _probe_narr(now: datetime):
+    """(source_end, error) from PSL OPeNDAP, 3 attempts with backoff."""
     import re as _re
+    import time as _time
     import urllib.request
-    for year in (now.year, now.year - 1):       # January: last year's file
-        base = NARR_DODS.format(year=year)
+    err = None
+    for attempt in range(3):
+        for year in (now.year, now.year - 1):   # January: last year's file
+            base = NARR_DODS.format(year=year)
+            try:
+                dds = urllib.request.urlopen(base + ".dds", timeout=30).read().decode()
+                n = int(_re.search(r"time\s*=\s*(\d+)", dds).group(1))
+                asc = urllib.request.urlopen(f"{base}.ascii?time[{n - 1}:1:{n - 1}]",
+                                             timeout=30).read().decode()
+                hours = float(_re.findall(r"[-\d.]+", asc.rsplit("time", 1)[-1])[-1])
+                return datetime(1800, 1, 1) + timedelta(hours=hours), None   # hours since 1800-1-1
+            except Exception as e:
+                err = f"{type(e).__name__}: {str(e)[:80]}"
+        _time.sleep((2, 6, 0)[attempt])
+    return None, err
+
+
+def narr_source_end(now: datetime):
+    """(source_end, how) — how is 'live', 'cached <age>' or 'probe failed: <err>'
+    (then source_end is None)."""
+    import json as _json
+    end, err = _probe_narr(now)
+    if end is not None:
         try:
-            dds = urllib.request.urlopen(base + ".dds", timeout=30).read().decode()
-            n = int(_re.search(r"time\s*=\s*(\d+)", dds).group(1))
-            asc = urllib.request.urlopen(f"{base}.ascii?time[{n - 1}:1:{n - 1}]",
-                                         timeout=30).read().decode()
-            hours = float(_re.findall(r"[-\d.]+", asc.rsplit("time", 1)[-1])[-1])
-            return datetime(1800, 1, 1) + timedelta(hours=hours)   # "hours since 1800-1-1"
-        except Exception:
-            continue
-    return None
+            with open(NARR_CACHE, "w") as fp:
+                _json.dump({"end": end.isoformat(), "at": now.isoformat()}, fp)
+        except OSError:
+            pass
+        return end, "live"
+    try:
+        with open(NARR_CACHE) as fp:
+            c = _json.load(fp)
+        at = datetime.fromisoformat(c["at"])
+        return datetime.fromisoformat(c["end"]), f"cached {(now - at).total_seconds() / 3600:.0f} h ago"
+    except Exception:
+        return None, f"probe failed: {err}"
 
 
 def _latest_member(names, var) -> datetime | None:
@@ -223,13 +257,14 @@ def main() -> int:
     # TEMP: judged against its SOURCE, not the calendar (see narr_source_end)
     latest, err = check_store_var(api, "temp")
     store_lat["temp"] = latest
-    src = narr_source_end(now) if latest is not None else None
+    src, how = narr_source_end(now) if latest is not None else (None, "")
     if latest is not None and src is not None:
         gap_d = (src - latest).total_seconds() / 86400.0
         lag_d = (now - latest).total_seconds() / 86400.0
         stale = gap_d > args.temp_source_gap_days or lag_d > args.temp_hard_days
         tag = "STALE " if stale else "ok    "
-        why = (f"NARR source ends {src:%Y-%m-%d %H:%M} UTC — "
+        why = (f"NARR source ends {src:%Y-%m-%d %H:%M} UTC"
+               + ("" if how == "live" else f" ({how})") + " — "
                + (f"{gap_d:.1f} d not yet ingested" if gap_d > args.temp_source_gap_days
                   else "store caught up to the source"
                   if lag_d <= args.temp_hard_days
@@ -237,6 +272,16 @@ def main() -> int:
         # keep "(lag N d)" intact: the updater Space parses it for self-heal
         print(f"  {'TEMP':12s} {tag} latest {latest:%Y-%m-%d %H:%M} UTC "
               f"(lag {lag_d:.1f} d) · {why}")
+        ok &= not stale
+    elif latest is not None:
+        # source unknown (probe down, nothing cached): never fall back to a
+        # calendar limit that the source's own publish lag already exceeds —
+        # only the hard limit can call TEMP stale until the probe recovers
+        lag_d = (now - latest).total_seconds() / 86400.0
+        stale = lag_d > args.temp_hard_days
+        print(f"  {'TEMP':12s} {'STALE ' if stale else 'ok    '} latest "
+              f"{latest:%Y-%m-%d %H:%M} UTC (lag {lag_d:.1f} d) · NARR {how}; "
+              f"judged on the {args.temp_hard_days:g}-d hard limit only")
         ok &= not stale
     else:
         ok &= _report("TEMP", latest, err, now, timedelta(days=args.temp_days), "d")
