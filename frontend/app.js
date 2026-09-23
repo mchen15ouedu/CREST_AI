@@ -2889,6 +2889,18 @@ async function loadEvents() {
   } else if (r.last && r.last.ok === false) {
     html += `<div style="color:#ff9d9d">last run failed: ${r.last.error || ""}</div>`;
   }
+  // CREST misses (last 7 days): the nowcast + gauge opened an event but EF5
+  // did not reproduce the flood, so no map was published — say so instead
+  // of showing a dry basin beside a flooding gauge
+  const missCut = Date.now() - 7 * 86400e3;
+  const misses = (d.missed || []).filter((m) => Date.parse(m.at || m.t0 || 0) >= missCut)
+    .sort((a, b) => (b.at || "").localeCompare(a.at || ""));
+  misses.slice(0, 6).forEach((m) => {
+    html += `<div style="color:#f0b060;font-size:12px" title="EF5 peak ${m.sim_peak_m3s} m³/s vs observed ${m.obs_peak_m3s} m³/s at the trigger gauge — no inundation map (CREST-miss guard)">` +
+      `⚠ CREST missed <b>${m.gauge}</b> · ${(m.t0 || "").slice(5, 16).replace("T", " ")}Z · ` +
+      `EF5 ${m.sim_peak_m3s} vs obs ${m.obs_peak_m3s} m³/s (${Math.round((m.frac || 0) * 100)}%)</div>`;
+  });
+  if (misses.length > 6) html += `<div style="color:#8fa3b8;font-size:11px">+${misses.length - 6} more CREST misses this week</div>`;
   // in-flight worker queue: events exist here before they publish — without
   // this, GPU-solved events were invisible for hours ("no new events?")
   (d.queue || []).forEach((q) => {

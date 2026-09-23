@@ -111,11 +111,20 @@ def status(full: bool = False) -> dict:
     return {"running": _running["id"], "status": _running["status"],
             "started": _running.get("started"), "busy_h": _busy_h(),
             "log": _running["log"][-(400 if full else 30):],
-            "last": _running["last"]}
+            "last": _running["last"],
+            "missed": _running.get("missed", [])[-20:]}
 
 
 OBS_GATE_FRAC = float(os.environ.get("EVENT_OBS_GATE", "0.3"))   # of Q2
 OBS_WINDOW_H = int(os.environ.get("EVENT_OBS_WINDOW_H", "6"))
+# CREST-miss guard (user 2026-09-23): the event list is decided by the nowcast
+# trigger + the USGS observation, but the 2-D solver only has the water EF5
+# delivers (routed flow is a boundary condition, runoff routes inside). When
+# EF5's peak at the trigger gauge over the anchored window is below this
+# fraction of the observed peak, the map would be a dry basin beside a
+# flooding gauge — publish nothing, record the miss. No runoff scaling: a
+# bias-corrected forcing is not a simulation. 0 disables the guard.
+MIN_SIM_FRAC = float(os.environ.get("EVENT_MIN_SIM_FRAC", "0.3"))
 
 
 def _recent_obs_max(gid: str) -> float | None:
@@ -123,21 +132,63 @@ def _recent_obs_max(gid: str) -> float | None:
     hours from NWIS IV; None if the gauge reports nothing."""
     import json as _json
     import urllib.request
-    url = ("https://waterservices.usgs.gov/nwis/iv/?format=json"
-           f"&sites={gid}&period=PT{OBS_WINDOW_H}H&parameterCd=00060")
-    try:
-        with urllib.request.urlopen(url, timeout=30) as r:
-            d = _json.load(r)
-        vals = []
-        for ts in d["value"]["timeSeries"]:
-            for block in ts["values"]:
-                for v in block["value"]:
-                    q = float(v["value"])
-                    if q > -999:
-                        vals.append(q * 0.0283168)   # cfs -> m3/s
-        return max(vals) if vals else None
-    except Exception:
+    # two hosts: waterservices.usgs.gov answered 503 for a whole day
+    # (2026-09-22) while nwis.waterservices.usgs.gov served the same query
+    for host in ("nwis.waterservices.usgs.gov", "waterservices.usgs.gov"):
+        url = (f"https://{host}/nwis/iv/?format=json"
+               f"&sites={gid}&period=PT{OBS_WINDOW_H}H&parameterCd=00060")
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                d = _json.load(r)
+            vals = []
+            for ts in d["value"]["timeSeries"]:
+                for block in ts["values"]:
+                    for v in block["value"]:
+                        q = float(v["value"])
+                        if q > -999:
+                            vals.append(q * 0.0283168)   # cfs -> m3/s
+            return max(vals) if vals else None
+        except Exception:
+            continue
+    return None
+
+
+def _crest_missed(hydro: dict, trigger: dict | None, gid: str,
+                  t_from: datetime.datetime, log=print) -> dict | None:
+    """EF5 peak at the trigger gauge from t_from on vs the observed peak
+    (hydro obs rows, else the trigger's observation, else NWIS now). A dict
+    describing the miss when sim < MIN_SIM_FRAC x obs, else None."""
+    if MIN_SIM_FRAC <= 0:
         return None
+    key = t_from.strftime("%Y-%m-%d %H:%M")
+    rows = [r for k, r in hydro.items() if k >= key] or list(hydro.values())
+    sims = [r["sim_q"] for r in rows if r.get("sim_q") is not None]
+    obss = [r["obs_q"] for r in rows if r.get("obs_q") is not None]
+    if not sims:
+        return None
+    sim_pk = max(sims)
+    src = "hydro"
+    obs_pk = max(obss) if obss else None
+    if obs_pk is None:
+        obs_pk = (trigger or {}).get("obs_m3s")
+        src = "trigger"
+    if obs_pk is None:
+        obs_pk = _recent_obs_max(gid)
+        src = "nwis"
+    try:
+        obs_pk = float(obs_pk)
+    except (TypeError, ValueError):
+        return None
+    if obs_pk <= 0:
+        return None
+    frac = sim_pk / obs_pk
+    log(f"CREST check: EF5 peak {sim_pk:.1f} m3/s vs observed peak "
+        f"{obs_pk:.1f} m3/s ({src}) = {100 * frac:.0f}% "
+        f"(guard {100 * MIN_SIM_FRAC:.0f}%)")
+    if frac >= MIN_SIM_FRAC:
+        return None
+    return {"sim_peak_m3s": round(sim_pk, 2), "obs_peak_m3s": round(obs_pk, 2),
+            "frac": round(frac, 3), "obs_source": src}
 
 
 def _age_days_started(s: dict) -> float | None:
@@ -381,6 +432,29 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         out_dir = os.path.join(work, "CREST_output")
         model = (meta.get("model") or "crest").lower()
         wb_model = "crest" if model in ("crest", "hp") else "crestphys"
+
+        # CREST-miss guard: no map when EF5 missed the flood the gauge saw
+        miss = _crest_missed(hydro, trigger, gid, sim_anchor, log)
+        if miss:
+            rec = {"event": ev_id, "gauge": gid, "t0": t0.strftime("%Y-%m-%dT%H:%MZ"),
+                   "episode": bool(episode_id),
+                   "at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   **miss}
+            log(f"CREST MISSED IT: EF5 peak {miss['sim_peak_m3s']} m3/s is "
+                f"{100 * miss['frac']:.0f}% of the observed {miss['obs_peak_m3s']} "
+                f"m3/s — no inundation map published for {ev_id}"
+                + (" (existing map left as is)" if episode_id else ""))
+            with _lock:
+                _running.setdefault("missed", []).append(rec)
+                del _running["missed"][:-50]
+            try:
+                eventstore.note_missed(rec)
+            except Exception as e:
+                log(f"missed.json not updated ({type(e).__name__})")
+            _running["last"] = {"event": ev_id, "ok": True,
+                                "skipped": "crest_missed", **miss}
+            return {"event_id": ev_id, "published": False,
+                    "skipped": "crest_missed", **miss}
 
         # diagnostics: what did EF5 actually write, and what did we ask for?
         ctl = os.path.join(work, "control.txt")

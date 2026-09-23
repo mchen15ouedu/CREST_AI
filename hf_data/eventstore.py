@@ -146,6 +146,47 @@ def load_index() -> dict:
         return {}
 
 
+MISSED_FILE = f"{PREFIX}/missed.json"
+MISSED_KEEP = 200
+
+
+def load_missed() -> list:
+    """Recorded CREST misses (newest last): events the trigger opened but
+    EF5 did not reproduce, so no map was published. [] on any failure."""
+    try:
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(REPO, MISSED_FILE, repo_type="dataset",
+                            token=os.environ.get("HF_TOKEN"))
+        with open(p, encoding="utf-8") as fp:
+            return json.load(fp)
+    except Exception:
+        return []
+
+
+def note_missed(rec: dict) -> bool:
+    """Append one miss record (replacing an earlier record of the same event
+    id, so an hourly re-check does not pile up) and commit."""
+    from huggingface_hub import CommitOperationAdd
+    api = _api()
+    if api is None:
+        return False
+    with _lock:
+        rows = [r for r in load_missed() if r.get("event") != rec.get("event")]
+        rows.append(rec)
+        rows = rows[-MISSED_KEEP:]
+        try:
+            api.create_commit(
+                repo_id=REPO, repo_type="dataset",
+                operations=[CommitOperationAdd(
+                    MISSED_FILE, io.BytesIO(json.dumps(rows).encode()))],
+                commit_message=f"CREST missed {rec.get('event')}: EF5 peak "
+                               f"{rec.get('sim_peak_m3s')} vs observed "
+                               f"{rec.get('obs_peak_m3s')} m3/s — no map")
+            return True
+        except Exception:
+            return False
+
+
 def publish_event(local_dir: str, manifest: dict) -> bool:
     """Upload one finished event dir + updated index + prune old events,
     all in a single commit. Returns True on success."""

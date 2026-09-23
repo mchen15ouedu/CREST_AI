@@ -733,8 +733,12 @@ def api_events(full: int = 0):
     except Exception:
         q = []
     runner = _remote_runner_status() or eventsim.status(bool(full))
+    try:                       # CREST misses: trigger fired, EF5 did not
+        missed = eventstore.load_missed()[-30:]
+    except Exception:
+        missed = []
     return {"events": eventstore.load_index(), "queue": q,
-            "runner": runner,
+            "runner": runner, "missed": missed,
             "base": (f"https://huggingface.co/datasets/{eventstore.REPO}/"
                      f"resolve/main/{eventstore.PREFIX}")}
 
