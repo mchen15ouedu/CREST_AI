@@ -187,6 +187,43 @@ def note_missed(rec: dict) -> bool:
             return False
 
 
+def drop_events(event_ids, purge: bool = True, why: str = "") -> bool:
+    """Remove events from the list (and, with purge, delete their result
+    folders) — e.g. an episode whose map the CREST-miss guard disowned."""
+    from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+    api = _api()
+    ids = [e for e in event_ids if e]
+    if api is None or not ids:
+        return False
+    with _lock:
+        idx = load_index()
+        gone = [e for e in ids if e in idx]
+        for e in gone:
+            idx.pop(e, None)
+        ops = []
+        if gone:
+            ops.append(CommitOperationAdd(f"{PREFIX}/index.json",
+                                          io.BytesIO(json.dumps(idx).encode())))
+        if purge:
+            try:
+                allfiles = api.list_repo_files(REPO, repo_type="dataset")
+            except Exception:
+                allfiles = []
+            stored = {f.split("/")[1] for f in allfiles
+                      if f.startswith(f"{PREFIX}/") and f.count("/") >= 2}
+            ops += [CommitOperationDelete(f"{PREFIX}/{e}/", is_folder=True)
+                    for e in ids if e in stored]
+        if not ops:
+            return False
+        try:
+            api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
+                              commit_message=f"drop {len(ids)} event(s)"
+                                             f"{': ' + why if why else ''}")
+            return True
+        except Exception:
+            return False
+
+
 def publish_event(local_dir: str, manifest: dict) -> bool:
     """Upload one finished event dir + updated index + prune old events,
     all in a single commit. Returns True on success."""

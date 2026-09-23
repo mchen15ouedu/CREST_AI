@@ -443,7 +443,16 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
             log(f"CREST MISSED IT: EF5 peak {miss['sim_peak_m3s']} m3/s is "
                 f"{100 * miss['frac']:.0f}% of the observed {miss['obs_peak_m3s']} "
                 f"m3/s — no inundation map published for {ev_id}"
-                + (" (existing map left as is)" if episode_id else ""))
+                + (" (listed map disowned: dropped from the list)"
+                   if episode_id else ""))
+            if episode_id:
+                # the listed map came from the same EF5 water — just as
+                # wrong; take it down rather than leave a dry basin listed
+                try:
+                    eventstore.drop_events([episode_id], purge=True,
+                                           why="CREST missed it")
+                except Exception as e:
+                    log(f"drop failed ({type(e).__name__})")
             with _lock:
                 _running.setdefault("missed", []).append(rec)
                 del _running["missed"][:-50]
