@@ -2901,6 +2901,13 @@ async function loadEvents() {
       `EF5 ${m.sim_peak_m3s} vs obs ${m.obs_peak_m3s} m³/s (${Math.round((m.frac || 0) * 100)}%)</div>`;
   });
   if (misses.length > 6) html += `<div style="color:#8fa3b8;font-size:11px">+${misses.length - 6} more CREST misses this week</div>`;
+  // auto-calibrations triggered by whole-event misses (CREST_autocal Space)
+  (d.autocal || []).filter((a) => a.ran && Date.parse(a.at || 0) >= missCut).slice(-3).reverse().forEach((a) => {
+    const f = (v) => (v === null || v === undefined) ? "n/a" : Number(v).toFixed(2);
+    html += `<div style="color:#9fd8c8;font-size:12px" title="6-month auto-calibration after CREST missed every hourly check of event ${a.event}">` +
+      `🤖 auto-calibrated <b>${a.gauge}</b> · NSE ${f(a.baseline_nse)} → ${f(a.best_nse)}` +
+      `${a.saved ? " · saved" : " · not better"}</div>`;
+  });
   // in-flight worker queue: events exist here before they publish — without
   // this, GPU-solved events were invisible for hours ("no new events?")
   (d.queue || []).forEach((q) => {

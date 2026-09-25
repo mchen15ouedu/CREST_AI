@@ -220,8 +220,12 @@ def backup() -> dict:
         expected = set(local)
         expected |= {r[:-4] + ".pqf" for r in local
                      if r.startswith("states/") and r.endswith(".tif")}
+        # params/ is append-only across Spaces: a winner calibrated on the
+        # CREST_autocal Space exists in the repo before any local copy here
+        # and must not be mirrored away as an "eviction"
         gone = [f for f in in_repo
-                if f.split("/")[0] in SYNC_DIRS and f not in expected]
+                if f.split("/")[0] in SYNC_DIRS and f not in expected
+                and not f.startswith("params/")]
         ops += [CommitOperationDelete(path_in_repo=f) for f in gone]
         if not ops:
             rep = {"changed": 0, "deleted": 0}

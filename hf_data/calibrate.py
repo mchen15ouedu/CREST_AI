@@ -157,8 +157,13 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                     model: str = "auto", snow: str = "auto", use_mock: bool = True,
                     rounds: int = 4, k: int = 3, timestep: str = "1h",
                     ext_rounds: int = EXT_ROUNDS, ext_k: int = EXT_K,
-                    ext_nse: float = EXT_NSE):
+                    ext_nse: float = EXT_NSE, save_vs_baseline: bool = False):
     """Generator of calibration events for the SSE stream.
+
+    save_vs_baseline: judge the winner against the baseline NSE measured on
+    THIS window (auto-calibration after a missed flood) rather than the
+    stored record's NSE from whatever window it came from; the saved record
+    is also pushed to CREST_state so other Spaces pick it up.
 
     Two-stage budget: rounds*k candidates, then — only if the best NSE is
     still below ext_nse — one extended stage of ext_rounds*ext_k more.
@@ -266,8 +271,13 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
         wb_best = {p: best_params[p] for p in wb0 if p in best_params}
         kw_best = {p: best_params[p] for p in kw0 if p in best_params}
         saved = paramstore.maybe_save(
-            g["id"], ef5_model, wb_best, kw_best, best_nse, source="ai-cali",
-            window=[t_start.strftime("%Y-%m-%d %H:%M"), t_end.strftime("%Y-%m-%d %H:%M")])
+            g["id"], ef5_model, wb_best, kw_best, best_nse,
+            source="auto-cali" if save_vs_baseline else "ai-cali",
+            window=[t_start.strftime("%Y-%m-%d %H:%M"), t_end.strftime("%Y-%m-%d %H:%M")],
+            baseline_nse=(base_nse if save_vs_baseline else None))
+        if saved and save_vs_baseline:
+            yield ("status", "winner pushed to CREST_state: "
+                   + ("ok" if paramstore.push_remote(g["id"], ef5_model) else "FAILED"))
     yield ("done", {"best_nse": best_nse, "baseline_nse": base_nse,
                     "best_params": best_params, "saved": saved, "improved": improved,
                     "extended": extended})

@@ -164,14 +164,26 @@ def load_missed() -> list:
 
 
 def note_missed(rec: dict) -> bool:
-    """Append one miss record (replacing an earlier record of the same event
-    id, so an hourly re-check does not pile up) and commit."""
+    """Record one miss. One row per event id: the row carries the latest
+    check's numbers plus `checks` (every hourly check so far: at, t0, frac,
+    sim/obs peaks), `n_checks` and `first_at` — the auto-calibration
+    trigger reads 'missed every hour for the whole event' from that history."""
     from huggingface_hub import CommitOperationAdd
     api = _api()
     if api is None:
         return False
     with _lock:
-        rows = [r for r in load_missed() if r.get("event") != rec.get("event")]
+        rows = load_missed()
+        prev = next((r for r in rows if r.get("event") == rec.get("event")), None)
+        rows = [r for r in rows if r.get("event") != rec.get("event")]
+        checks = list((prev or {}).get("checks") or [])
+        if prev and not checks:                 # pre-history row: keep its check
+            checks.append({k: prev.get(k) for k in ("at", "t0", "frac",
+                                                    "sim_peak_m3s", "obs_peak_m3s")})
+        checks.append({k: rec.get(k) for k in ("at", "t0", "frac",
+                                               "sim_peak_m3s", "obs_peak_m3s")})
+        rec = {**rec, "checks": checks[-100:], "n_checks": len(checks),
+               "first_at": (prev or {}).get("first_at") or rec.get("at")}
         rows.append(rec)
         rows = rows[-MISSED_KEEP:]
         try:
@@ -182,6 +194,48 @@ def note_missed(rec: dict) -> bool:
                 commit_message=f"CREST missed {rec.get('event')}: EF5 peak "
                                f"{rec.get('sim_peak_m3s')} vs observed "
                                f"{rec.get('obs_peak_m3s')} m3/s — no map")
+            return True
+        except Exception:
+            return False
+
+
+AUTOCAL_FILE = f"{PREFIX}/autocal.json"
+AUTOCAL_KEEP = 500
+
+
+def load_autocal() -> list:
+    """Auto-calibration records (newest last): one per (event, gauge) the
+    CREST_autocal Space looked at — ran (with before/after NSE and whether
+    the winner was saved) or skipped with a reason. [] on any failure."""
+    try:
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(REPO, AUTOCAL_FILE, repo_type="dataset",
+                            token=os.environ.get("HF_TOKEN"),
+                            force_download=True)
+        with open(p, encoding="utf-8") as fp:
+            return json.load(fp)
+    except Exception:
+        return []
+
+
+def note_autocal(rec: dict) -> bool:
+    """Append one auto-calibration record and commit."""
+    from huggingface_hub import CommitOperationAdd
+    api = _api()
+    if api is None:
+        return False
+    with _lock:
+        rows = load_autocal()
+        rows.append(rec)
+        rows = rows[-AUTOCAL_KEEP:]
+        try:
+            api.create_commit(
+                repo_id=REPO, repo_type="dataset",
+                operations=[CommitOperationAdd(
+                    AUTOCAL_FILE, io.BytesIO(json.dumps(rows).encode()))],
+                commit_message=f"autocal {rec.get('gauge')}: "
+                               f"{'ran' if rec.get('ran') else 'skipped'} "
+                               f"({rec.get('reason') or 'NSE %s -> %s' % (rec.get('baseline_nse'), rec.get('best_nse'))})")
             return True
         except Exception:
             return False

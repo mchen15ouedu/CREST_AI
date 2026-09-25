@@ -737,8 +737,12 @@ def api_events(full: int = 0):
         missed = eventstore.load_missed()[-30:]
     except Exception:
         missed = []
+    try:                       # auto-calibrations those misses triggered
+        autocal = eventstore.load_autocal()[-10:]
+    except Exception:
+        autocal = []
     return {"events": eventstore.load_index(), "queue": q,
-            "runner": runner, "missed": missed,
+            "runner": runner, "missed": missed, "autocal": autocal,
             "base": (f"https://huggingface.co/datasets/{eventstore.REPO}/"
                      f"resolve/main/{eventstore.PREFIX}")}
 
