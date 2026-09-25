@@ -2893,14 +2893,22 @@ async function loadEvents() {
   // did not reproduce the flood, so no map was published — say so instead
   // of showing a dry basin beside a flooding gauge
   const missCut = Date.now() - 7 * 86400e3;
-  const misses = (d.missed || []).filter((m) => Date.parse(m.at || m.t0 || 0) >= missCut)
-    .sort((a, b) => (b.at || "").localeCompare(a.at || ""));
-  misses.slice(0, 6).forEach((m) => {
-    html += `<div style="color:#f0b060;font-size:12px" title="EF5 peak ${m.sim_peak_m3s} m³/s vs observed ${m.obs_peak_m3s} m³/s at the trigger gauge — no inundation map (CREST-miss guard)">` +
-      `⚠ CREST missed <b>${m.gauge}</b> · ${(m.t0 || "").slice(5, 16).replace("T", " ")}Z · ` +
+  // one line per gauge: every hourly re-check of a still-flagged gauge is its
+  // own miss row (new event id each hour), so show the latest with the count
+  const byGauge = new Map();
+  (d.missed || []).filter((m) => Date.parse(m.at || m.t0 || 0) >= missCut).forEach((m) => {
+    const g = byGauge.get(m.gauge) || { n: 0, latest: m };
+    g.n += (m.n_checks || 1);
+    if ((m.at || "") > (g.latest.at || "")) g.latest = m;
+    byGauge.set(m.gauge, g);
+  });
+  const misses = [...byGauge.values()].sort((a, b) => (b.latest.at || "").localeCompare(a.latest.at || ""));
+  misses.slice(0, 6).forEach(({ n, latest: m }) => {
+    html += `<div style="color:#f0b060;font-size:12px" title="EF5 peak ${m.sim_peak_m3s} m³/s vs observed ${m.obs_peak_m3s} m³/s at the trigger gauge — no inundation map (CREST-miss guard); ${n} hourly check(s) missed this week">` +
+      `⚠ CREST missed <b>${m.gauge}</b> · ${n}× · last ${(m.t0 || "").slice(5, 16).replace("T", " ")}Z · ` +
       `EF5 ${m.sim_peak_m3s} vs obs ${m.obs_peak_m3s} m³/s (${Math.round((m.frac || 0) * 100)}%)</div>`;
   });
-  if (misses.length > 6) html += `<div style="color:#8fa3b8;font-size:11px">+${misses.length - 6} more CREST misses this week</div>`;
+  if (misses.length > 6) html += `<div style="color:#8fa3b8;font-size:11px">+${misses.length - 6} more gauges CREST missed this week</div>`;
   // auto-calibrations triggered by whole-event misses (CREST_autocal Space)
   (d.autocal || []).filter((a) => a.ran && Date.parse(a.at || 0) >= missCut).slice(-3).reverse().forEach((a) => {
     const f = (v) => (v === null || v === undefined) ? "n/a" : Number(v).toFixed(2);
