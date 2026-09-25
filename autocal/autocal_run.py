@@ -178,7 +178,9 @@ def calibrate_one(rec: dict, now: dt.datetime) -> dict:
     info = {}
     series = obs.get_series(gid, t_start, t_end, info=info)
     hours = max(1.0, (t_end - t_start).total_seconds() / 3600.0)
-    frac = len(series) / hours
+    # NWIS rows are 15-min: count the distinct HOURS observed, not the rows
+    frac = min(1.0, len({t.replace(minute=0, second=0, microsecond=0)
+                         for t, _ in series}) / hours)
     if frac < OBS_MIN_FRAC:
         return {**base, "ran": False,
                 "reason": f"obs cover {100 * frac:.0f}% of the window (< {100 * OBS_MIN_FRAC:.0f}%)"
