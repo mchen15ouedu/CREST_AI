@@ -118,21 +118,9 @@ def maybe_save(gauge: str, model: str, wb: dict, kw: dict, nse: float | None,
            "window": window}
     with open(_path(gauge, model), "w", encoding="utf-8") as fh:
         json.dump(rec, fh, indent=1)
-    # cached hydrograph rows + rendered 2-D frames were produced with the OLD
-    # params — drop both so the next run regenerates them. Speed runs cache
-    # under "<model>-spd" (pipeline cache_model): invalidate that too, or a
-    # post-calibration speed rerun replays the pre-calibration hydrograph.
-    for m in (model, model + "-spd"):
-        try:
-            rp = statecache.results_path(gauge, m)
-            if os.path.exists(rp):
-                os.remove(rp)
-        except Exception:
-            pass
-        try:
-            import shutil
-            from hf_data import viz
-            shutil.rmtree(viz.frames_cache_dir(gauge, m), ignore_errors=True)
-        except Exception:
-            pass
+    # NOTE (UX isolation, 2026-09-28): caches are NOT purged any more. The
+    # pipeline keys rows and frames by a tag that includes this record's
+    # `when`, so the next run simply lands under a new key while anyone's run
+    # in flight keeps its own — deleting shared caches under a live job broke
+    # other users' animations.
     return True

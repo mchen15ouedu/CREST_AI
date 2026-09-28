@@ -29,10 +29,64 @@ FRAME_PACE_S = float(os.environ.get("CREST_FRAME_PACE_S", "0.01"))
 
 _JOBS: dict[str, "SimJob"] = {}
 
+# ---- CPU admission (UX isolation, user 2026-09-28) --------------------------
+# Every job used to open its own pool of MAX_CONCURRENT EF5 processes, so
+# three users could put 12 EF5s on the Space's cores and stall everyone's
+# hydrograph. One server-wide cap plus a per-browser cap: a user's third
+# gauge waits behind their own first two, never behind someone else's ten.
+GLOBAL_CONCURRENT = int(os.environ.get("CREST_GLOBAL_CONCURRENT", "6"))
+PER_USER_CONCURRENT = int(os.environ.get("CREST_PER_USER_CONCURRENT", "2"))
+_GLOBAL = threading.BoundedSemaphore(GLOBAL_CONCURRENT)
+_PER_USER: dict[str, threading.BoundedSemaphore] = {}
+_ADMIT_GUARD = threading.Lock()
+_running_n = {"n": 0}
+
+
+def _user_sem(key: str) -> threading.BoundedSemaphore:
+    with _ADMIT_GUARD:
+        if key not in _PER_USER:
+            _PER_USER[key] = threading.BoundedSemaphore(PER_USER_CONCURRENT)
+        return _PER_USER[key]
+
+
+def _acquire(sem, cancel, on_wait, what: str) -> bool:
+    """Blocking acquire that stays cancellable; on_wait(msg) once if queued."""
+    if sem.acquire(blocking=False):
+        return True
+    on_wait(what)
+    while not sem.acquire(timeout=2):
+        if cancel is not None and cancel.is_set():
+            return False
+    return True
+
+
+def admit(owner_key: str, cancel, on_wait) -> bool:
+    """Per-user slot first (own fairness), then a global slot. False = cancelled."""
+    if not _acquire(_user_sem(owner_key), cancel, on_wait,
+                    f"⏳ waiting for one of your {PER_USER_CONCURRENT} simulation "
+                    f"slots (your other gauges are still running)"):
+        return False
+    if not _acquire(_GLOBAL, cancel, on_wait,
+                    f"⏳ waiting for a free CPU slot ({_running_n['n']} of "
+                    f"{GLOBAL_CONCURRENT} busy server-wide)"):
+        _user_sem(owner_key).release()
+        return False
+    with _ADMIT_GUARD:
+        _running_n["n"] += 1
+    return True
+
+
+def release(owner_key: str):
+    with _ADMIT_GUARD:
+        _running_n["n"] = max(0, _running_n["n"] - 1)
+    _GLOBAL.release()
+    _user_sem(owner_key).release()
+
 
 class SimJob:
-    def __init__(self, gauge_ids, t_start, t_end, opts):
+    def __init__(self, gauge_ids, t_start, t_end, opts, owner=None):
         self.id = uuid.uuid4().hex[:8]
+        self.owner = owner or {}                 # {sid, user, token} — see server._owns
         self.gauge_ids = gauge_ids[:MAX_SIMS]
         self.t_start, self.t_end = t_start, t_end
         self.opts = opts or {}
@@ -68,6 +122,13 @@ class SimJob:
     def _run_one(self, gid):
         if self.cancel.is_set():                 # stopped while still queued
             self._finished.add(gid)
+            self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -9,
+                        "n": len(self.hydro.get(gid, []))})
+            return
+        okey = self.owner.get("sid") or "anon"
+        if not admit(okey, self.cancel,
+                     lambda msg: self._emit({"kind": "status", "gauge_id": gid, "msg": msg})):
+            self._finished.add(gid)             # stopped while waiting for a slot
             self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -9,
                         "n": len(self.hydro.get(gid, []))})
             return
@@ -147,6 +208,8 @@ class SimJob:
             self._finished.add(gid)
             self._emit({"kind": "status", "gauge_id": gid, "msg": f"⚠️ {e}"})
             self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -1})
+        finally:
+            release(okey)
 
     def _build_timeline(self, gid):
         """After a gauge finishes, pre-render all frames with a fixed color scale
@@ -236,8 +299,9 @@ class SimJob:
 MAX_KEPT_JOBS = 30            # finished jobs kept in RAM for reattach/replay
 
 
-def start_job(gauge_ids, t_start: datetime, t_end: datetime, opts) -> SimJob:
-    job = SimJob(gauge_ids, t_start, t_end, opts)
+def start_job(gauge_ids, t_start: datetime, t_end: datetime, opts,
+              owner=None) -> SimJob:
+    job = SimJob(gauge_ids, t_start, t_end, opts, owner=owner)
     _JOBS[job.id] = job
     if len(_JOBS) > MAX_KEPT_JOBS:            # prune the oldest FINISHED jobs
         for jid in sorted(_JOBS, key=lambda j: _JOBS[j].created):

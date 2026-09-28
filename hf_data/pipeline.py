@@ -209,6 +209,29 @@ _RUN_LOCKS: dict[tuple, threading.Lock] = {}
 _RUN_LOCKS_GUARD = threading.Lock()
 
 
+def config_tag(stored: dict | None, overrides: dict | None, snow: str) -> str:
+    """Fingerprint of everything besides (gauge, model, scheme) that changes
+    the rows a run produces: the stored parameter record it starts from, the
+    advanced-panel overrides, and a non-default snow choice. Empty for a
+    default run — that is the key the fleet precomputed under. Rows and
+    frames cache under model+tag; EF5 state grids stay under the base key.
+    (UX isolation, user 2026-09-28: a custom run must never be served another
+    user's rows, and a calibration winner is a new key, not a cache purge.)"""
+    import hashlib
+    import json as _json
+    parts = {}
+    if stored:
+        parts["p"] = stored.get("when") or stored.get("nse")
+    if overrides:
+        parts["o"] = {k: overrides[k] for k in sorted(overrides)}
+    if snow and snow != "auto":
+        parts["s"] = snow
+    if not parts:
+        return ""
+    return hashlib.sha1(_json.dumps(parts, sort_keys=True, default=str)
+                        .encode()).hexdigest()[:8]
+
+
 def _run_lock(gauge_id: str, model: str) -> threading.Lock:
     key = (str(gauge_id).zfill(8), model)
     with _RUN_LOCKS_GUARD:
@@ -280,10 +303,17 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
             grids = False
     yield ("meta", {**g, "model": model})        # for the report + right panel
 
-    lock = _run_lock(g["id"], ef5_model)
-    if not lock.acquire(blocking=False):
-        yield ("status", "⏳ another simulation of this gauge is already running — "
-                         "queued behind it (its results are shared via the cache)")
+    # the run lock guards the SHARED row/state cache of one configuration:
+    # keyed by the same tag the cache uses, so a custom-parameter run never
+    # waits behind a default one, and skipped entirely by no_cache runs
+    # (calibration candidates, nowcast / event runs) — they own their workdir
+    # and write no cache, so a calibration no longer blocks other users
+    tag = config_tag(paramstore.get(g["id"], ef5_model), overrides, snow)
+    lock = None if (no_cache or nowcast_t0) else \
+        _run_lock(g["id"], ef5_model + (f"-{tag}" if tag else ""))
+    if lock is not None and not lock.acquire(blocking=False):
+        yield ("status", "⏳ this exact run is already in progress for someone "
+                         "else — waiting for it (the results are shared)")
         while not lock.acquire(timeout=2):       # keep the queue cancellable
             if cancel is not None and cancel.is_set():
                 yield ("status", "⏹ stopped while queued")
@@ -295,7 +325,8 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
                                    warmup_days, grids, no_cache, workdir, cancel,
                                    scheme, nowcast_t0, domain_bbox)
     finally:
-        lock.release()
+        if lock is not None:
+            lock.release()
 
 
 def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
@@ -428,7 +459,13 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                                  "gauges) — running the full basin")
     # separate cache/state keys per scheme: rows, frames and EF5 state grids
     # from a truncated domain must never mix with full-basin ones
-    cache_model = ef5_model + ("-spd" if speed else "")
+    # rows + frames key: scheme + configuration tag (stored params, overrides,
+    # snow); EF5 states key: scheme only (shared warm starts; written only by
+    # default runs so a custom run cannot poison the shared state grids)
+    stored = paramstore.get(g["id"], ef5_model)       # best-known set for this basin
+    tag = config_tag(stored, overrides, snow)
+    state_model = ef5_model + ("-spd" if speed else "")
+    cache_model = state_model + (f"-{tag}" if tag else "")
     variant = (("cut:" + ",".join(sorted(c["id"] for c in speed["cut"]))) if speed
                else "bc:" + (",".join(sorted(b_["id"] for b_ in bc_gauges)) or "none"))
 
@@ -445,7 +482,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             and not g.get("virtual"):
         try:      # fleet pre-runs (read-only repo): rows serve instantly below,
             from hf_data import fleetstore     # states give 10-day warm starts
-            if fleetstore.ensure_local(g["id"], cache_model) == "fetched":
+            if fleetstore.ensure_local(g["id"], state_model) == "fetched":
                 yield ("status", "🚚 pre-simulated by the background fleet — "
                                  "loading saved results and model states")
         except Exception:
@@ -454,14 +491,15 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     # --- result cache: reuse overlap, simulate only the missing window (task #6) ---
     # the row cache is hourly; a sub-hourly run neither reuses nor writes it
     hourly = timestep == "1h" and not no_cache
-    pl = statecache.plan(g["id"], cache_model, t_start, t_end, variant=variant) \
+    pl = statecache.plan(g["id"], cache_model, t_start, t_end, variant=variant,
+                         state_model=state_model) \
         if timestep == "1h" else {
         "cached_rows": [], "run_start": t_start, "run_end": t_end,
         "load_state_time": None, "warmup_from": None, "need_warmup": True,
         "reason": "sub-hourly timestep — cache bypassed"}
     if no_cache:            # calibration: fresh full-window run; candidates
         # still warm-start from any state saved on disk at/near t_start
-        ex, wfrom, needw = statecache._state_choice(g["id"], cache_model, t_start)
+        ex, wfrom, needw = statecache._state_choice(g["id"], state_model, t_start)
         pl = {"cached_rows": [], "run_start": t_start, "run_end": t_end,
               "load_state_time": ex, "warmup_from": wfrom, "need_warmup": needw,
               "reason": "calibration run — row cache bypassed"}
@@ -475,7 +513,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         # then only renders frames, its duplicate row stream suppressed.
         from hf_data import viz as _viz
         if not _viz.has_frames_cache(g["id"], cache_model, t_start, t_end):
-            lt, wf, nw = statecache._state_choice(g["id"], cache_model, t_start)
+            lt, wf, nw = statecache._state_choice(g["id"], state_model, t_start)
             pl = {"cached_rows": pl["cached_rows"], "run_start": t_start,
                   "run_end": t_end,
                   "load_state_time": lt, "warmup_from": wf, "need_warmup": nw,
@@ -523,8 +561,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         # HP water balance has its own 2 params (fractions in [0,1]);
         # calibrated KW routing params are still used
         wb = {"precip": 1.0, "split": 0.5}
-    stored = paramstore.get(g["id"], ef5_model)       # best-known set for this basin
-    if stored:
+    if stored:                                        # (read above, with the tag)
         wb = {**wb, **{k: v for k, v in stored.get("wb", {}).items() if k in wb}}
         kw = {**kw, **{k: v for k, v in stored.get("kw", {}).items() if k in kw}}
         yield ("status", f"🎯 using stored best parameters ({stored.get('source','?')}, "
@@ -571,7 +608,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     pet_dir = forcing.store_dir("pet", bbox)
     temp_dir = forcing.store_dir("temp", bbox)
 
-    sdir = statecache.state_dir(g["id"], cache_model)
+    sdir = statecache.state_dir(g["id"], state_model)
     warmup_start = None
     if pl["need_warmup"] and (pl.get("warmup_from") or warmup_days > 0):
         # nearby state -> short gap; else the full warm-up (knob, default 90 d; 0 = cold start)
@@ -694,7 +731,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         # calibration candidates (no_cache) warm-START from saved states but must
         # never SAVE: trial-parameter states would overwrite the legitimate
         # end-of-window state grids in the shared cache
-        state_dir=sdir, warmup_start=warmup_start, save_state_end=not no_cache,
+        state_dir=sdir, warmup_start=warmup_start, save_state_end=(not no_cache and not tag),   # default runs only
         snow_on=snow_on, snow_scalars=snow_scalars, snow_grids=snow_grids, temp_dir=temp_dir,
         temp_dem=temp_dem, da_file=da_file, per_gauge=per_gauge or None)
     build_control(spec)

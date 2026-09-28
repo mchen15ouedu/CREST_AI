@@ -567,6 +567,7 @@ async function simulate() {
                              // a still-running previous job would hold the per-gauge
                              // lock — the server stops it so this run starts now
                              prev_sim_id: safeStore.getItem("lastSimId") || null,
+                             prev_tok: safeStore.getItem("lastSimTok") || null,
                              ...opt }),
     });
     d = await r.json();
@@ -578,6 +579,7 @@ async function simulate() {
   }
   if (d.warning) addMsg("⚠️ " + d.warning, "status");
   safeStore.setItem("lastSimId", d.sim_id);   // reattach after closing the app
+  safeStore.setItem("lastSimTok", d.token || "");   // proves this browser started it
   resetAnim();
   zoomedToOverlay = false;
   const tS = d.t_start || win.tStart, tE = d.t_end || win.tEnd;   // server may clamp
@@ -598,17 +600,43 @@ async function simulate() {
   openStream(d.sim_id);
 }
 
+// ---- tab isolation: only ONE tab of a browser follows a run ---------------
+// Two tabs of the same browser share localStorage, so both used to reattach
+// to the same lastSimId and shadow each other. The tab driving a run
+// heartbeats attached:<simId>; a newly opened tab whose lastSimId is being
+// driven by a live tab starts clean instead.
+let attachTimer = null;
+function simTok() { return encodeURIComponent(safeStore.getItem("lastSimTok") || ""); }
+function tokQ(sep = "?") { const t = simTok(); return t ? `${sep}tok=${t}` : ""; }
+function heartbeatAttach(simId) {
+  if (attachTimer) clearInterval(attachTimer);
+  const beat = () => { try { safeStore.setItem("attached:" + simId, String(Date.now())); } catch (_) {} };
+  beat();
+  attachTimer = setInterval(beat, 5000);
+}
+function stopAttach(simId) {
+  if (attachTimer) { clearInterval(attachTimer); attachTimer = null; }
+  if (simId) safeStore.removeItem("attached:" + simId);
+}
+function drivenElsewhere(simId) {
+  const t = Number(safeStore.getItem("attached:" + simId) || 0);
+  return t && Date.now() - t < 15000;
+}
+window.addEventListener("beforeunload", () => stopAttach(currentSim));
+
 function openStream(simId) {
   if (currentES) { currentES.close(); currentES = null; }   // never two streams
   currentSim = simId;
-  const es = currentES = new EventSource(`/api/stream/${simId}`);
+  heartbeatAttach(simId);
+  const es = currentES = new EventSource(`/api/stream/${simId}${tokQ()}`);
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     handleSimEvent(simId, ev);
-    if (ev.kind === "all_done") es.close();
+    if (ev.kind === "all_done") { es.close(); stopAttach(simId); }
   };
   es.onerror = () => {
     es.close();
+    stopAttach(simId);
     if (currentES === es) { simRunning = false; refreshSelection(); }
   };
 }
@@ -690,7 +718,7 @@ function initProgress(ids) {
            "up to ~a minute if one is mid-download). You can start a new simulation " +
            "right away — it takes over automatically.", "status");
     try {
-      await fetch(`/api/cancel/${currentSim}`, { method: "POST" });
+      await fetch(`/api/cancel/${currentSim}${tokQ()}`, { method: "POST" });
     } catch (_) {
       btn.disabled = false; btn.textContent = "⏹ Stop";   // cancel didn't reach the server
       addMsg("⚠️ Stop request failed to reach the server — try again.", "status");
@@ -957,7 +985,7 @@ async function startCalibration(gid) {
                            model: opt.model, snow: opt.snow }),
   });
   const d = await r.json();
-  const es = new EventSource(`/api/calstream/${d.cal_id}`);
+  const es = new EventSource(`/api/calstream/${d.cal_id}` + (d.token ? `?tok=${encodeURIComponent(d.token)}` : ""));
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     if (ev.kind === "cal_status") {
@@ -1169,7 +1197,7 @@ async function downloadReport(gid, btn) {
   btn.disabled = true;
   btn.textContent = "⏳ writing report…";
   try {
-    const r = await fetch(`/api/report/${currentSim}/${gid}`);
+    const r = await fetch(`/api/report/${currentSim}/${gid}${tokQ()}`);
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
       throw new Error(d.error || r.statusText);
@@ -1357,7 +1385,7 @@ function _bindHydroClick(el, id) {
 async function fetchNowcast(gid) {
   if (!currentSim) return;
   try {
-    const d = await (await fetch(`/api/nowcast/${currentSim}/${gid}`)).json();
+    const d = await (await fetch(`/api/nowcast/${currentSim}/${gid}${tokQ()}`)).json();
     if (!d.ok) return;                       // not trained / Space asleep — no tail
     (gaugeResult[gid] = gaugeResult[gid] || {}).nowcast = d;
     if (gid === panelGauge) renderHydro(gid);
@@ -1894,7 +1922,8 @@ async function loadHistory() {
     hist.forEach((h) => {
       const row = document.createElement("div");
       row.className = "hist-row";
-      const badge = h.status === "running" ? "🟢 running" : h.status === "done" ? "✓ done" : "♻ cached";
+      const badge = h.status === "running" ? (h.this_browser === false ? "🟢 running (another browser)" : "🟢 running")
+                  : h.status === "done" ? (h.this_browser === false ? "✓ done (another browser)" : "✓ done") : "♻ cached";
       row.innerHTML =
         `<div class="hist-info"><b>${escapeHtml(h.label || h.gauge_ids.join(", "))}</b><br>` +
         `<span class="pm-sub">${h.gauge_ids.length} gauge(s) · ${h.t_start.slice(0, 10)} → ` +
@@ -2265,9 +2294,17 @@ document.getElementById("fb-send").onclick = async () => {
 async function reattach(explicitId) {
   const simId = explicitId || safeStore.getItem("lastSimId");
   if (!simId) return;
+  // another tab of this browser is driving that run: leave it alone
+  if (!explicitId && drivenElsewhere(simId)) return;
   try {
-    const r = await fetch(`/api/job/${simId}`);
-    if (!r.ok) { if (!explicitId) safeStore.removeItem("lastSimId"); return; }
+    const r = await fetch(`/api/job/${simId}${tokQ()}`);
+    if (!r.ok) {
+      // 403 = started from another browser session (or the session was
+      // reset): this browser must not pick it up — forget it quietly
+      if (!explicitId) { safeStore.removeItem("lastSimId"); safeStore.removeItem("lastSimTok"); }
+      else if (r.status === 403) addMsg("⚠️ That simulation was started from another browser session — it can only be followed there.", "status");
+      return;
+    }
     const j = await r.json();
     if (!explicitId && j.done && j.age_s > 24 * 3600) { safeStore.removeItem("lastSimId"); return; }
     zoomedToOverlay = false;               // zoom to the 2-D layer on first frame

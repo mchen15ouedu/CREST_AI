@@ -196,11 +196,16 @@ def _state_choice(gauge, model, t: datetime, tol_days: float = STATE_TOL_DAYS):
     return None, None, True                                  # full warm-up
 
 
-def plan(gauge, model, a: datetime, b: datetime, variant: str | None = None) -> dict:
+def plan(gauge, model, a: datetime, b: datetime, variant: str | None = None,
+         state_model: str | None = None) -> dict:
     """Decide how to satisfy a request for [a, b]: reuse cache + minimal run,
     warm-starting from the nearest state within +/- STATE_TOL_DAYS if possible.
     `variant` fingerprints the run configuration (boundary-condition gauges) —
-    rows cached under a different variant are not reused (states still are)."""
+    rows cached under a different variant are not reused (states still are).
+    `state_model`: key of the shared EF5 state grids when it differs from the
+    rows key (a custom-parameter run reads rows under its own tagged key but
+    warm-starts from the base configuration's states)."""
+    smodel = state_model or model
     if os.environ.get("CREST_CACHE", "1") == "0":            # force a fresh full run
         return {"cached_rows": [], "run_start": a, "run_end": b, "load_state_time": None,
                 "warmup_from": None, "need_warmup": True, "reason": "cache disabled"}
@@ -222,11 +227,11 @@ def plan(gauge, model, a: datetime, b: datetime, variant: str | None = None) -> 
                     "load_state_time": None, "warmup_from": None,
                     "need_warmup": False, "reason": "fully cached"}
         if c0 <= a + slack and a <= c1 < b:                  # extend forward from the cache end
-            lt, wf, nw = _state_choice(gauge, model, c1)
+            lt, wf, nw = _state_choice(gauge, smodel, c1)
             return {"cached_rows": slice_rows(a, c1), "run_start": c1, "run_end": b,
                     "load_state_time": lt, "warmup_from": wf, "need_warmup": nw,
                     "reason": "reuse cache + fill missing tail"}
-    lt, wf, nw = _state_choice(gauge, model, a)              # full run
+    lt, wf, nw = _state_choice(gauge, smodel, a)             # full run
     reason = ("warm start (exact state)" if not nw else
               "short warm-up from nearby state" if wf is not None else "full 3-month warm-up")
     return {"cached_rows": [], "run_start": a, "run_end": b,

@@ -14,8 +14,10 @@ _JOBS: dict[str, "CalJob"] = {}
 
 
 class CalJob:
-    def __init__(self, gauge_id: str, t_start: datetime, t_end: datetime, opts: dict):
+    def __init__(self, gauge_id: str, t_start: datetime, t_end: datetime, opts: dict,
+                 owner=None):
         self.id = uuid.uuid4().hex[:8]
+        self.owner = owner or {}                 # {sid, user, token} — see server._owns
         self.gauge_id = gauge_id
         self.t_start, self.t_end = t_start, t_end
         self.opts = opts or {}
@@ -59,8 +61,9 @@ class CalJob:
             self.done.set()
 
 
-def start_job(gauge_id: str, t_start: datetime, t_end: datetime, opts: dict) -> CalJob:
-    job = CalJob(gauge_id, t_start, t_end, opts)
+def start_job(gauge_id: str, t_start: datetime, t_end: datetime, opts: dict,
+              owner=None) -> CalJob:
+    job = CalJob(gauge_id, t_start, t_end, opts, owner=owner)
     _JOBS[job.id] = job
     job.start()
     return job

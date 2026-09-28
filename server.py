@@ -90,6 +90,45 @@ ADMIN_USERS = {u.strip().lower() for u in
                os.environ.get("ADMIN_USERS", "vincewin").split(",") if u.strip()}
 
 
+def _sid(request: Request) -> str:
+    """Per-BROWSER identity (UX isolation, user 2026-09-28): a random id kept
+    in the session cookie, independent of the HF login — people on a shared
+    account or a shared machine still get their own jobs, tabs and panels."""
+    sid = request.session.get("sid")
+    if not sid:
+        sid = secrets.token_hex(8)
+        request.session["sid"] = sid
+    return sid
+
+
+def _owner(request: Request) -> dict:
+    """Owner record stamped on a job at start; the token goes back to the
+    browser that started it (survives a session reset / a shared account)."""
+    u = request.session.get("user") or {}
+    return {"sid": _sid(request), "user": u.get("username"),
+            "token": secrets.token_hex(12)}
+
+
+def _owns(job, request: Request, tok: str = "", strict: bool = False) -> bool:
+    """May this browser act on the job? Its own job (same sid, or the token it
+    was handed) always; the same signed-in account on another device only
+    for non-strict reads (an explicit Open from the history list)."""
+    o = getattr(job, "owner", None) or {}
+    if not o:
+        return True                                    # legacy job, no owner
+    if tok and tok == o.get("token"):
+        return True
+    if o.get("sid") and o.get("sid") == request.session.get("sid"):
+        return True
+    if strict:
+        return False
+    u = (request.session.get("user") or {}).get("username")
+    return bool(u) and u == o.get("user")
+
+
+_FORBIDDEN = {"error": "this simulation belongs to another browser session"}
+
+
 def _is_admin(request: Request) -> bool:
     u = request.session.get("user") or {}
     return bool(u.get("username")) and u["username"].lower() in ADMIN_USERS
@@ -150,7 +189,7 @@ def api_datacleanup():
 
 
 @app.get("/api/report/{sim_id}/{gauge_id}")
-def api_report(sim_id: str, gauge_id: str, request: Request):
+def api_report(sim_id: str, gauge_id: str, request: Request, tok: str = ""):
     """Downloadable simulation report (AQUAH report-writer agent -> PDF).
     Generated on first request (LLM + pandoc, ~30-90 s), then cached. Signed-in
     users get a persistent copy in their report library; anonymous reports stay
@@ -160,6 +199,8 @@ def api_report(sim_id: str, gauge_id: str, request: Request):
         return JSONResponse({"error": "simulation not found (it may have been "
                                       "restarted away) — re-run it, then download "
                                       "the report"}, status_code=404)
+    if not _owns(job, request, tok):
+        return JSONResponse(_FORBIDDEN, status_code=403)
     if not (job.hydro.get(gauge_id) or []):
         return JSONResponse({"error": "no results for this gauge yet"}, status_code=409)
     from hf_data import report
@@ -295,11 +336,12 @@ def logout(request: Request):
 
 @app.get("/api/me")
 def api_me(request: Request):
+    sid = _sid(request)                    # per-browser id (set on first visit)
     u = request.session.get("user")
     if not u:
-        return {"user": None, "oauth": _oauth is not None, "admin": False}
+        return {"user": None, "oauth": _oauth is not None, "admin": False, "sid": sid}
     return {"user": u, "profile": _load_profile(u["username"]), "oauth": _oauth is not None,
-            "admin": _is_admin(request)}
+            "admin": _is_admin(request), "sid": sid}
 
 
 class ProfileUpdate(BaseModel):
@@ -564,6 +606,7 @@ class SimRequest(BaseModel):
     overrides: dict | None = None
     label: str | None = None          # event label for the history entry
     prev_sim_id: str | None = None    # caller's previous job — superseded (cancelled)
+    prev_tok: str | None = None       # ... only with its token / from the same browser
     scheme: str = "full"              # "full" = whole basin; "speed" = domain
                                       # truncated at boundary gauges (obs = inflow)
 
@@ -603,9 +646,11 @@ def api_simulate(req: SimRequest, request: Request):
                         f"(now ends {t1:%Y-%m-%d %H:%M}).")
     # supersede the caller's previous run: a stale in-flight job would otherwise
     # hold the per-gauge lock and the new run would queue behind it indefinitely
+    owner = _owner(request)
     if req.prev_sim_id:
         prev = simjobs.get_job(req.prev_sim_id)
-        if prev and not prev.done.is_set():
+        if prev and not prev.done.is_set() and _owns(prev, request, req.prev_tok or "",
+                                                     strict=True):
             prev.cancel.set()
             warnings.append("Your previous simulation was still running — "
                             "it was stopped and replaced by this one.")
@@ -613,7 +658,7 @@ def api_simulate(req: SimRequest, request: Request):
             "timestep": req.timestep, "warmup_days": req.warmup_days,
             "overrides": req.overrides,
             "scheme": req.scheme if req.scheme in ("full", "speed") else "full"}
-    job = simjobs.start_job(req.gauge_ids, t0, t1, opts)
+    job = simjobs.start_job(req.gauge_ids, t0, t1, opts, owner=owner)
     u = request.session.get("user")
     if u:                                              # signed-in -> history entry
         try:
@@ -624,19 +669,22 @@ def api_simulate(req: SimRequest, request: Request):
                 "when": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")})
         except Exception as e:
             crashlog.capture("history:save", e, user=u.get("username"))
-    return {"sim_id": job.id, "gauge_ids": job.gauge_ids,
+    return {"sim_id": job.id, "token": owner["token"], "gauge_ids": job.gauge_ids,
             "t_start": t0.isoformat(), "t_end": t1.isoformat(),
             "warning": " ".join(warnings) or None,
-            "max_concurrent": simjobs.MAX_CONCURRENT}
+            "max_concurrent": simjobs.MAX_CONCURRENT,
+            "per_user": simjobs.PER_USER_CONCURRENT}
 
 
 @app.get("/api/nowcast/{sim_id}/{gauge_id}")
-def api_nowcast(sim_id: str, gauge_id: str):
+def api_nowcast(sim_id: str, gauge_id: str, request: Request, tok: str = ""):
     """AI nowcast tail (+6 h) from the CREST_nowcast Space for a finished
     gauge. Always answers; {"ok": false} just means no tail is shown."""
     job = simjobs.get_job(sim_id)
     if not job:
         return JSONResponse({"ok": False, "reason": "unknown job"}, status_code=404)
+    if not _owns(job, request, tok):
+        return JSONResponse({"ok": False, **_FORBIDDEN}, status_code=403)
     from hf_data import nowcast as _nc
     return _nc.for_job(job, gauge_id)
 
@@ -895,12 +943,15 @@ def api_upstream(gid: str):
 
 
 @app.post("/api/cancel/{sim_id}")
-def api_cancel(sim_id: str):
+def api_cancel(sim_id: str, request: Request, tok: str = ""):
     """Stop a running simulation job: the EF5 processes are killed and the
-    per-gauge run locks released so a new run can start immediately."""
+    per-gauge run locks released so a new run can start immediately. Only
+    the browser that started it (or holds its token) may stop it."""
     job = simjobs.get_job(sim_id)
     if not job:
         return JSONResponse({"error": "unknown job"}, status_code=404)
+    if not _owns(job, request, tok, strict=True):
+        return JSONResponse(_FORBIDDEN, status_code=403)
     if job.done.is_set():
         return {"ok": True, "already_done": True}
     job.cancel.set()
@@ -914,10 +965,14 @@ def api_history(request: Request):
     if not u:
         return JSONResponse({"error": "not signed in"}, status_code=401)
     hist = _load_profile(u["username"]).get("history", [])
+    sid = _sid(request)
     for h in hist:
         job = simjobs.get_job(h.get("sim_id", ""))
         h["status"] = ("done" if job and job.done.is_set() else
                        "running" if job else "expired")   # expired -> cache re-run
+        # started from THIS browser? (a shared account sees the others' runs
+        # listed, but only its own browser follows them automatically)
+        h["this_browser"] = bool(job) and (getattr(job, "owner", None) or {}).get("sid") == sid
     return {"history": hist}
 
 
@@ -958,20 +1013,25 @@ async def _drain(job, cursor: int = 0):
 
 
 @app.get("/api/stream/{sim_id}")
-async def api_stream(sim_id: str, cursor: int = 0):
+async def api_stream(sim_id: str, request: Request, cursor: int = 0, tok: str = ""):
     job = simjobs.get_job(sim_id)
     if not job:
         return Response(status_code=404)
+    if not _owns(job, request, tok):
+        return Response(status_code=403)
     return EventSourceResponse(_drain(job, cursor))
 
 
 @app.get("/api/job/{sim_id}")
-def api_job(sim_id: str):
+def api_job(sim_id: str, request: Request, tok: str = ""):
     """Job descriptor for reattaching after the browser was closed. The run
-    keeps going server-side; the client replays the event log via /api/stream."""
+    keeps going server-side; the client replays the event log via /api/stream.
+    Another browser session gets 403 and forgets the id."""
     job = simjobs.get_job(sim_id)
     if not job:
         return JSONResponse({"error": "unknown or expired job"}, status_code=404)
+    if not _owns(job, request, tok):
+        return JSONResponse(_FORBIDDEN, status_code=403)
     return {"sim_id": job.id, "gauge_ids": job.gauge_ids,
             "t_start": job.t_start.isoformat(), "t_end": job.t_end.isoformat(),
             "done": job.done.is_set(), "n_events": len(job.events),
@@ -996,24 +1056,27 @@ class CalRequest(BaseModel):
 
 
 @app.post("/api/calibrate")
-def api_calibrate(req: CalRequest):
+def api_calibrate(req: CalRequest, request: Request):
     from hf_data import virtualpoints
     if virtualpoints.is_virtual(req.gauge_id):
         return JSONResponse({"error": "ungauged points have no observations — "
                                       "calibration is not possible"}, status_code=422)
+    owner = _owner(request)
     job = caljobs.start_job(req.gauge_id,
                             datetime.fromisoformat(req.t_start),
                             datetime.fromisoformat(req.t_end),
                             {"model": req.model, "snow": req.snow,
-                             "rounds": req.rounds, "k": req.k})
-    return {"cal_id": job.id, "gauge_id": req.gauge_id}
+                             "rounds": req.rounds, "k": req.k}, owner=owner)
+    return {"cal_id": job.id, "token": owner["token"], "gauge_id": req.gauge_id}
 
 
 @app.get("/api/calstream/{cal_id}")
-async def api_calstream(cal_id: str, cursor: int = 0):
+async def api_calstream(cal_id: str, request: Request, cursor: int = 0, tok: str = ""):
     job = caljobs.get_job(cal_id)
     if not job:
         return Response(status_code=404)
+    if not _owns(job, request, tok):
+        return Response(status_code=403)
     return EventSourceResponse(_drain(job, cursor))
 
 
