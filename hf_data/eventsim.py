@@ -905,6 +905,11 @@ def hourly_tick() -> dict:
     """
     from . import eventstore, nowcaststore
     note_tick_attempt()                            # health: tick liveness
+    try:                       # CONUS state mosaic: index the fleet's new bundles
+        from . import conusstate
+        conusstate.maybe_refresh()
+    except Exception:
+        pass
     if _running["id"]:
         return {"skipped": "runner busy"}
     risk = nowcaststore.all_risk()

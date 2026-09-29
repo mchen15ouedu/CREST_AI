@@ -525,17 +525,40 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             if got == "fetched":
                 yield ("status", "🚚 pre-simulated by the background fleet — "
                                  "loading saved results and model states")
-            elif got is None and not speed and bc_gauges and not no_cache \
-                    and fleetstore.has_remote(g["id"], state_model + "-spd"):
-                # the fleet ran this gauge on the truncated ⚡ domain; those
-                # rows and state grids cannot serve a full-basin run
-                yield ("status", "ℹ️ the background fleet pre-simulated this gauge "
-                                 "under the ⚡ Speed run scheme — switch the run "
-                                 "scheme to ⚡ Speed run to reuse its saved "
-                                 "results and model states")
         except Exception as e:
             from hf_data import crashlog
             crashlog.capture("fleetstore", e, gauge=g["id"], model=state_model)
+
+    # full-basin run of a gauge with upstream gauges: the fleet pre-ran it
+    # (and each upstream gauge) on truncated ⚡ domains, so no single bundle
+    # holds the whole basin — but together they tile it. With nothing saved
+    # near the start, stitch the full-basin state from the CONUS mosaic
+    # (user 2026-09-29); plan() below then finds it like any saved state.
+    if timestep == "1h" and not use_mock and not g.get("virtual") \
+            and not speed and bc_gauges:
+        try:
+            pre = None if no_cache else statecache.plan(
+                g["id"], cache_model, t_start, t_end, variant=variant,
+                state_model=state_model)
+            rs = (pre or {}).get("run_start") or t_start
+            runs = no_cache or pre["run_start"] is not None or bool(grids)
+            ex0, wf0, _ = statecache._state_choice(g["id"], state_model, rs)
+            if runs and ex0 is None and wf0 is None:
+                from hf_data import conusstate
+                ms = conusstate.warm_state(
+                    g, ef5_model, [b_["id"] for b_ in bc_gauges], basic_dir,
+                    statecache.state_dir(g["id"], state_model), rs, warmup_days)
+                if ms:
+                    yield ("status",
+                           f"🧩 full-basin model state stitched from "
+                           f"{ms['n_sources']} fleet pre-run(s) (this gauge + its "
+                           f"upstream gauges) @ {ms['time']:%Y-%m-%d} — covers "
+                           f"{ms['coverage']:.0%} of the basin"
+                           + ("" if ms["tier"] == "full" else
+                              "; the uncovered part spins up over the warm-up"))
+        except Exception as e:
+            from hf_data import crashlog
+            crashlog.capture("conusstate", e, gauge=g["id"], model=state_model)
 
     # --- result cache: reuse overlap, simulate only the missing window (task #6) ---
     # the row cache is hourly; a sub-hourly run neither reuses nor writes it

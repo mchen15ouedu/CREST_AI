@@ -2055,12 +2055,9 @@ document.getElementById("chat-text").addEventListener("keydown", (e) => {
 });
 document.getElementById("btn-sim").onclick = simulate;
 
-// run scheme (🏞 full / ⚡ speed) — persisted; changing it makes a new run differ.
-// Default ⚡ (2026-09-29): it is the scheme the background fleet precomputed, so
-// a default hindcast is served the fleet's rows + states on every gauge (a
-// gauge with no upstream cut gauge runs the full basin either way)
+// run scheme (🏞 full / ⚡ speed) — persisted; changing it makes a new run differ
 const schemeSel = document.getElementById("run-scheme");
-schemeSel.value = safeStore.getItem("runScheme") || "speed";
+schemeSel.value = safeStore.getItem("runScheme") || "full";
 schemeSel.onchange = () => {
   safeStore.setItem("runScheme", schemeSel.value);
   addMsg(schemeSel.value === "speed"
