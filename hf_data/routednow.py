@@ -86,8 +86,9 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
             elif kind == "status":
                 status.append(f"[{tag}] {ev}")
             elif kind == "params":
-                if ev.get("cache_model"):
-                    model = ev["cache_model"]       # the key EF5 actually saved state under
+                if ev.get("state_model") or ev.get("cache_model"):
+                    # the key EF5 actually saved state under
+                    model = ev.get("state_model") or ev["cache_model"]
                 if ev.get("n_upstream") is not None:
                     n_up = ev["n_upstream"]
         return rows, model, n_up

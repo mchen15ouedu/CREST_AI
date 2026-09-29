@@ -49,15 +49,17 @@ def _token():
 
 
 def _done_keys() -> set[str]:
-    """gauge keys already fully uploaded (results + states present)."""
+    """gauge ids already fully uploaded (results + states present). By gauge,
+    not by key: rows are keyed by model+scheme+parameter tag, state grids by
+    model+scheme only, so the two names differ for a calibrated gauge."""
     from huggingface_hub import HfApi
     try:
         files = set(HfApi(token=_token()).list_repo_files(FLEET_REPO, repo_type="dataset"))
     except Exception:
         return set()
-    res = {f[len("results/"):-len(".json")] for f in files if f.startswith("results/")}
-    st = {f[len("states/"):-len(".pqf")] for f in files if f.startswith("states/")}
-    return res & st
+    res = {f[len("results/"):].split("_", 1)[0] for f in files if f.startswith("results/")}
+    st = {f[len("states/"):].split("_", 1)[0] for f in files if f.startswith("states/")}
+    return {g + "_" for g in res & st}
 
 
 def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict:
@@ -67,6 +69,7 @@ def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict
 
     t_start = time.time()
     last_status = ""
+    rows_model = state_model = None
     cur = t0
     while cur < t1:
         ce = min(cur + timedelta(days=chunk_days), t1)
@@ -75,6 +78,9 @@ def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict
                                                 grids=False, scheme="speed"):
             if kind == "status":
                 last_status = payload
+            elif kind == "params":
+                rows_model = payload.get("cache_model") or rows_model
+                state_model = payload.get("state_model") or state_model
             elif kind == "done":
                 rc = payload.get("returncode")
         if rc != 0:
@@ -82,24 +88,29 @@ def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict
                     "rc": rc, "last": last_status[-300:]}
         cur = ce
 
-    # the run resolved model/scheme itself — find the record it wrote
-    recs = sorted(glob.glob(os.path.join(statecache.CACHE_DIR, "results",
-                                         f"{str(gid).zfill(8)}_*.json")),
-                  key=os.path.getmtime)
+    # the run resolved model/scheme itself and reported its keys: rows under
+    # model+scheme(+parameter tag), state grids under model+scheme
+    if rows_model:
+        rec_path = statecache.results_path(gid, rows_model)
+        recs = [rec_path] if os.path.exists(rec_path) else []
+    else:
+        recs = sorted(glob.glob(os.path.join(statecache.CACHE_DIR, "results",
+                                             f"{str(gid).zfill(8)}_*.json")),
+                      key=os.path.getmtime)
     if not recs:
         return {"gauge": gid, "ok": False, "rc": -1, "last": "no result record"}
     rec_path = recs[-1]
     key = os.path.splitext(os.path.basename(rec_path))[0]
-    model = key.split("_", 1)[1]
+    skey = f"{str(gid).zfill(8)}_{state_model}" if state_model else key
 
-    sdir = statecache.state_dir(gid, model)
+    sdir = statecache.state_dir(gid, skey.split("_", 1)[1])
     blob = statebundle.pack_dir(sdir)
     if blob is None:
         return {"gauge": gid, "ok": False, "rc": -1, "last": "no state grids"}
     api = HfApi(token=os.environ["HF_TOKEN"])
     api.create_commit(repo_id=FLEET_REPO, repo_type="dataset",
                       operations=[
-                          CommitOperationAdd(f"states/{key}.pqf", blob),
+                          CommitOperationAdd(f"states/{skey}.pqf", blob),
                           CommitOperationAdd(f"results/{key}.json", rec_path)],
                       commit_message=f"fleet {key}")
     n_states = len(json.load(open(rec_path)).get("state_times", []))

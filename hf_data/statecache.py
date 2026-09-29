@@ -168,10 +168,17 @@ def _state_times_on_disk(gauge, model) -> set[datetime]:
     return out
 
 
-def _state_choice(gauge, model, t: datetime, tol_days: float = STATE_TOL_DAYS):
+def _state_choice(gauge, model, t: datetime, tol_days: float = STATE_TOL_DAYS,
+                  far_days: float = 0.0):
     """(load_time, warmup_from, need_warmup) for warm-starting a run at t:
         exact state         -> load it directly, no warm-up
         earlier state <=10d -> short warm-up FORWARD over the gap from that state
+        earlier state <=far_days -> warm-up forward from THAT state: no longer
+                               than the cold warm-up it replaces (far_days is
+                               the caller's warm-up length), but it starts from
+                               a spun-up state instead of from nothing — this
+                               is how the fleet's last state serves a hindcast
+                               that begins after the fleet period ended
         else                -> full warm-up (warmup_from=None; caller uses 3 months)
     A state in the *future* of t can't warm forward, so it isn't used here.
     """
@@ -189,22 +196,41 @@ def _state_choice(gauge, model, t: datetime, tol_days: float = STATE_TOL_DAYS):
         gap = (t - dt).total_seconds() / 86400.0             # >0 when dt precedes t
         if gap == 0:
             return t, None, False                            # exact -> no warm-up
-        if 0 < gap <= tol_days and (best_before is None or gap < best_before[1]):
+        if 0 < gap <= max(tol_days, far_days) and (
+                best_before is None or gap < best_before[1]):
             best_before = (dt, gap)
     if best_before:
         return None, best_before[0], True                    # short forward warm-up
     return None, None, True                                  # full warm-up
 
 
+def _contiguous_end(rows: list[dict], step_h: float = 1.0):
+    """(n, end): the leading run of `rows` (sorted) with no gap > one step.
+    A record can hold disjoint windows (the fleet's 5 years + a later
+    hindcast); min/max of the row times says nothing about what lies between."""
+    if not rows:
+        return 0, None
+    end = _rt(rows[0]["time"])
+    n = 1
+    for r in rows[1:]:
+        t = _rt(r["time"])
+        if (t - end).total_seconds() > step_h * 3600 + 60:
+            break
+        end = t
+        n += 1
+    return n, end
+
+
 def plan(gauge, model, a: datetime, b: datetime, variant: str | None = None,
-         state_model: str | None = None) -> dict:
+         state_model: str | None = None, far_days: float = 0.0) -> dict:
     """Decide how to satisfy a request for [a, b]: reuse cache + minimal run,
     warm-starting from the nearest state within +/- STATE_TOL_DAYS if possible.
     `variant` fingerprints the run configuration (boundary-condition gauges) —
     rows cached under a different variant are not reused (states still are).
     `state_model`: key of the shared EF5 state grids when it differs from the
     rows key (a custom-parameter run reads rows under its own tagged key but
-    warm-starts from the base configuration's states)."""
+    warm-starts from the base configuration's states).
+    `far_days`: see _state_choice (the caller's warm-up length)."""
     smodel = state_model or model
     if os.environ.get("CREST_CACHE", "1") == "0":            # force a fresh full run
         return {"cached_rows": [], "run_start": a, "run_end": b, "load_state_time": None,
@@ -216,22 +242,29 @@ def plan(gauge, model, a: datetime, b: datetime, variant: str | None = None,
     def slice_rows(lo, hi):
         if not rec:
             return []
-        return [r for r in rec["rows"] if lo <= _rt(r["time"]) <= hi]
+        # TS_FMT sorts lexicographically — no 40k strptime calls per plan
+        los, his = lo.strftime(TS_FMT), hi.strftime(TS_FMT)
+        return sorted((r for r in rec["rows"] if los <= r["time"] <= his),
+                      key=lambda r: r["time"])
 
-    if rec and rec.get("window"):
+    if rec and rec.get("rows"):
         from datetime import timedelta
         slack = timedelta(hours=1)      # EF5's first ts row lands one step AFTER
-        c0, c1 = _rt(rec["window"][0]), _rt(rec["window"][1])   # TIME_BEGIN
-        if c0 <= a + slack and c1 >= b:                      # fully cached
-            return {"cached_rows": slice_rows(a, b), "run_start": None, "run_end": None,
+        got = slice_rows(a, b)                                  # TIME_BEGIN
+        # coverage is judged on the rows actually present in [a, b]: the
+        # record's window is only the min/max of possibly disjoint runs
+        n, c1 = _contiguous_end(got) if got and _rt(got[0]["time"]) <= a + slack \
+            else (0, None)
+        if n and c1 >= b:                                    # fully cached
+            return {"cached_rows": got[:n], "run_start": None, "run_end": None,
                     "load_state_time": None, "warmup_from": None,
                     "need_warmup": False, "reason": "fully cached"}
-        if c0 <= a + slack and a <= c1 < b:                  # extend forward from the cache end
-            lt, wf, nw = _state_choice(gauge, smodel, c1)
-            return {"cached_rows": slice_rows(a, c1), "run_start": c1, "run_end": b,
+        if n and a <= c1 < b:                                # extend forward from the cache end
+            lt, wf, nw = _state_choice(gauge, smodel, c1, far_days=far_days)
+            return {"cached_rows": got[:n], "run_start": c1, "run_end": b,
                     "load_state_time": lt, "warmup_from": wf, "need_warmup": nw,
                     "reason": "reuse cache + fill missing tail"}
-    lt, wf, nw = _state_choice(gauge, smodel, a)             # full run
+    lt, wf, nw = _state_choice(gauge, smodel, a, far_days=far_days)   # full run
     reason = ("warm start (exact state)" if not nw else
               "short warm-up from nearby state" if wf is not None else "full 3-month warm-up")
     return {"cached_rows": [], "run_start": a, "run_end": b,
