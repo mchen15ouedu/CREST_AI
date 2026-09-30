@@ -452,6 +452,16 @@ def mark_ended(event_ids) -> bool:
             return False
 
 
+def _parse_hydro_t(t):
+    """Hydro row time ("2026-09-29 13:00" or "2026-09-29T13:00Z") -> naive
+    UTC datetime, or None if unparseable (row is then kept)."""
+    s = str(t or "").replace("T", " ").rstrip("Z")[:16]
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+
+
 def finalize_episodes(event_ids, log=print) -> int:
     """V30 episode final product (user directive 2026-08-14): when an
     episode ends, its running event entry is REPLACED by a consolidated
@@ -497,7 +507,11 @@ def finalize_episodes(event_ids, log=print) -> int:
                                                 "%Y-%m-%dT%H:%MZ")
         except Exception:
             pass
-        ended_t = t_last or datetime.datetime.utcnow()
+        # frames include forecast lead times past "now" — an episode can't
+        # end in the future (seen live: 08291000 "ended" 2026-10-01T02Z
+        # when finalized 2026-09-30 ~15Z)
+        now = datetime.datetime.utcnow()
+        ended_t = min(t_last, now) if t_last else now
 
         # inundation stats from the episode-wide maxdepth
         depth_stats = {}
@@ -519,7 +533,14 @@ def finalize_episodes(event_ids, log=print) -> int:
 
         # observed peak from the episode's merged hydrograph
         peak_obs, peak_obs_t, peak_sim = None, None, None
+        # only rows inside the episode window (same -12 h lead-in the scorer
+        # uses) — the merged hydrograph carries sim warm-up rows from before
+        # the episode, which leaked a prior episode's peak into the final
+        w0 = t_start - datetime.timedelta(hours=12) if t_start else None
         for r in man.get("hydro") or []:
+            rt = _parse_hydro_t(r.get("time"))
+            if rt is not None and ((w0 and rt < w0) or rt > ended_t):
+                continue
             if r.get("obs_q") is not None and \
                     (peak_obs is None or r["obs_q"] > peak_obs):
                 peak_obs, peak_obs_t = r["obs_q"], r.get("time")
