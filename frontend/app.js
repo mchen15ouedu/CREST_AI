@@ -87,6 +87,32 @@ L.control.layers({ "Topographic": esriTopo, "Satellite": esriImg, "Dark": osm },
 // belongs to the legends (test-user feedback 2026-10-01)
 L.control.scale({ position: "bottomright", maxWidth: 140 }).addTo(map);
 
+// The hindcast 2-D streamflow overlay, its legend and its time slider belong
+// to Hindcast mode: they are hidden in Nowcast / 2D inundation (whose own
+// legends share the same corner) and come back with the mode — the results
+// are kept. The layers-control checkbox stays the user's own switch.
+let q2dUserOff = false, q2dSyncing = false;
+map.on("overlayadd overlayremove", (e) => {
+  if (e.layer !== q2dGroup || q2dSyncing) return;
+  q2dUserOff = e.type === "overlayremove";
+  syncHindcastLayers();
+});
+function syncHindcastLayers() {
+  const mine = !nowcastMode && !eventsMode;
+  const want = mine && !q2dUserOff;
+  q2dSyncing = true;
+  try {
+    if (want && !map.hasLayer(q2dGroup)) q2dGroup.addTo(map);
+    else if (!want && map.hasLayer(q2dGroup)) map.removeLayer(q2dGroup);
+  } finally { q2dSyncing = false; }
+  document.getElementById("q-legend").classList.toggle(
+    "hidden", !(want && Object.keys(overlays).length > 0));
+  if (!mine) stopPlay();
+  if (!eventsMode) {                   // in 2D inundation the bar is the event's
+    document.getElementById("anim").classList.toggle("hidden", !(mine && animMax > 0));
+  }
+}
+
 // A mode switch keeps the user's view once they have zoomed in — comparing
 // the same place across Hindcast / Nowcast / 2D inundation is the point
 // (test-user feedback 2026-10-01). Only a map still at the CONUS overview
@@ -1045,9 +1071,8 @@ function resetAnim() {
 }
 
 function showAnim() {
-  const bar = document.getElementById("anim");
-  bar.classList.remove("hidden");
   document.getElementById("anim-slider").max = String(animMax);
+  syncHindcastLayers();                // shown only while Hindcast is the mode
 }
 
 // scrubber label: the frame's real datetime; falls back to a time computed
@@ -1097,7 +1122,7 @@ function stopPlay() {
 function addOverlay(gid, url, bounds) {
   overlays[gid] = L.imageOverlay(url, bounds,
     { opacity: 0.9, interactive: false, pane: "q2d" }).addTo(q2dGroup);
-  document.getElementById("q-legend").classList.remove("hidden");
+  syncHindcastLayers();                // legend only while Hindcast is the mode
   if (!zoomedToOverlay) {                 // make the 2-D layer impossible to miss
     zoomedToOverlay = true;
     try { map.fitBounds(bounds, { padding: [60, 60] }); } catch (_) {}
@@ -2435,6 +2460,7 @@ function setMode(nc) {
     if (panelGauge && simHydro[panelGauge]) focusGauge(panelGauge);
   }
   syncRiskLayer();
+  syncHindcastLayers();                  // streamflow map + legend + slider
   refreshSelection();                    // pin colors depend on the mode
 }
 
@@ -2782,8 +2808,10 @@ function enterEventsMode() {
   // the Model options panel is a hindcast tool and overlaps the event list
   const lp = document.getElementById("left-panel");
   if (lp) lp.style.display = "none";
-  // the streamflow legend shares this corner and means nothing here
-  document.getElementById("q-legend").classList.add("hidden");
+  // the streamflow map, its legend (same corner) and its time slider mean
+  // nothing here; the bar comes back as the event's own once one is selected
+  syncHindcastLayers();
+  document.getElementById("anim").classList.add("hidden");
   overviewUnlessZoomed();              // CONUS overview: event pins
   addMsg("<b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
          "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the whole " +
@@ -2821,6 +2849,7 @@ function leaveEventsMode() {
   if (evtPollTimer) { clearTimeout(evtPollTimer); evtPollTimer = null; }
   hideDepthLegend();
   evtManifest = null;
+  syncHindcastLayers();                // back to Hindcast: its layers return
 }
 
 // event location: trigger gauge if recorded, else the domain-bbox center
