@@ -83,6 +83,17 @@ const q2dGroup = L.layerGroup().addTo(map);      // toggleable in the layers con
 // edge and used to cover this control — test-user feedback 2026-07-17)
 L.control.layers({ "Topographic": esriTopo, "Satellite": esriImg, "Dark": osm },
   { "2-D streamflow": q2dGroup }, { position: "bottomright" }).addTo(map);
+// scale bar (km + mi), left of the layers button: the bottom-left corner
+// belongs to the legends (test-user feedback 2026-10-01)
+L.control.scale({ position: "bottomright", maxWidth: 140 }).addTo(map);
+
+// A mode switch keeps the user's view once they have zoomed in — comparing
+// the same place across Hindcast / Nowcast / 2D inundation is the point
+// (test-user feedback 2026-10-01). Only a map still at the CONUS overview
+// (or wider) is re-centred on it.
+function overviewUnlessZoomed() {
+  if (map.getZoom() <= 5) map.setView([39, -98], 5, { animate: false });
+}
 
 // ---- state -------------------------------------------------------------
 const gaugeMarkers = {};          // id -> marker
@@ -2399,9 +2410,10 @@ function setMode(nc) {
   const lpm = document.getElementById("left-panel");
   if (lpm) lpm.style.display = nc ? "none" : "";
   if (nc) {
-    // everyone starts from the CONUS overview — the tiered risk map IS the
-    // point of nowcast mode (no auto-zoom, even for signed-in users)
-    map.setView([39, -98], 5, { animate: false });
+    // the tiered risk map opens on the CONUS overview (no auto-zoom to the
+    // user's location, even for signed-in users) — unless the user is already
+    // looking at a place, which then stays in view
+    overviewUnlessZoomed();
     addMsg("⚡ <b>Nowcast mode</b> — no dates needed. Colors show where the AI predicts " +
            "trouble within 6 hours: 🔴 ≥ 5-yr flood, 🟠 ≥ 2-yr (bankfull), 🟡 ≥ 5× " +
            "baseflow (density map zoomed out, colored pins zoomed in). Click gauges, " +
@@ -2772,7 +2784,7 @@ function enterEventsMode() {
   if (lp) lp.style.display = "none";
   // the streamflow legend shares this corner and means nothing here
   document.getElementById("q-legend").classList.add("hidden");
-  map.setView([39, -98], 5, { animate: false });   // CONUS overview: event pins
+  overviewUnlessZoomed();              // CONUS overview: event pins
   addMsg("<b>2D inundation</b> — when the nowcast flags a gauge at flood level " +
          "(≥ 5-yr return), the CREST-iMAP v2 hydrodynamic model simulates the whole " +
          "basin contributing to that gauge in 2-D — the domain is the basin itself, " +
@@ -2900,6 +2912,7 @@ function drawEventSite(man) {
 async function loadEvents() {
   let d = null;
   try { d = await (await fetch("/api/events")).json(); } catch (_) {}
+  if (!eventsMode) return;       // the user left 2D inundation while this loaded
   if (!d) { addMsg("⚠️ Couldn't load the event list.", "status"); return; }
   evtBase = d.base;
   const ids = Object.keys(d.events || {});

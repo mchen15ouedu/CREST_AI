@@ -336,6 +336,11 @@ body.font-xl #depth-legend { zoom: 1.4; }
 /* map pins */
 .pin { border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.5); }
 .leaflet-container { background: #0b0f14; }
+/* scale bar: beside the layers button, above the attribution line */
+.leaflet-bottom.leaflet-right .leaflet-control-scale {
+  position: absolute; right: 64px; bottom: 22px; margin: 0; white-space: nowrap;
+}
+.leaflet-control-scale-line { background: rgba(255,255,255,.82); color: #1b2733; font-size: 11px; }
 
 /* focused-gauge teardrop pin: white stroke reads on dark bases, dark shadow
    reads on the bright topo base */
