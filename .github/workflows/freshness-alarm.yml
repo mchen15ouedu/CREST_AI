@@ -56,7 +56,16 @@ jobs:
           fi
           echo "----- latest freshness check -----"
           echo "$f"
-          if echo "$f" | grep -qE 'STALE|FAILED'; then
+          bad=$(echo "$f" | grep -E 'STALE|FAILED' || true)
+          if [ -n "$bad" ] && ! echo "$bad" | grep -qv 'USGS'; then
+            # only the live NWIS probe failed (after its retries): USGS's own
+            # service blinking, not one of our stored feeds rotting
+            # (2026-09-26 went red on one 503 + one bad gzip)
+            echo "::warning::USGS live probe failed (NWIS outage?), not alarming: $bad"
+            echo "all store feeds fresh"
+            exit 0
+          fi
+          if [ -n "$bad" ]; then
             echo "::error::One or more CREST_demo data feeds are STALE — the updater self-heal did not recover. Check https://vincewin-crest-updater.hf.space/api/status"
             echo "$f" | grep -E 'STALE|FAILED'
             exit 1

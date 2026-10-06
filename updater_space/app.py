@@ -147,6 +147,7 @@ def _run_all(feeds: list[str]):
         _state["freshness"] = []
         _state["started"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _state["finished"] = None
+        _state["last_feeds"] = list(feeds)
         for feed in feeds:
             rc, lines = _run_script(feed)
             _state["results"][feed] = lines
@@ -270,6 +271,11 @@ def _auto():
                         recent = (datetime.now(timezone.utc) - t).total_seconds() < 10 * 60
                     except ValueError:
                         pass
+                # ...and only when that run actually did the hourly feeds: the
+                # alarm's obs-only POST (feeds=mrms_recent) at :52 suppressed the
+                # :58 nowcast and lost the 2026-10-03 14Z issue.
+                if recent and not set(AUTO_FEEDS) <= set(_state.get("last_feeds") or []):
+                    recent = False
                 if not _state["running"] and not recent and _start(AUTO_FEEDS):
                     _log(f"hourly self-run started: {','.join(AUTO_FEEDS)}")
         threading.Thread(target=hourly, daemon=True).start()

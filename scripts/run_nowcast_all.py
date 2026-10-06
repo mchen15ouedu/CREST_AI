@@ -30,9 +30,11 @@ import argparse
 import io
 import math
 import os
+import random
 import sys
 import tarfile
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -224,32 +226,56 @@ def _pass2_member(t: datetime, token) -> bytes | None:
 
 
 # ---- USGS obs (batched NWIS) -------------------------------------------------
-def _fetch_obs_chunk(sites: list[str], t_start: datetime) -> dict[str, list]:
+# Two hostnames for the same NWIS IV service; the bare one has had multi-hour
+# 503 spells (2026-09-22) that the nwis.* name rode through.
+NWIS_IV_HOSTS = ("https://waterservices.usgs.gov/nwis/iv/",
+                 "https://nwis.waterservices.usgs.gov/nwis/iv/")
+OBS_TRIES = 3
+OBS_TIMEOUT = (10, 45)                    # (connect, read) s: a dead host fails fast
+OBS_RETRY_BUDGET_S = 300                  # retries only inside this window per run;
+                                          # first tries always happen (old worst case)
+
+
+def _fetch_obs_chunk(sites: list[str], t_start: datetime,
+                     deadline: float | None = None) -> tuple[dict[str, list], bool]:
+    """(rows by site, ok). ok=False means the CHUNK was lost after every retry
+    -- our fetch failed, which says nothing about those gauges' health. Before
+    2026-10-06 a single try + silent `except: pass` left ~1/4 of hourly issues
+    partly obs-blind (risk-map flicker, gauge-health strikes)."""
+    params = {"sites": ",".join(sites), "parameterCd": "00060",
+              "format": "json", "siteStatus": "all",
+              "startDT": t_start.strftime("%Y-%m-%dT%H:%MZ")}
+    for k in range(OBS_TRIES):
+        if k and deadline is not None and time.time() > deadline:
+            break                                   # retry budget spent
+        try:
+            r = requests.get(NWIS_IV_HOSTS[k % len(NWIS_IV_HOSTS)],
+                             params=params, timeout=OBS_TIMEOUT)
+            r.raise_for_status()
+            return _parse_obs(r.json()), True
+        except Exception:
+            if k + 1 < OBS_TRIES:
+                time.sleep((2, 6)[min(k, 1)] + random.uniform(0, 2))
+    return {}, False
+
+
+def _parse_obs(js: dict) -> dict[str, list]:
     out: dict[str, list] = {}
-    try:
-        r = requests.get("https://waterservices.usgs.gov/nwis/iv/",
-                         params={"sites": ",".join(sites), "parameterCd": "00060",
-                                 "format": "json", "siteStatus": "all",
-                                 "startDT": t_start.strftime("%Y-%m-%dT%H:%MZ")},
-                         timeout=60)
-        r.raise_for_status()
-        for ts in r.json().get("value", {}).get("timeSeries", []):
-            sid = ts["sourceInfo"]["siteCode"][0]["value"].zfill(8)
-            rows = []
-            for v in ts["values"][0]["value"]:
-                try:
-                    cfs = float(v["value"])
-                except (TypeError, ValueError):
-                    continue
-                if cfs < 0:
-                    continue
-                dt = (datetime.fromisoformat(v["dateTime"].replace("Z", "+00:00"))
-                      .astimezone(timezone.utc).replace(tzinfo=None))
-                rows.append((dt, cfs * CFS_TO_CMS))
-            if rows:
-                out[sid] = sorted(rows)
-    except Exception:
-        pass                                            # chunk lost -> stale-obs path
+    for ts in js.get("value", {}).get("timeSeries", []):
+        sid = ts["sourceInfo"]["siteCode"][0]["value"].zfill(8)
+        rows = []
+        for v in ts["values"][0]["value"]:
+            try:
+                cfs = float(v["value"])
+            except (TypeError, ValueError):
+                continue
+            if cfs < 0:
+                continue
+            dt = (datetime.fromisoformat(v["dateTime"].replace("Z", "+00:00"))
+                  .astimezone(timezone.utc).replace(tzinfo=None))
+            rows.append((dt, cfs * CFS_TO_CMS))
+        if rows:
+            out[sid] = sorted(rows)
     return out
 
 
@@ -258,6 +284,7 @@ VP_LATEST = "nowcast/v3_virtual_latest.parquet"
 VP_CACHE = "nowcast/v3_virtual_precip_cache.parquet"
 VP_ARCHIVE = "nowcast/v3_virtual_archive/"
 VP_HIST_H = 168                           # rolling analysis history kept in `hist`
+EF5_MAX_AGE_H = 26.0                      # = ungauged_space CARRY_TTL_H
 
 
 def _vp_history(token, t0, files, vid, prev_hist, prev_t0, prev_q1):
@@ -408,10 +435,14 @@ def _virtual_v3(token, t0, hours, recent, files, model3, ck3, model3_12, ck3_12,
         print(f"nowcast: v3 virtual history failed ({e}) — empty hist")
         hist_col = ["[]"] * len(vid)
 
-    # compact EF5 snapshot from the sharded routed feed (its t0 may lag ours)
+    # compact EF5 snapshot from the sharded routed feed (its t0 may lag ours).
+    # Rows older than EF5_MAX_AGE_H are skipped: a shard that stopped
+    # publishing (1of3, 2026-08-13) otherwise passed 53-day-old values off as
+    # this hour's comparison. ef5_t0 = newest row issue time actually used.
     ef5: dict[str, np.ndarray] = {}
-    ef5_t0 = ""
+    ef5_newest = None
     ef5_cols: list[str] = []
+    n_ef5_stale = 0
     for shard in [x for x in files if x.startswith("nowcast/ungauged_latest")]:
         try:
             p = hf_hub_download(HF_REPO, shard, repo_type="dataset", token=token,
@@ -422,12 +453,27 @@ def _virtual_v3(token, t0, hours, recent, files, model3, ck3, model3_12, ck3_12,
             ef5_cols = ef5_cols or qc
             qs = np.column_stack([tt.column(c).to_numpy(zero_copy_only=False)
                                   for c in qc]).astype("float32")
-            for i2, v in enumerate(tt.column("vp").to_pylist()):
-                ef5[str(v)] = qs[i2]
             meta = tt.schema.metadata or {}
-            ef5_t0 = ef5_t0 or meta.get(b"t0", b"").decode()
+            file_t0 = meta.get(b"t0", b"").decode().replace(" UTC", "")
+            row_t0 = (tt.column("t0").to_pylist() if "t0" in tt.schema.names
+                      else [file_t0] * tt.num_rows)
+            for i2, v in enumerate(tt.column("vp").to_pylist()):
+                try:
+                    rt = datetime.strptime(str(row_t0[i2] or file_t0), "%Y-%m-%d %H:%M")
+                except ValueError:
+                    n_ef5_stale += 1
+                    continue
+                if (t0 - rt).total_seconds() / 3600.0 > EF5_MAX_AGE_H:
+                    n_ef5_stale += 1
+                    continue
+                ef5[str(v)] = qs[i2]
+                ef5_newest = rt if ef5_newest is None else max(ef5_newest, rt)
         except Exception:
             continue
+    ef5_t0 = ef5_newest.strftime("%Y-%m-%d %H:00 UTC") if ef5_newest else ""
+    if n_ef5_stale:
+        print(f"nowcast: v3 virtual — skipped {n_ef5_stale} EF5 shard rows older than "
+              f"{EF5_MAX_AGE_H:g} h")
 
     md = {b"t0": t0.strftime("%Y-%m-%d %H:00 UTC").encode(),
           b"generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC").encode(),
@@ -553,9 +599,34 @@ def main() -> int:
     # -- obs -------------------------------------------------------------------
     chunks = [list(gid[i:i + 100]) for i in range(0, len(gid), 100)]
     obs: dict[str, list] = {}
+    failed: list[list[str]] = []
+    t_obs = t0 - timedelta(hours=L)
+    deadline = time.time() + OBS_RETRY_BUDGET_S
     with ThreadPoolExecutor(max_workers=8) as ex:
-        for got in ex.map(lambda c: _fetch_obs_chunk(c, t0 - timedelta(hours=L)), chunks):
+        for c, (got, ok) in zip(chunks, ex.map(lambda c: _fetch_obs_chunk(c, t_obs, deadline),
+                                               chunks)):
             obs.update(got)
+            if not ok:
+                failed.append(c)
+    n_first_fail = len(failed)
+    # one slow serial pass for scattered losses; skipped in a real outage (it
+    # would rescue nothing and only delay the issue), and bounded by the budget
+    if failed and n_first_fail <= NET_OUTAGE_FRAC * len(chunks):
+        time.sleep(10)
+        still = []
+        for c in failed:
+            if time.time() > deadline:
+                still.append(c)
+                continue
+            got, ok = _fetch_obs_chunk(c, t_obs, deadline)
+            obs.update(got)
+            if not ok:
+                still.append(c)
+        failed = still
+    lost_ids = {x for c in failed for x in c}
+    lost = np.array([g in lost_ids for g in gid], bool)
+    print(f"nowcast: obs {len(chunks)} chunks, {n_first_fail} failed first pass, "
+          f"{len(failed)} lost after retry ({int(lost.sum())} gauges)")
 
     # -- features + batched inference ------------------------------------------
     model, ck, mfile = _model_and_stats(token, MODEL_FILES[0])
@@ -642,9 +713,19 @@ def main() -> int:
               f"fetch outage; gauge health state frozen")
     t0s = t0.strftime("%Y-%m-%d %H:%M")
     clean_since, health = [], np.empty(len(gid), dtype=object)
+    health_store = np.empty(len(gid), dtype=object)       # what route_state keeps
     for i, g in enumerate(gid):
         cs = prev_cs.get(g, None)
         ph = prev_health.get(g, "")
+        if dark[i] and (net_outage or lost[i]):
+            # OUR fetch failed (whole run, or this gauge's chunk after retry):
+            # no v1 this hour, but the stored state is untouched, so a lost
+            # chunk is never a strike (it used to persist "suspect", and a
+            # second lost hour reset the 30-day streak to "gap").
+            health[i] = "suspect"
+            health_store[i] = ph or "probation"
+            clean_since.append(cs if cs is not None else "")
+            continue
         if dark[i]:
             if net_outage:
                 health[i] = "suspect"                       # keep streak, no v1 this hour
@@ -657,6 +738,7 @@ def main() -> int:
                 cs = t0s
             days = (t0 - datetime.strptime(cs, "%Y-%m-%d %H:%M")).total_seconds() / 86400.0
             health[i] = "healthy" if days >= PROBATION_D else "probation"
+        health_store[i] = health[i]
         clean_since.append(cs if cs is not None else "")
     healthy_now = (health == "healthy")                     # implies not dark this hour
 
@@ -838,7 +920,7 @@ def main() -> int:
     pq.write_table(latest, lp, compression="zstd")
     pq.write_table(cache_tbl, cp, compression="zstd")
     pq.write_table(pa.table({"gid": gid.tolist(), "clean_since": clean_since,
-                             "obs_health": health.tolist()}).replace_schema_metadata(
+                             "obs_health": health_store.tolist()}).replace_schema_metadata(
         {b"t0": t0s.encode(), b"gap_h": str(GAP_H).encode(),
          b"probation_d": str(PROBATION_D).encode()}), sp, compression="zstd")
     # every issue is also archived (latest.parquet is overwritten hourly) so

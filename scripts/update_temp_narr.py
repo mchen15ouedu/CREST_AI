@@ -4,7 +4,9 @@ Source: NCEP North American Regional Reanalysis 2-m air temperature
 (GDEX d608000, https://gdex.ucar.edu/datasets/d608000/ — 32 km Lambert
 Conformal, 3-hourly, GRIB1). We pull it from NOAA PSL's netCDF mirror of the
 SAME dataset (one yearly file per variable, anonymous HTTPS, updated ~weekly):
-    https://downloads.psl.noaa.gov/Datasets/NARR/monolevel/air.2m.YYYY.nc
+    https://psl.noaa.gov/thredds/fileServer/Datasets/NARR/monolevel/air.2m.YYYY.nc
+(downloads.psl.noaa.gov served the same files until it began answering 403
+for the whole NARR tree on 2026-10-03; it stays as a fallback mirror)
 because the GDEX form is 0.5–1 GB multi-variable GRIB tars per ~8 days, i.e.
 ~2.6 GB of download per month to extract a single band.
 
@@ -43,7 +45,8 @@ import urllib.request
 from hf_data.forcing import TEMP_GRID, VARS, _write_pqf  # noqa: E402
 
 HF_REPO = "vincewin/CREST_data"
-PSL_URL = "https://downloads.psl.noaa.gov/Datasets/NARR/monolevel/air.2m.{year}.nc"
+PSL_URLS = ("https://psl.noaa.gov/thredds/fileServer/Datasets/NARR/monolevel/air.2m.{year}.nc",
+            "https://downloads.psl.noaa.gov/Datasets/NARR/monolevel/air.2m.{year}.nc")
 TOKEN_PATH = r"C:\Users\chenm\Documents\EF5\CREST_token.txt"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_narr_cache")
 BACKFILL_START = (2026, 6)          # NLDAS members end 2026-06-23 12z
@@ -68,16 +71,23 @@ def _member_hours(names) -> set[datetime]:
 def _download_year(year: int) -> str | None:
     """Fetch air.2m.<year>.nc if PSL has a newer copy than our cache."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    url = PSL_URL.format(year=year)
     dest = os.path.join(DATA_DIR, f"air.2m.{year}.nc")
     meta = dest + ".meta.json"
-    try:
-        req = urllib.request.Request(url, method="HEAD")
-        h = urllib.request.urlopen(req, timeout=60)
-        remote = {"len": h.headers.get("Content-Length"),
-                  "mod": h.headers.get("Last-Modified")}
-    except Exception as e:
-        print(f"  [narr] HEAD {url} failed: {e}")
+    url = remote = None
+    for u in (m.format(year=year) for m in PSL_URLS):
+        try:
+            req = urllib.request.Request(u, method="HEAD")
+            h = urllib.request.urlopen(req, timeout=60)
+            url, remote = u, {"len": h.headers.get("Content-Length"),
+                              "mod": h.headers.get("Last-Modified")}
+            break
+        except Exception as e:
+            print(f"  [narr] HEAD {u} failed: {e}")
+    if url is None:
+        # no mirror answered: the cached copy is all we have — say so loudly,
+        # a silent fallback hid the 2026-10-03 source move
+        print(f"  [narr] WARNING: no NARR mirror reachable for {year}; "
+              f"{'using cached copy' if os.path.exists(dest) else 'no cached copy'}")
         return dest if os.path.exists(dest) else None
     if os.path.exists(dest) and os.path.exists(meta):
         if json.load(open(meta)) == remote:

@@ -51,6 +51,7 @@ V3_LATEST = "nowcast/v3_virtual_latest.parquet"
 TTL_S = 240
 HORIZON_H = 12
 TS_FMT = "%Y-%m-%d %H:%M"
+MAX_ROW_AGE_H = 26.0                # = ungauged_space CARRY_TTL_H
 META_T0_FMT = "%Y-%m-%d %H:%M UTC"
 
 
@@ -213,6 +214,23 @@ def _load():
             big = pa.concat_tables(tables, promote=True)
     cols = {name: big.column(name).to_numpy(zero_copy_only=False)
             for name in big.schema.names}
+    # Drop rows whose own issue time is far behind the freshest shard: a shard
+    # that stopped publishing (1of3 since 2026-08-13) was served under the
+    # fresh shard's t0 label. Rows with no parseable t0 cannot be dated -> drop.
+    try:
+        newest = datetime.strptime(meta.get("t0", ""), META_T0_FMT)
+    except ValueError:
+        newest = None
+    if newest is not None and "t0" in cols:
+        keep = np.zeros(len(cols["t0"]), bool)
+        for i, v in enumerate(cols["t0"]):
+            try:
+                keep[i] = ((newest - datetime.strptime(str(v), TS_FMT))
+                           .total_seconds() / 3600.0 <= MAX_ROW_AGE_H)
+            except (ValueError, TypeError):
+                pass
+        if not keep.all():
+            cols = {k: v[keep] for k, v in cols.items()}
     meta["source"] = "ef5_routed"
     return meta, cols
 

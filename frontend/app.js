@@ -4,6 +4,9 @@
 let errBeaconCount = 0;
 function reportClientError(message, source, line, stack) {
   if (errBeaconCount >= 10) return;             // per-page-load cap
+  // Microsoft's link scanner (Outlook/Teams Safe Links) rejects with this when
+  // it opens a shared link — a bot, not a user; it filled the error log 2026-10-05
+  if (/Object Not Found Matching Id:\d+, MethodName:/.test(String(message))) return;
   errBeaconCount++;
   try {
     fetch("/api/clienterror", {

@@ -42,6 +42,11 @@ CLAIM_WAIT_S = int(os.environ.get("EVENT_CLAIM_WAIT_S", "300"))
 RESULT_WAIT_S = int(os.environ.get("EVENT_RESULT_WAIT_S", "2700"))
 CLAIM_FRESH_S = int(os.environ.get("EVENT_CLAIM_FRESH_S", "600"))
 QUEUE_MAX_AGE_H = float(os.environ.get("EVENT_QUEUE_MAX_AGE_H", "48"))
+# A deliberate full re-solve (spec "cold" stamp) waits its turn behind other
+# re-runs on a single HPC worker — 19 of the 2026-09-23 re-run bundles were
+# swept unclaimed at 51 h, never solved. They get a far longer leash.
+QUEUE_RERUN_MAX_AGE_H = float(os.environ.get("EVENT_QUEUE_RERUN_MAX_AGE_H",
+                                             "720"))
 _TS = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -86,7 +91,9 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
         # entry's event to be genuinely idle: no fresh claim, and its spec's
         # own `queued` stamp (not the id) past QUEUE_MAX_AGE_H.
         spec_age_h: dict[str, float] = {}
+        spec_limit_h: dict[str, float] = {}
         claim_ok: dict[str, bool] = {}
+        swept: set[str] = set()
 
         def _entry_idle_and_old(eid: str) -> bool:
             if eid not in claim_ok:
@@ -105,7 +112,10 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
                     except ValueError:
                         pass
                 spec_age_h[eid] = age
-            return spec_age_h[eid] > QUEUE_MAX_AGE_H
+                spec_limit_h[eid] = (QUEUE_RERUN_MAX_AGE_H
+                                     if (sp or {}).get("cold")
+                                     else QUEUE_MAX_AGE_H)
+            return spec_age_h[eid] > spec_limit_h[eid]
 
         for f in existing:
             base = os.path.basename(f)
@@ -123,11 +133,20 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
             if prior or (id_old and eid != event_id
                          and _entry_idle_and_old(eid)):
                 ops.append(CommitOperationDelete(f))
+                if not prior:
+                    swept.add(eid)
         mb = os.path.getsize(tar_path) / 1e6
+        # name swept ids in the commit so an eviction is never silent again
+        sweep_note = (f"; swept {len(swept)}: {', '.join(sorted(swept))}"
+                      if swept else "")
         api.create_commit(repo_id=eventstore.REPO, repo_type="dataset",
                           operations=ops,
-                          commit_message=f"queue {event_id} "
-                                         f"({len(tifs)} grids, {mb:.0f} MB)")
+                          commit_message=(f"queue {event_id} "
+                                          f"({len(tifs)} grids, {mb:.0f} MB)"
+                                          f"{sweep_note}")[:500])
+        if swept:
+            log(f"queue: swept {len(swept)} idle entries: "
+                f"{', '.join(sorted(swept))}")
         log(f"queue: job {event_id} enqueued "
             f"({len(tifs)} grids, {mb:.0f} MB) [mode {mode()}]")
         _wake_workers(log)
@@ -203,6 +222,12 @@ def gauge_pending(gid: str) -> str | None:
         base = os.path.basename(f)
         if (f.startswith(f"{QPREFIX}/") and base.endswith(suffix)
                 and not base.endswith(".failed.json")):
+            # a cold re-run re-solves an already-published episode and may
+            # wait up to QUEUE_RERUN_MAX_AGE_H: it must not block a NEW flood
+            # at the same gauge from being detected meanwhile
+            sp = _spec(base[:-5])
+            if sp and sp.get("cold"):
+                continue
             return base[:-5]
     return None
 

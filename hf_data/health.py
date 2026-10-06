@@ -202,6 +202,13 @@ def snapshot() -> dict:
         except Exception as e:
             out["queue"] = {"ok": False, "error": type(e).__name__}
             out["workers"] = {}
+        if runner_url:
+            # The runner owns the tick; THIS process never ticks (EVENT_TICK=0)
+            # and its uptime counts from first import, so the local reading
+            # said "warming", ok:true, through the whole 2026-10-02..05 runner
+            # sleep. Unreachable runner = no tick.
+            out["tick"] = {"ok": False, "reason": "runner unreachable",
+                           "last_publish_h": _newest_publish_h()}
 
     # event throughput (index reads work from any Space)
     try:
@@ -224,7 +231,8 @@ def snapshot() -> dict:
         out["events"] = {"error": type(e).__name__}
 
     out["ok"] = all(out.get(k, {}).get("ok", True)
-                    for k in ("nowcast", "mrms", "forcing", "tick", "queue"))
+                    for k in ("nowcast", "mrms", "forcing", "tick", "queue",
+                              "runner_space"))
     with _lock:
         _cache.update(t=time.time(), snap=out)
     return out

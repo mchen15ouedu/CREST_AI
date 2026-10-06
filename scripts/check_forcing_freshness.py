@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import tarfile
+import time
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -202,10 +203,18 @@ def check_usgs() -> tuple[datetime | None, str | None]:
     now = _now()
     latest, errs = None, []
     for site in _USGS_PROBE:
-        try:
-            s = obs.fetch_usgs_discharge(site, now - timedelta(days=2), now)
-        except Exception as e:
-            errs.append(f"{site}: {e}")
+        s, err = None, None
+        for k in range(3):                    # NWIS blips (503, bad gzip) are
+            try:                              # minutes long: retry before FAILED
+                s = obs.fetch_usgs_discharge(site, now - timedelta(days=2), now)
+                err = None
+                break
+            except Exception as e:
+                err = e
+                if k < 2:
+                    time.sleep((5, 15)[k])
+        if err is not None:
+            errs.append(f"{site}: {err}")
             continue
         if s and (latest is None or s[-1][0] > latest):
             latest = s[-1][0]
