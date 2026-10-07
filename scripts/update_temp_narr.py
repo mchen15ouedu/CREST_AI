@@ -33,6 +33,7 @@ import re
 import sys
 import tarfile
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -93,7 +94,23 @@ def _download_year(year: int) -> str | None:
         if json.load(open(meta)) == remote:
             return dest
     print(f"  [narr] downloading {url} ({int(remote['len'] or 0)/1e6:.0f} MB)…")
-    urllib.request.urlretrieve(url, dest + ".part")
+    # PSL rate-limits bursts (HTTP 429 on 2026-10-07, 21 min after it
+    # republished the year file) — back off and retry transient errors
+    # instead of failing the whole self-heal until the next cooldown
+    for attempt, wait in enumerate((30, 120, 300, None)):
+        try:
+            urllib.request.urlretrieve(url, dest + ".part")
+            break
+        except Exception as e:
+            code = getattr(e, "code", None)
+            transient = code is None or code == 429 or code >= 500
+            if wait is None or not transient:
+                raise
+            ra = getattr(e, "headers", None) and e.headers.get("Retry-After")
+            if ra and str(ra).isdigit():
+                wait = max(wait, min(int(ra), 900))
+            print(f"  [narr] download failed ({e}); retry {attempt + 1}/3 in {wait} s")
+            time.sleep(wait)
     os.replace(dest + ".part", dest)
     json.dump(remote, open(meta, "w"))
     return dest
