@@ -125,9 +125,33 @@ class NarrYear:
         t = self.ds.variables["time"]
         import cftime  # noqa: F401  (num2date backend)
         import netCDF4 as nc4
-        dates = nc4.num2date(t[:], t.units)
-        self.hours = {datetime(d.year, d.month, d.day, d.hour): i
-                      for i, d in enumerate(dates)}
+        # PSL's 2026-10-07 rewrite of air.2m.2026.nc (HDF5) holds Jan-Jul as
+        # DAILY records, 1,732 masked (empty) time slots where August belongs,
+        # and only September 3-hourly. A masked stamp crashed num2date; a daily
+        # record read as a 00Z instant would be silently wrong. Index only
+        # records that sit inside a 3-hourly run.
+        tv = t[:]
+        mask = np.ma.getmaskarray(tv)
+        vals = np.ma.getdata(tv).astype("float64")
+        good = np.nonzero(~mask)[0]
+        gv = vals[good]
+        step3 = np.zeros(len(good), bool)
+        if len(good) > 1:
+            d = np.diff(gv)
+            nxt3 = np.isclose(d, 3.0)
+            step3[:-1] |= nxt3                     # opens/continues a 3-h step
+            # reached by a 3-h step and not opening a daily run: a daily record
+            # stamped D 00Z sits exactly 3 h after D-1 21Z (residual ambiguity:
+            # a lone daily record at the very END of a file looks the same)
+            step3[1:] |= nxt3 & np.append(~np.isclose(d[1:], 24.0), True)
+        dates = nc4.num2date(gv[step3], t.units) if step3.any() else []
+        self.hours = {datetime(d.year, d.month, d.day, d.hour): int(i)
+                      for i, d in zip(good[step3], dates)}
+        n_off = int((~step3).sum())
+        if mask.any() or n_off:
+            print(f"  [narr] {os.path.basename(path)}: {len(self.hours)} 3-hourly records "
+                  f"usable, {int(mask.sum())} empty time slots, {n_off} non-3-hourly "
+                  f"(e.g. daily) records ignored")
         self.air = self.ds.variables["air"]
         gm = self.ds.variables["Lambert_Conformal"]
         x = self.ds.variables["x"][:].astype("float64")
@@ -152,6 +176,8 @@ class NarrYear:
         if idx is None:
             return None
         a = np.ma.filled(self.air[idx, :, :].astype("float64"), np.nan) - 273.15
+        if not np.isfinite(a).any():
+            return None                # empty record: no data, not a nodata grid
         i0 = np.clip(np.floor(self.fi).astype(int), 0, a.shape[0] - 2)
         j0 = np.clip(np.floor(self.fj).astype(int), 0, a.shape[1] - 2)
         di = np.clip(self.fi - i0, 0, 1)
@@ -227,6 +253,11 @@ def update_month(year: int, month: int, years: dict[int, NarrYear], api,
         _write_pqf(buf, v, xll, yll, cell, TEMP_GRID[5])
         new.append((t.strftime(cfg.out_fmt), open(buf, "rb").read()))
     if not new:
+        src_end = max((max(ny.hours) for ny in years.values() if ny.hours),
+                      default=None)
+        if src_end is not None and src_end >= end:
+            return (f"{year}-{month:02d}: SOURCE GAP — {len(want)} hour(s) missing and "
+                    f"NARR has later data (to {src_end:%Y-%m-%d %H}Z) but none for them")
         return (f"{year}-{month:02d}: {len(want)} hour(s) missing but NARR has "
                 f"no data for them yet (lag)")
     if dry_run:

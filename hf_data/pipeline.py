@@ -858,7 +858,15 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         forcing.prepare_forcing("pet", bbox, f0, force_end, pet_dir, cancel=cancel)
         if snow_on and not _stopped():
             yield ("status", "❄ preparing temperature forcing (snow module)…")
-            forcing.prepare_forcing("temp", bbox, f0, force_end, temp_dir, cancel=cancel)
+            tr = forcing.prepare_forcing("temp", bbox, f0, force_end, temp_dir,
+                                         cancel=cancel)
+            if tr.missing:
+                # NARR lags weeks and its 2026 file has no August (PSL rewrite
+                # 2026-10-07): say so instead of letting SNOW17 run blind
+                yield ("status", f"⚠️ {len(tr.missing)} temperature hour(s) "
+                                 f"unavailable (NARR source lag or gap) — the "
+                                 f"snow module has no observed temperature for "
+                                 f"them (first: {tr.missing[0]})")
         if _stopped():
             yield ("status", "⏹ stopped")
             yield ("done", {"returncode": -9, "cancelled": True})

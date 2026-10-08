@@ -171,6 +171,28 @@ def check_store_var(api, var: str) -> tuple[datetime | None, str | None]:
     return None, err or "no datable members in newest tar"
 
 
+def store_month_gaps(api, var: str) -> list[str]:
+    """Months with no month tar between the first and the newest month tar —
+    a hole the newest-member check cannot see (TEMP 2026-08: PSL's 2026-10-07
+    rewrite of the NARR year file has no August, September ingested past it)."""
+    try:
+        files = api.list_repo_files(HF_REPO, repo_type="dataset")
+    except Exception:
+        return []
+    have = sorted({(int(m.group(1)), int(m.group(2))) for f in files
+                   for m in [re.match(rf"{var}/\d{{4}}/{var}_(\d{{4}})_(\d{{2}})\.tar$", f)]
+                   if m})
+    if len(have) < 2:
+        return []
+    gaps, (y, mo) = [], have[0]
+    hs = set(have)
+    while (y, mo) < have[-1]:
+        if (y, mo) not in hs:
+            gaps.append(f"{y}-{mo:02d}")
+        y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
+    return gaps
+
+
 def check_mrms_recent(api) -> tuple[datetime | None, str | None]:
     """Newest loose Pass1 hour in mrms_recent/ (no download — names carry the
     timestamp). This is the nowcasting feed, refreshed every 6 h."""
@@ -296,6 +318,11 @@ def main() -> int:
         ok &= _report("TEMP", latest, err, now, timedelta(days=args.temp_days), "d")
 
     latest, err = check_mrms_recent(api)
+    for var in ("mrms", "pet", "temp"):
+        gaps = store_month_gaps(api, var)
+        if gaps:                          # informational: no STALE/FAILED token
+            print(f"  {var.upper() + ' gap':12s} note   month tar(s) absent: "
+                  f"{', '.join(gaps)} (store has later data)")
     ok &= _report("MRMS recent", latest, err, now,
                   timedelta(hours=args.recent_hours), "h")
 
