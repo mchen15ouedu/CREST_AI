@@ -230,6 +230,17 @@ def snapshot() -> dict:
     except Exception as e:
         out["events"] = {"error": type(e).__name__}
 
+    # user-initiated work in THIS process (dashboard simulations + user
+    # calibrations, running or waiting for a slot) — top compute priority;
+    # CREST_autocal reads it to stay out of the way. Info only, not in ok.
+    try:
+        from . import caljobs, simjobs
+        out["user_ops"] = {
+            "sims": sum(1 for j in list(simjobs._JOBS.values()) if not j.done.is_set()),
+            "cals": sum(1 for j in list(caljobs._JOBS.values()) if not j.done.is_set())}
+    except Exception as e:
+        out["user_ops"] = {"error": type(e).__name__}
+
     out["ok"] = all(out.get(k, {}).get("ok", True)
                     for k in ("nowcast", "mrms", "forcing", "tick", "queue",
                               "runner_space"))

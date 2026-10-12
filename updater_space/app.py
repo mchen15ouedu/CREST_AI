@@ -35,7 +35,10 @@ from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-FEEDS = ["temp", "pet", "mrms", "mrms_recent", "nowcast", "usgs"]   # temp first (matches local routine)
+# Priority order (user: nowcast > 2-D inundation > data update): the hourly
+# nowcast inputs + nowcast run first, the heavy archive feeds after, so a full
+# (weekly / manual) run never holds the nowcast or the 2-D tick behind them.
+FEEDS = ["mrms_recent", "nowcast", "usgs", "temp", "pet", "mrms"]
 SCRIPTS = {
     "temp": "update_temp_narr.py",
     "pet": "update_pet.py",
@@ -155,6 +158,9 @@ def _run_all(feeds: list[str]):
         rc, lines = _run_script("check")          # always end with the freshness report
         _state["freshness"] = lines
         _state["exit_codes"]["check"] = rc
+        # 2-D tick (class 3) as soon as the fresh nowcast exists — BEFORE any
+        # self-heal of the heavy archive feeds (class 4) below
+        _ping_event_tick()                        # V25: hourly inundation tick
 
         # self-heal any heavy store feed the check found stalled (see notes at
         # HEAL_THRESH_D). Runs the same updater the weekly refresh would, then
@@ -178,7 +184,6 @@ def _run_all(feeds: list[str]):
                 _state["exit_codes"]["check"] = rc
 
         _log("=== run complete ===")
-        _ping_event_tick()                        # V25: hourly inundation tick
     except Exception as e:                        # keep the app alive whatever happens
         _log(f"run crashed: {e!r}")
     finally:
@@ -234,6 +239,7 @@ def run(feeds: str = "", key: str = ""):
     want = [f for f in (feeds.split(",") if feeds else FEEDS) if f in SCRIPTS and f != "check"]
     if not want:
         want = FEEDS
+    want = sorted(dict.fromkeys(want), key=FEEDS.index)      # priority order
     if not _start(want):
         return JSONResponse({"error": "a run is already in progress"}, status_code=409)
     return {"ok": True, "feeds": want}

@@ -50,6 +50,15 @@ K = int(os.environ.get("AUTOCAL_K", "3"))
 REQUIRE_LLM = os.environ.get("AUTOCAL_REQUIRE_LLM", "1") == "1"
 STREAK_GAP_H = float(os.environ.get("AUTOCAL_STREAK_GAP_H", "3"))
 STATE_PATH = os.environ.get("AUTOCAL_STATE", "/tmp/autocal_state.json")
+# Idle gate (user 2026-10-12: "auto_cal has the lowest priority — only when
+# there is enough computation"): start, and keep going between rounds, only
+# while the dashboard's /api/health shows no user-initiated work, no 2-D
+# bundle queued or claimed, and no event EF5 run on the runner's tick. The
+# health snapshot is cached 120 s server-side. Fleet runners are NOT a gate:
+# they run on their own Spaces with a permanent backlog (would never idle).
+HEALTH_URL = os.environ.get("AUTOCAL_HEALTH_URL",
+                            "https://vincewin-crest-demo.hf.space/api/health")
+IDLE_FOR_S = float(os.environ.get("AUTOCAL_IDLE_FOR_S", "1800"))
 
 TS = "%Y-%m-%dT%H:%M:%SZ"
 state = {"phase": "booting", "current": None, "last": None, "runs": 0, "skips": 0}
@@ -65,6 +74,39 @@ def _dump_state():
             json.dump(state, fp)
     except OSError:
         pass
+
+
+class Preempted(Exception):
+    """Higher-priority work appeared mid-calibration: drop it, retry later."""
+
+
+def busy_reason() -> str | None:
+    """None when every higher compute class is quiet, else why not. Fails
+    CLOSED: an unreadable health snapshot counts as busy."""
+    try:
+        import requests
+        h = requests.get(HEALTH_URL, timeout=30).json()
+    except Exception as e:
+        return f"health unreadable ({type(e).__name__})"
+    u = h.get("user_ops") or {}
+    if "sims" not in u:
+        return "health has no user_ops (dashboard not updated?)"
+    if u.get("sims") or u.get("cals"):
+        return f"user work running ({u.get('sims')} sims, {u.get('cals')} cals)"
+    q, w, t = h.get("queue") or {}, h.get("workers") or {}, h.get("tick") or {}
+    ev = h.get("events") or {}
+    # queue.depth also counts solved-but-unswept bundles (up to 48 h), and
+    # re-solves of LISTED episodes count as "published" — so gate on never-
+    # published bundles plus any active flood episode (still being re-solved)
+    if q.get("unpublished") is None or q.get("unpublished"):
+        return f"{q.get('unpublished')} unpublished 2-D bundle(s)"
+    if ev.get("active") is None or ev.get("active"):
+        return f"{ev.get('active')} active flood episode(s)"
+    if w.get("active_claims"):
+        return f"{w['active_claims']} 2-D worker claim(s) active"
+    if t.get("running"):
+        return f"runner tick busy ({t['running']})"
+    return None
 
 
 def _parse(s: str | None) -> dt.datetime | None:
@@ -193,6 +235,9 @@ def calibrate_one(rec: dict, now: dt.datetime) -> dict:
     for kind, payload in calibrate.run_calibration(
             gid, t_start, t_end, model="auto", snow="auto", use_mock=False,
             rounds=ROUNDS, k=K, save_vs_baseline=True):
+        why = busy_reason() if kind in ("status", "round") else None
+        if why:
+            raise Preempted(why)
         if kind == "status":
             log(f"  {payload}")
         elif kind == "round":
@@ -221,6 +266,7 @@ def main():
         log(state["phase"])
         while True:
             time.sleep(3600)
+    idle_since = None
     while True:
         now = dt.datetime.utcnow()
         try:
@@ -229,6 +275,19 @@ def main():
                 _dump_state()
                 log(state["phase"])
                 time.sleep(POLL_S)
+                continue
+            busy = busy_reason()
+            if busy:
+                idle_since = None
+            elif idle_since is None:
+                idle_since = time.time()
+            if busy or time.time() - idle_since < IDLE_FOR_S:
+                state["phase"] = ("yielding — " + busy) if busy else (
+                    f"idle for {(time.time() - idle_since) / 60:.0f} of "
+                    f"{IDLE_FOR_S / 60:.0f} min before starting")
+                _dump_state()
+                log(state["phase"])
+                time.sleep(min(POLL_S, 300))
                 continue
             missed = eventstore.load_missed()
             index = eventstore.load_index()
@@ -250,6 +309,11 @@ def main():
             state["last"] = result
             state["current"] = None
             log(f"record: {json.dumps(result)[:400]}")
+        except Preempted as p:             # nothing recorded: retried when idle
+            state["phase"] = f"preempted — {p}"
+            state["current"] = None
+            idle_since = None
+            log(state["phase"])
         except Exception as e:
             state["phase"] = f"error: {type(e).__name__}: {e}"
             state["current"] = None

@@ -36,6 +36,7 @@ from hf_data import llm, nowcaststore
 TOP_GAUGES = int(os.environ.get("BRIEF_TOP_GAUGES", "14"))
 TOP_STATES = int(os.environ.get("BRIEF_TOP_STATES", "8"))
 LLM_TIMEOUT_S = float(os.environ.get("BRIEF_LLM_TIMEOUT_S", "120"))
+FORCE_COOLDOWN_S = float(os.environ.get("BRIEF_FORCE_COOLDOWN_S", "600"))
 TIER_NAME = {3: "flood", 2: "minor", 1: "elevated"}
 
 _lock = threading.Lock()
@@ -373,6 +374,13 @@ def brief(force: bool = False) -> dict:
     if not snap.get("ok"):
         return snap
     with _lock:
+        # ?refresh=1 is public: honour a forced rebuild (a paid web-search
+        # call) at most once per FORCE_COOLDOWN_S, so it can't drain the
+        # OpenAI budget that user chat needs
+        if force and time.time() - _cache.get("forced_at", 0.0) < FORCE_COOLDOWN_S:
+            force = False
+        if force:
+            _cache["forced_at"] = time.time()
         fresh = (_cache["text"] is not None and _cache["t0"] == snap["t0"] and not force)
         if not fresh and not _cache["building"] and llm.available():
             _cache.update(building=True, error=None)
