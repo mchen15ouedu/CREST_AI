@@ -19,7 +19,7 @@ import shutil
 import tempfile
 from datetime import datetime
 
-from hf_data import analysis, llm, paramstore
+from hf_data import analysis, caltrace, llm, paramstore
 
 # ---- calibration rules (AI_cali hydrocalib/config.py) ----------------------
 PARAM_BOUNDS = {
@@ -108,8 +108,10 @@ def _heuristic_candidates(base: dict, k: int, rnd: random.Random) -> list[dict]:
 
 
 def propose(base: dict, metrics: dict, history: list[dict], k: int,
-            round_index: int, rnd: random.Random) -> list[dict]:
-    """One round of candidates: LLM if available, heuristic ladder otherwise."""
+            round_index: int, rnd: random.Random, trace: list | None = None) -> list[dict]:
+    """One round of candidates: LLM if available, heuristic ladder otherwise.
+    trace: optional list; one note describing what produced the candidates
+    (and what the LLM was shown / replied) is appended for caltrace."""
     if llm.available():
         payload = {
             "round": round_index,
@@ -124,6 +126,7 @@ def propose(base: dict, metrics: dict, history: list[dict], k: int,
                      "objective; bias_pct shows volume error; peak_sim vs peak_obs shows "
                      "peak magnitude error."),
         }
+        txt = None
         try:
             txt, _prov = llm.chat(
                 [{"role": "system", "content": PROPOSE_SYSTEM},
@@ -138,10 +141,17 @@ def propose(base: dict, metrics: dict, history: list[dict], k: int,
                     out.append({"id": str(c.get("id", f"cand{i}")),
                                 "goal": str(c.get("goal", ""))[:120], "updates": ups})
             if out:
+                caltrace.note(trace, source="llm", provider=_prov, shown=payload, raw=txt)
                 return out
+            caltrace.note(trace, source="heuristic", why="LLM reply had no usable candidates",
+                          shown=payload, raw=txt)
         except Exception as e:                    # heuristic fallback degrades
             from hf_data import crashlog          # calibration quality — record it
             crashlog.capture("cal:llm-propose", e, round=rnd)
+            caltrace.note(trace, source="heuristic", why=f"LLM error: {type(e).__name__}",
+                          shown=payload, raw=txt)
+    else:
+        caltrace.note(trace, source="heuristic", why="no LLM configured")
     return _heuristic_candidates(base, k, rnd)
 
 
@@ -158,6 +168,32 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                     rounds: int = 4, k: int = 3, timestep: str = "1h",
                     ext_rounds: int = EXT_ROUNDS, ext_k: int = EXT_K,
                     ext_nse: float = EXT_NSE, save_vs_baseline: bool = False):
+    """_run_calibration, with its rounds recorded for the review pilot
+    (caltrace). Recording only observes: the event stream is unchanged, and a
+    calibration stopped early (autocal preemption, client gone) still uploads
+    the rounds it finished."""
+    rec = caltrace.Recorder(gauge_id, model, t_start, t_end, use_mock=use_mock,
+                            auto=save_vs_baseline, rounds=rounds, k=k)
+    try:
+        yield from _run_calibration(gauge_id, t_start, t_end, model=model, snow=snow,
+                                    use_mock=use_mock, rounds=rounds, k=k,
+                                    timestep=timestep, ext_rounds=ext_rounds,
+                                    ext_k=ext_k, ext_nse=ext_nse,
+                                    save_vs_baseline=save_vs_baseline,
+                                    rec=rec if rec.on else None)
+    except GeneratorExit:                      # consumer stopped early (autocal preempt)
+        rec.finish(status="stopped")
+        raise
+    finally:
+        rec.finish()
+
+
+def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
+                     model: str = "auto", snow: str = "auto", use_mock: bool = True,
+                     rounds: int = 4, k: int = 3, timestep: str = "1h",
+                     ext_rounds: int = EXT_ROUNDS, ext_k: int = EXT_K,
+                     ext_nse: float = EXT_NSE, save_vs_baseline: bool = False,
+                     rec: caltrace.Recorder | None = None):
     """Generator of calibration events for the SSE stream.
 
     save_vs_baseline: judge the winner against the baseline NSE measured on
@@ -192,6 +228,10 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
     if stored:
         base = {**base, **stored.get("wb", {}), **stored.get("kw", {})}
     base = clamp(base)
+    if rec is not None:
+        rec.setup(gauge_info={kk: g.get(kk) for kk in ("name", "lat", "lon", "area_km2", "area")},
+                  ef5_model=ef5_model, start_from="stored best" if stored else "a-priori",
+                  stored_nse=(stored or {}).get("nse"), use_mock=use_mock)
 
     def run_candidate(params: dict):
         """Run EF5 with the candidate params, 1-D only; return (nse, metrics, rows).
@@ -215,6 +255,8 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
 
     yield ("status", f"baseline run — current parameters ({'stored best' if stored else 'a-priori'})")
     base_nse, base_metrics, base_rows = run_candidate(base)
+    if rec is not None:
+        rec.baseline(base, base_nse, _summarize(base_metrics))
     yield ("round", {"round": 0, "tried": [{"id": "baseline", "goal": "current parameters",
                                             "nse": base_nse}],
                      "best_nse": base_nse})
@@ -233,23 +275,35 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
         n_rounds, kk = stages[si]
         for _ in range(n_rounds):
             r += 1
-            cands = propose(best_params, base_metrics, history, kk, r, rnd)
+            ptrace = [] if rec is not None else None
+            nse_before = best_nse
+            cands = propose(best_params, base_metrics, history, kk, r, rnd, trace=ptrace)
             tried = []
+            rec_cands = []
             for c in cands:
                 params = clamp({**best_params, **c["updates"]})
                 yield ("status", f"round {r}: testing “{c['goal'] or c['id']}”")
+                err = None
                 try:
                     nse, m, rows = run_candidate(params)
                 except Exception as e:
                     nse, m, rows = None, {}, []
+                    err = f"{type(e).__name__}: {str(e)[:200]}"
                     yield ("status", f"round {r}: candidate {c['id']} failed ({e})")
                 done_runs += 1
                 tried.append({"id": c["id"], "goal": c["goal"], "nse": nse,
                               "progress": round(done_runs / total, 3)})
                 history.append({"id": c["id"], "updates": c["updates"], "nse": nse})
+                if rec is not None:
+                    rec_cands.append({"id": c["id"], "goal": c["goal"], "updates": c["updates"],
+                                      "params": params, "nse": nse,
+                                      "metrics": _summarize(m), "error": err})
                 if nse is not None and (best_nse is None or nse > best_nse):
                     best_nse, best_params, best_rows = nse, params, rows
                     yield ("hydro", {"rows": rows})
+            if rec is not None:
+                rec.round(r, ptrace[-1] if ptrace else None, rec_cands, nse_before,
+                          best_nse, extended)
             yield ("round", {"round": r, "tried": tried, "best_nse": best_nse,
                              "best_params": best_params, "extended": extended})
         si += 1
@@ -278,6 +332,9 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
         if saved and save_vs_baseline:
             yield ("status", "winner pushed to CREST_state: "
                    + ("ok" if paramstore.push_remote(g["id"], ef5_model) else "FAILED"))
-    yield ("done", {"best_nse": best_nse, "baseline_nse": base_nse,
-                    "best_params": best_params, "saved": saved, "improved": improved,
-                    "extended": extended})
+    done = {"best_nse": best_nse, "baseline_nse": base_nse,
+            "best_params": best_params, "saved": saved, "improved": improved,
+            "extended": extended}
+    if rec is not None:
+        rec.finish(done)
+    yield ("done", done)
