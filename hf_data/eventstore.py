@@ -10,11 +10,13 @@ Storage discipline (HF limits):
     event is ~10-30 MB. KEEP_EVENTS caps steady-state usage (< ~1 GB).
   * No DEM/forcing archive: DEM comes from public 3DEP on demand; runoff
     grids are reproducible from the MRMS archive already in CREST_data.
-  * Animation cleanup (monthly): while an event is on the list it stays fully
-    animatable; when it rolls off (KEEP_EVENTS / MAX_AGE_D) only its animation
-    files (depth_* frames + archive.parquet) are cleared, and the simulation
-    RESULTS (manifest + max-depth map + final product + DEM) stay in the store
-    as a lightweight archive until RESULTS_MAX_AGE_D.
+  * Animation cleanup: while an event is on the list it stays fully
+    animatable; when it rolls off (KEEP_EVENTS count cap; age/monthly limits
+    are OFF since 2026-10-16) only its animation files (depth_* frames +
+    archive.parquet) are cleared, and the simulation RESULTS (manifest +
+    max-depth map + final product + DEM) stay in the store as a lightweight
+    archive until RESULTS_MAX_AGE_D.
+  * Pinned demo events (events/pinned.json) are exempt from all of the above.
 """
 from __future__ import annotations
 
@@ -50,12 +52,20 @@ KEEP_EVENTS = int(os.environ.get("EVENT_KEEP", "40"))
 _kf = os.environ.get("EVENT_KEEP_FULL")
 KEEP_FULL = (int(_kf) if _kf and os.environ.get("EVENT_DEMOTE") == "1"
              else KEEP_EVENTS)
-MAX_AGE_D = float(os.environ.get("EVENT_MAX_AGE_D", "30"))
-# calendar-month list (user directive 2026-09-11): the public list is cleared
-# monthly — an ended event whose t_end falls before the first day of the
-# current UTC month rolls off (results kept, exactly like the age roll-off).
-# MAX_AGE_D stays as the outer bound. EVENT_LIST_MONTHLY=0 disables.
-LIST_MONTHLY = os.environ.get("EVENT_LIST_MONTHLY", "1") != "0"
+# Age-based roll-off is OFF (user directive 2026-10-16: "we are not deleting
+# after a month anymore"). EVENT_MAX_AGE_D > 0 re-enables an age limit;
+# 0 (the default) means events never age off the list.
+MAX_AGE_D = float(os.environ.get("EVENT_MAX_AGE_D", "0"))
+# calendar-month list clearing (user directive 2026-09-11) is likewise OFF by
+# default since 2026-10-16; EVENT_LIST_MONTHLY=1 brings it back.
+LIST_MONTHLY = os.environ.get("EVENT_LIST_MONTHLY", "0") == "1"
+# Pinned events (user directive 2026-10-16: "keep some of the already
+# simulated results for demo purposes"): ids listed in events/pinned.json are
+# never dropped from the list, demoted, stripped of their animation or purged,
+# whatever the count cap or age. They also don't count toward KEEP_EVENTS.
+PINNED_FILE = f"{PREFIX}/pinned.json"
+PINNED_TTL_S = float(os.environ.get("EVENT_PINNED_TTL_S", "600"))
+_pin_cache = {"t": 0.0, "ids": frozenset(), "ok": False}
 # when an event rolls OFF the list (count cap or MAX_AGE_D age), we clear only
 # its ANIMATION files and KEEP the simulation results (manifest + max-depth map
 # + final product + DEM) in the store — a monthly animation cleanup that leaves
@@ -107,11 +117,42 @@ def _ended_before_month(event_id: str, summary: dict | None) -> bool:
     return t_end[:16] < _month_start()[:16]
 
 
+def pinned_ids(force: bool = False) -> frozenset:
+    """Event ids protected from every retention path (events/pinned.json:
+    {"ids": [...], "note": ...}). Cached PINNED_TTL_S. If the file can't be
+    READ (network), the last known set is kept — a transient error must never
+    unprotect a demo event; only a successful read of a missing file empties it."""
+    now = time.time()
+    if not force and now - _pin_cache["t"] < PINNED_TTL_S:
+        return _pin_cache["ids"] if _pin_cache["ok"] else None
+    try:
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError
+        try:
+            p = hf_hub_download(REPO, PINNED_FILE, repo_type="dataset",
+                                token=os.environ.get("HF_TOKEN"), force_download=True)
+            with open(p, encoding="utf-8") as fp:
+                data = json.load(fp)
+            raw = data.get("ids") if isinstance(data, dict) else data
+            if isinstance(raw, str):
+                raw = [raw]
+            ids = frozenset(str(x) for x in (raw or []))
+        except EntryNotFoundError:
+            ids = frozenset()
+        _pin_cache.update(t=now, ids=ids, ok=True)
+    except Exception:
+        _pin_cache["t"] = now - PINNED_TTL_S + 60      # retry in a minute
+    return _pin_cache["ids"] if _pin_cache["ok"] else None
+
+
 def _aged_out(idx: dict, keep: str | None = None) -> list[str]:
+    pins = pinned_ids()
+    if pins is None:
+        return []
     return [e for e in idx
-            if e != keep
+            if e != keep and e not in pins
             and idx[e].get("status") != "active"
-            and ((_age_days(e) or 0.0) > MAX_AGE_D
+            and ((MAX_AGE_D > 0 and (_age_days(e) or 0.0) > MAX_AGE_D)
                  or (LIST_MONTHLY and _ended_before_month(e, idx[e])))]
 
 
@@ -246,7 +287,10 @@ def drop_events(event_ids, purge: bool = True, why: str = "") -> bool:
     folders) — e.g. an episode whose map the CREST-miss guard disowned."""
     from huggingface_hub import CommitOperationAdd, CommitOperationDelete
     api = _api()
-    ids = [e for e in event_ids if e]
+    pins = pinned_ids(force=True)
+    if pins is None:
+        return False
+    ids = [e for e in event_ids if e and e not in pins]   # demo events stay
     if api is None or not ids:
         return False
     with _lock:
@@ -315,8 +359,15 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
         summary["archive_frames"] = manifest.get("archive_frames")
         # newest first
         idx = {ev: summary, **idx}
-        drop = list(idx.keys())[KEEP_EVENTS:]
-        drop += [d for d in _aged_out(idx, keep=ev) if d not in drop]
+        pins = pinned_ids()
+        # the count cap applies to unpinned events only (pinned demo events
+        # stay listed and don't use up the KEEP_EVENTS slots)
+        if pins is None:
+            drop = []
+        else:
+            unpinned = [d for d in idx if d not in pins]
+            drop = [d for d in unpinned[KEEP_EVENTS:] if d != ev]
+            drop += [d for d in _aged_out(idx, keep=ev) if d not in drop]
         for d in drop:
             idx.pop(d, None)
 
@@ -378,8 +429,9 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
                 ops.append(CommitOperationAdd(f"{PREFIX}/{ev}/{fn}", p))
         # demote events beyond KEEP_FULL (default = KEEP_EVENTS, so normally
         # none): strip the animation, keep the results, stay listed.
-        demote = [d for d in list(idx.keys())[KEEP_FULL:]
-                  if not idx[d].get("demoted")]
+        demote = [] if pins is None else [
+            d for d in [x for x in idx if x not in pins][KEEP_FULL:]
+            if not idx[d].get("demoted")]
         # events leaving the list (count cap or aged out): keep their
         # simulation RESULTS, clear only the animation files — unless they are
         # older than RESULTS_MAX_AGE_D, then remove the result too.
@@ -641,6 +693,9 @@ def retention_sweep() -> int:
     api = _api()
     if api is None:
         return 0
+    pins = pinned_ids()
+    if pins is None:
+        return 0
     with _lock:
         idx = load_index()
         aged = _aged_out(idx)                       # leaving the list this pass
@@ -651,7 +706,13 @@ def retention_sweep() -> int:
         # event ids with a result folder in the store but no longer listed
         stored = {f.split("/")[1] for f in allfiles
                   if f.startswith(f"{PREFIX}/") and f.count("/") >= 2}
-        orphans = stored - set(idx.keys()) - set(aged)
+        if not idx and stored:
+            # an empty index next to stored results is a failed index read,
+            # not "nothing listed" — sweeping now would strip every event's
+            # animation and overwrite index.json with {}
+            return 0
+        # pinned demo events keep everything (animation included), listed or not
+        orphans = stored - set(idx.keys()) - set(aged) - pins
 
         ops, stripped, purged = [], 0, 0
         for e in aged:                              # keep result, clear animation

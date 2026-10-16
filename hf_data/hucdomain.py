@@ -363,12 +363,19 @@ def build_domain(gauge: dict, ef5_dir: str, dem_res: str = "1",
         geoms = {None: geom_u}
         log("domain: EF5 carved catchment used as the (single) unit")
 
-    # ---- hydrologic-unit trimming for a cell budget (CPU rung) ------------- #
+    # ---- hydrologic-unit trimming for a cell budget (CPU rung / GPU queue) - #
     trimmed = False
+    full_n = len(hucs)
+    full_area = sum((r["area_km2"] or 0.0) for r in hucs) or None
     order = sorted(hucs, key=lambda r: (-r["depth"], r["huc12"] or ""))
+    # the bbox of a union is the min/max of its members' bounds, so the
+    # trimming loop needs no polygon union (a 337-unit basin took ~160 s when
+    # every drop re-unioned); the union is built once, after trimming
+    ub = {r["huc12"]: geoms[r["huc12"]].bounds for r in hucs}
     while True:
-        u = unary_union([geoms[r["huc12"]] for r in hucs])
-        bbox = _snap_bbox(u.bounds, res)
+        bs = [ub[r["huc12"]] for r in hucs]
+        bbox = _snap_bbox((min(b[0] for b in bs), min(b[1] for b in bs),
+                           max(b[2] for b in bs), max(b[3] for b in bs)), res)
         nx = int(round((bbox[2] - bbox[0]) / res))
         ny = int(round((bbox[3] - bbox[1]) / res))
         if not max_cells or nx * ny <= max_cells or len(hucs) <= 1:
@@ -376,6 +383,7 @@ def build_domain(gauge: dict, ef5_dir: str, dem_res: str = "1",
         drop = order.pop(0)          # most-upstream first; gauge unit last
         hucs = [r for r in hucs if r is not drop]
         trimmed = True
+    u = unary_union([geoms[r["huc12"]] for r in hucs])
     if max_cells and nx * ny > max_cells:
         raise DomainError(f"even the gauge's own unit ({nx * ny / 1e6:.1f}M "
                           f"cells) exceeds the {max_cells / 1e6:.1f}M cell "
@@ -426,6 +434,10 @@ def build_domain(gauge: dict, ef5_dir: str, dem_res: str = "1",
             "bbox": [round(v, 6) for v in bbox], "n_active": n_active,
             "n_bbox": int(nx * ny), "dem_res": str(dem_res),
             "basin": rings[0], "trimmed": trimmed}
+    if trimmed:
+        # the whole contributing basin, for an honest "N of M units" label
+        summ["of_n_hucs"] = full_n
+        summ["of_area_km2"] = round(full_area, 1) if full_area else None
     log(f"domain: {len(hucs)} {summ['unit']} unit(s), "
         f"{(area or 0):.0f} km2, {n_active / 1e6:.2f}M active of "
         f"{nx * ny / 1e6:.2f}M bbox cells at {res * 111000:.0f} m "

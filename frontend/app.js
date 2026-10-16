@@ -2903,10 +2903,12 @@ function drawEventSite(man) {
   evtSiteLayer = L.layerGroup().addTo(map);
   const gid = (man.trigger && man.trigger.gauge) || man.gauge || "";
   const dom = man.domain || {};
-  const nU = dom.n_units || (man.huc12s && man.huc12s.length) || 0;
+  const nU = dom.n_hucs || dom.n_units || (man.huc12s && man.huc12s.length) || 0;
   const areaTxt = dom.area_km2 ? ` · ${Math.round(dom.area_km2).toLocaleString()} km²` : "";
   const label = nU
-    ? `Simulated domain: basin of gauge ${gid} — ${nU} HUC12 unit${nU > 1 ? "s" : ""}${areaTxt}`
+    ? (dom.trimmed && dom.of_n_hucs
+      ? `Simulated domain: the ${nU} of ${dom.of_n_hucs} HUC12 units of gauge ${gid}'s basin nearest the gauge${areaTxt} (GPU cell budget)`
+      : `Simulated domain: basin of gauge ${gid} — ${nU} HUC12 unit${nU > 1 ? "s" : ""}${areaTxt}`)
     : `Simulated domain: basin draining to gauge ${gid}`;
   const drawRing = () => {
     if (Array.isArray(man.basin) && man.basin.length > 3) {
@@ -3101,13 +3103,15 @@ function renderEvtCtl() {
     ? ` · ~${Math.round(gr.dx_m || 0)} m cells` : "";
   // the domain IS the basin: say so in hydrologic units, not grid boxes
   const dom = man.domain || {};
-  const nU = dom.n_units || (man.huc12s && man.huc12s.length) || 0;
+  const nU = dom.n_hucs || dom.n_units || (man.huc12s && man.huc12s.length) || 0;
   const domTxt = nU
     ? `<div style="opacity:.85">basin domain: ${nU} HUC12 unit${nU > 1 ? "s" : ""}` +
       `${dom.area_km2 ? ` · ${Math.round(dom.area_km2).toLocaleString()} km²` : ""}` +
       `${dom.n_active ? ` · ${(dom.n_active / 1e6).toFixed(2)} M cells` : ""}` +
       `${man.cpu_trimmed ? ` <span style="opacity:.8">(CPU rung: ${man.cpu_trimmed.n_hucs} of ` +
-        `${man.cpu_trimmed.of_n_hucs} units nearest the gauge)</span>` : ""}</div>`
+        `${man.cpu_trimmed.of_n_hucs} units nearest the gauge)</span>` :
+        (dom.trimmed && dom.of_n_hucs ? ` <span style="opacity:.8">(GPU budget: the ${nU} of ` +
+          `${dom.of_n_hucs} units nearest the gauge${dom.of_area_km2 ? `, of ${Math.round(dom.of_area_km2).toLocaleString()} km²` : ""})</span>` : "")}</div>`
     : "";
   ctl.innerHTML =
     `<b>${id}</b><br><span style="opacity:.8">depth scale 0–${man.depth_cap_m || 3} m` +

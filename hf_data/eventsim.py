@@ -65,6 +65,12 @@ WARMUP_D = int(os.environ.get("EVENT_WARMUP_D", "30"))
 # back 12 h from t0 to capture the rising limb from the beginning
 SIM_BACKSET_H = int(os.environ.get("EVENT_SIM_BACKSET_H", "12"))
 MAX_CELLS = int(os.environ.get("EVENT_MAX_CELLS", "400000"))
+# GPU-queue budget (bbox cells of the bundled domain; 0 = whole basin). Set
+# when no worker can take very large basins (HPC released 2026-10-16; the
+# ZeroGPU worker accepts <= ZERO_MAX_CELLS): the bundle keeps the HUC12 units
+# nearest the gauge that fit — whole units at native resolution, never a box
+# or a coarser grid; EF5's routed flow enters at the cut as inlet inflow.
+QUEUE_MAX_CELLS = int(os.environ.get("EVENT_QUEUE_MAX_CELLS", "0"))
 DEM_RES = os.environ.get("EVENT_DEM_RES", "1")
 DEM_CACHE = os.environ.get("EVENT_DEM_CACHE",
                            os.path.join(tempfile.gettempdir(), "dem_cache"))
@@ -442,15 +448,16 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                    **miss}
             log(f"CREST MISSED IT: EF5 peak {miss['sim_peak_m3s']} m3/s is "
                 f"{100 * miss['frac']:.0f}% of the observed {miss['obs_peak_m3s']} "
-                f"m3/s — no inundation map published for {ev_id}"
-                + (" (listed map disowned: dropped from the list)"
-                   if episode_id else ""))
+                f"m3/s — no inundation map published for {ev_id}")
             if episode_id:
                 # the listed map came from the same EF5 water — just as
                 # wrong; take it down rather than leave a dry basin listed
+                # (pinned demo events are never dropped: drop_events refuses)
                 try:
-                    eventstore.drop_events([episode_id], purge=True,
-                                           why="CREST missed it")
+                    dropped = eventstore.drop_events([episode_id], purge=True,
+                                                     why="CREST missed it")
+                    log("listed map disowned: dropped from the list" if dropped
+                        else "listed map kept (pinned demo event or nothing to drop)")
                 except Exception as e:
                     log(f"drop failed ({type(e).__name__})")
             with _lock:
@@ -488,7 +495,13 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         from . import hucdomain
         with _lock:
             _running["status"] = "domain"
-        dom = hucdomain.build_domain(g, out_dir, dem_res=DEM_RES, log=log)
+        dom = hucdomain.build_domain(g, out_dir, dem_res=DEM_RES,
+                                     max_cells=QUEUE_MAX_CELLS or None, log=log)
+        if dom.get("trimmed"):
+            log(f"GPU budget: kept {dom['n_hucs']} of {dom.get('of_n_hucs')} HUC12 "
+                f"units nearest the gauge ({dom.get('area_km2')} of "
+                f"{dom.get('of_area_km2')} km2) to fit EVENT_QUEUE_MAX_CELLS="
+                f"{QUEUE_MAX_CELLS / 1e6:.1f}M")
         basin_ring = dom["basin"]
         basin_bbox = tuple(dom["bbox"])        # raster extent of the union
         # worker spec = full anchored span (fixed episode window); the local
@@ -657,7 +670,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         if cpu_dom.get("trimmed"):
             manifest["cpu_trimmed"] = {"n_hucs": cpu_dom["n_hucs"],
                                        "area_km2": cpu_dom["area_km2"],
-                                       "of_n_hucs": dom["n_hucs"]}
+                                       "of_n_hucs": dom.get("of_n_hucs") or dom["n_hucs"]}
 
         with _lock:
             _running["status"] = "archive"
