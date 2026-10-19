@@ -1,8 +1,8 @@
-"""CREST_gpu_worker — ZeroGPU BACKUP event worker (V27 P1.5 + P1.6 sessions,
-degradation-ladder rung 2). Claims events/queue/ jobs the HPC worker has left
-unclaimed for ZERO_DELAY_S, solves them in <=120 s GPU slices, and — only
-when PUBLISH=1 after the user flips the Space to EVENT_QUEUE_MODE=on —
-publishes exactly like the HPC worker.
+"""CREST_gpu_worker — ZeroGPU event worker (V27 P1.5 + P1.6 sessions). Since
+the HPC worker was released (2026-10-16) it is the only 2-D engine: it claims
+events/queue/ jobs, solves them in <=120 s GPU slices within a daily GPU
+budget (authenticated calls draw on the account's ZeroGPU quota), and — when
+PUBLISH=1 — publishes exactly like the HPC worker did.
 
 P1.6: solver state is a resident crestimap.session.EventSession per episode
 (depth AND momentum held in RAM between bundles), so returning to an episode
@@ -78,7 +78,29 @@ TS = "%Y-%m-%dT%H:%M:%SZ"
 TMIN = "%Y-%m-%dT%H:%MZ"
 QPREFIX = "events/queue"
 REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")
-ZERO_DELAY_S = float(os.environ.get("ZERO_DELAY_S", "420"))   # HPC first shot
+# The HPC worker was released 2026-10-16; this Space is now the only 2-D
+# engine, so there is no reason to leave a job unclaimed for anyone else.
+ZERO_DELAY_S = float(os.environ.get("ZERO_DELAY_S", "0"))
+# GPU calls must be AUTHENTICATED to get the account's ZeroGPU quota (PRO:
+# 40 min/day, fixed 24 h window from first use). Self-calls over 127.0.0.1
+# carry no X-IP-Token and land in a shared anonymous "Space app" pool that
+# gave ~0 GPU-s/day from 2026-09-23 to 10-16 ("Space app has reached its GPU
+# limit" on every claim). ZERO_AUTH=1 self-drives through the public Space
+# URL with HF_TOKEN instead.
+ZERO_AUTH = os.environ.get("ZERO_AUTH", "1") == "1"
+# Our own daily cap, below the 40-min PRO quota: the quota is shared with
+# every other ZeroGPU use under the same account, and past it ZeroGPU bills
+# prepaid credits automatically ($1 per 10 min). 0 disables the cap.
+DAILY_BUDGET_S = float(os.environ.get("ZERO_DAILY_BUDGET_S", "1800"))
+GPU_CALL_S = 120.0          # declared @spaces.GPU duration (admission needs it)
+if 0 < DAILY_BUDGET_S < GPU_CALL_S:
+    DAILY_BUDGET_S = GPU_CALL_S                 # a smaller cap could never run
+# a NEW event (full anchored solve) is only claimed with this much budget
+# left; otherwise it would be claimed, paused ~a day, and solved stale
+MIN_NEW_S = float(os.environ.get("ZERO_MIN_NEW_S", "600"))
+# "No GPU was available after 60s" is platform capacity, not this job's
+# fault and not quota: wait and retry the same chunk.
+CAPACITY_BACKOFF_S = float(os.environ.get("ZERO_CAPACITY_BACKOFF_S", "120"))
 # Backup -> active drain under pressure (user directive 2026-08-14): with
 # more than this many jobs pending, skip the polite deferral and claim the
 # next unclaimed event immediately — one solver per event, so this Space
@@ -105,7 +127,9 @@ if _tok:
     os.environ["HF_TOKEN"] = _tok                    # eventstore reads env
 
 MAX_SESSIONS = int(os.environ.get("ZERO_MAX_SESSIONS", "6"))
-EVICT_IDLE_H = float(os.environ.get("ZERO_EVICT_IDLE_H", "12"))
+# > one daily budget pause (~23.5 h), so parked sessions survive the pause and
+# the next bundle is a cheap catch-up rather than a full re-solve
+EVICT_IDLE_H = float(os.environ.get("ZERO_EVICT_IDLE_H", "36"))
 # cadence of the server-side tick loop (see _self_drive); matches the old
 # gr.Timer(5) so idle polling behaviour is unchanged
 SELF_TICK_S = float(os.environ.get("ZERO_SELF_TICK_S", "5"))
@@ -114,11 +138,19 @@ LOG: list[str] = []
 W = {"phase": "idle", "job": None, "runner": None, "chunk_sim_s": CHUNK0_SIM_S,
      "last_poll": 0.0, "last_hb": 0.0, "queued": "", "workdir": None,
      "done": set(), "solved": [], "t_wall0": 0.0, "last_tick": 0.0,
+     # daily GPU budget: [(start, seconds), ...] of GPU calls in a SLIDING
+     # 24 h window, so use stays under the cap in any 24 h (hence in any of
+     # ZeroGPU's own windows); RAM-only — keep the account's prepaid credit
+     # balance at $0 so an over-run after a restart becomes a quota error
+     "gpu_calls": [], "capacity_until": 0.0, "quota_until": 0.0,
+     "paused_note": "", "auth_suspect": False,
      # P1.6 resident sessions: ev -> {"session", "bbox", "visits", "last",
      # "root"}. RAM-only; a Space rebuild recovers via the bundle's
      # init_depth (state-hierarchy level 2).
      "sessions": {}}
 _tick_lock = threading.Lock()
+# secret the self-drive loop passes to /tick (in-process only; never logged)
+_SELF_KEY = __import__("secrets").token_hex(16)
 
 
 def log(msg: str):
@@ -161,6 +193,77 @@ def _commit_claim(ev: str, queued: str) -> bool:
     return _commit([CommitOperationAdd(f"{QPREFIX}/{ev}.claim",
                                        io.BytesIO(body.encode()))],
                    f"claim {ev} [{IDENT}]")
+
+
+def _used_s(now: float) -> float:
+    """GPU seconds booked in the last 24 h (old calls are forgotten)."""
+    W["gpu_calls"] = [(t, s) for t, s in W["gpu_calls"] if now - t < 86400.0]
+    return sum(s for _, s in W["gpu_calls"])
+
+
+def _budget_left(now: float) -> float:
+    """Seconds of daily GPU budget left (inf when uncapped)."""
+    if DAILY_BUDGET_S <= 0:
+        return float("inf")
+    return DAILY_BUDGET_S - _used_s(now)
+
+
+def _budget_free_at(now: float, need: float) -> float:
+    """When at least `need` seconds of budget will be free again."""
+    left = _budget_left(now)
+    for t, s in sorted(W["gpu_calls"]):
+        if left >= need:
+            break
+        left += s
+        now = t + 86400.0
+    return now
+
+
+def _charge(seconds: float, started: float):
+    """Book a GPU call that began at `started` and lasted `seconds` (wall,
+    incl. fork/pickle overhead — conservative)."""
+    if DAILY_BUDGET_S > 0:
+        W["gpu_calls"].append((started, max(0.0, seconds)))
+
+
+def _gpu_wait_reason(now: float) -> str | None:
+    """Why no GPU call may start now (None = go)."""
+    if now < W["quota_until"]:
+        return f"ZeroGPU quota exhausted until {_hhmm(W['quota_until'])}"
+    if now < W["capacity_until"]:
+        return "no ZeroGPU capacity — retrying shortly"
+    if _budget_left(now) < GPU_CALL_S:
+        return (f"daily GPU budget used ({_used_s(now) / 60:.0f} of "
+                f"{DAILY_BUDGET_S / 60:.0f} min in 24 h) — resumes "
+                f"{_hhmm(_budget_free_at(now, GPU_CALL_S))}")
+    return None
+
+
+def _hhmm(t: float) -> str:
+    return datetime.datetime.utcfromtimestamp(t).strftime("%m-%d %H:%MZ")
+
+
+def _quota_retry_s(exc) -> float | None:
+    """Seconds until ZeroGPU says to retry ('... try again in H:MM:SS'), or
+    None when the error names no retry time (e.g. the anonymous pool's
+    'Space app has reached its GPU limit')."""
+    import re
+    m = re.search(r"try again in (\d+):(\d{2}):(\d{2})", str(exc), re.I)
+    if m:
+        h, mi, s = (int(x) for x in m.groups())
+        return float(h * 3600 + mi * 60 + s) + 60.0
+    return None
+
+
+def _auth_suspect(exc) -> bool:
+    """The error text of the ANONYMOUS pool: our calls were not attributed
+    to the account (ZERO_AUTH did not take effect)."""
+    m = f"{exc}".lower()
+    return "space app has reached its gpu limit" in m or "unlogged" in m
+
+
+def _is_capacity_error(exc) -> bool:
+    return "no gpu was available" in f"{exc}".lower()
 
 
 def _claim_fresh(claim) -> bool:
@@ -447,17 +550,42 @@ def _evict_sessions():
         del W["sessions"][ev]
 
 
+def view():
+    """What a browser sees: status + log only. It never advances the state
+    machine — a visitor's request would run @spaces.GPU under the VISITOR's
+    ZeroGPU identity, and an anonymous visitor's quota error could stall the
+    only 2-D engine for a day."""
+    return _status(), "\n".join(LOG[-40:])
+
+
+def tick_api(key: str = ""):
+    """The /tick endpoint: advances the worker only for the self-drive loop,
+    which passes this process's secret; anyone else just gets the status."""
+    if not key or key != _SELF_KEY:
+        return view()
+    return tick()
+
+
 def tick():
-    """One state-machine step; driven by gr.Timer (single-flight)."""
+    """One state-machine step (single-flight); called via tick_api by the
+    self-drive loop."""
     if not _tick_lock.acquire(blocking=False):
         return _status(), "\n".join(LOG[-40:])
     try:
         now = time.time()
+        wait = _gpu_wait_reason(now)
+        if (wait or "") != W["paused_note"]:
+            W["paused_note"] = wait or ""
+            log(f"paused: {wait}" if wait else "GPU available — resuming")
         if W["phase"] == "idle":
-            if now - W["last_poll"] >= POLL_S and now >= W.get("quota_until", 0.0):
+            # never claim a job we couldn't start computing on right away
+            if now - W["last_poll"] >= POLL_S and wait is None:
                 W["last_poll"] = now
                 _evict_sessions()
                 job = _scan()
+                if (job and job["id"] not in W["sessions"]
+                        and _budget_left(now) < MIN_NEW_S):
+                    job = None          # a new event waits for a fuller budget
                 if job:
                     kind = ("catch-up" if job["id"] in W["sessions"]
                             else "new")
@@ -475,13 +603,39 @@ def tick():
                 _commit_claim(ev, W["queued"])
                 W["last_hb"] = now
             session = W["runner"]
+            if wait is not None:
+                # paused mid-visit: the session keeps its state in RAM and
+                # the claim stays fresh (heartbeat above); resume later
+                return _status(), "\n".join(LOG[-40:])
             t0 = time.time()
             try:
                 done, state = gpu_chunk(session, W["chunk_sim_s"])
                 session.set_state(state)
             except Exception as e:
-                _fail_job(e)
+                # admission failures leave the session untouched (the chunk
+                # never ran): hold the job and retry the same chunk later —
+                # but only when ZeroGPU names a retry time; a quota error
+                # without one (the anonymous pool: our identity was not
+                # recognised) takes the old release-and-back-off path
+                retry = _quota_retry_s(e) if _is_quota_error(e) else None
+                if _is_capacity_error(e):
+                    W["capacity_until"] = time.time() + CAPACITY_BACKOFF_S
+                    log(f"{ev}: no ZeroGPU capacity — retry in "
+                        f"{CAPACITY_BACKOFF_S:.0f} s ({e})")
+                elif retry is not None:
+                    W["quota_until"] = time.time() + retry
+                    log(f"{ev}: ZeroGPU quota exhausted — holding the job "
+                        f"until {_hhmm(W['quota_until'])} ({e})")
+                else:
+                    if _auth_suspect(e):
+                        W["auth_suspect"] = True
+                        log(f"{ev}: anonymous-pool quota error — GPU calls are "
+                            f"NOT attributed to the account (ZERO_AUTH failed?)")
+                    elif not _is_quota_error(e):
+                        _charge(time.time() - t0, t0)   # it ran, then failed
+                    _fail_job(e)
                 return _status(), "\n".join(LOG[-40:])
+            _charge(time.time() - t0, t0)
             wall = max(time.time() - t0, 1e-3)
             rate = W["chunk_sim_s"] / wall                  # sim-s per wall-s
             W["chunk_sim_s"] = float(min(max(GPU_TARGET_S * rate, 60.0), 14400.0))
@@ -516,7 +670,12 @@ def _status():
                                           .strftime("%m-%d %H:%MZ")
                                           if r["session"] else None)}
                          for ev, r in W["sessions"].items()},
-            "solved": W["solved"][-5:], "zero_gpu": HAS_ZERO}
+            "solved": W["solved"][-5:], "zero_gpu": HAS_ZERO,
+            "gpu_budget": {"used_min_24h": round(_used_s(time.time()) / 60, 1),
+                           "budget_min": round(DAILY_BUDGET_S / 60, 1),
+                           "authenticated": bool(ZERO_AUTH and _tok),
+                           "auth_suspect": W["auth_suspect"],
+                           "paused": W["paused_note"] or None}}
 
 
 def _keep_awake():
@@ -548,18 +707,36 @@ def _self_drive():
     @spaces.GPU allocation happens inside a normal Gradio request)."""
     from gradio_client import Client
     base = f"http://127.0.0.1:{os.environ.get('GRADIO_SERVER_PORT', '7860')}"
+    space = os.environ.get("SPACE_ID", "")
+    if ZERO_AUTH and _tok and space:
+        # through HF's proxy with the account token: the proxy attaches the
+        # caller identity (X-IP-Token), so @spaces.GPU draws on the account's
+        # ZeroGPU quota instead of the anonymous per-Space pool
+        src, kw, how = space, {"hf_token": _tok}, "authenticated (account quota)"
+    else:
+        src, kw, how = base, {}, "localhost, unauthenticated (anonymous pool)"
     client = None
     while True:
         try:
             if client is None:
-                client = Client(base, verbose=False)
-                log("self-drive: local tick loop connected "
-                    f"({SELF_TICK_S:.0f} s cadence)")
-            client.predict(api_name="/tick")     # blocks for the GPU chunk
+                # token positionally: gradio_client 1.x names it hf_token,
+                # 2.x names it token
+                client = (Client(src, kw["hf_token"], verbose=False) if kw
+                          else Client(src, verbose=False))
+                log(f"self-drive: tick loop connected — {how}, "
+                    f"{SELF_TICK_S:.0f} s cadence")
+            # bounded wait: a half-open proxy connection must not hang the
+            # only engine forever (a healthy tick is <= ~3 min)
+            client.submit(_SELF_KEY, api_name="/tick").result(timeout=900)
             W["last_tick"] = time.time()
         except Exception as e:                    # server still booting, etc.
+            try:
+                if client is not None:
+                    client.close()
+            except Exception:
+                pass
             client = None
-            log(f"self-drive: {type(e).__name__} — retrying")
+            log(f"self-drive: {type(e).__name__}: {str(e)[:200]} — retrying")
             time.sleep(15)
             continue
         time.sleep(SELF_TICK_S)
@@ -568,16 +745,24 @@ def _self_drive():
 threading.Thread(target=_keep_awake, daemon=True).start()
 threading.Thread(target=_self_drive, daemon=True).start()
 log(f"boot: {IDENT} publish={PUBLISH} zero={HAS_ZERO} "
-    f"delay={ZERO_DELAY_S:.0f}s budget={MAX_CELLS / 1e6:.1f}M cells")
+    f"delay={ZERO_DELAY_S:.0f}s budget={MAX_CELLS / 1e6:.1f}M cells "
+    f"gpu/day={DAILY_BUDGET_S / 60:.0f} min auth={bool(ZERO_AUTH and _tok)}")
 
-with gr.Blocks(title="CREST GPU worker (ZeroGPU backup)") as demo:
-    gr.Markdown("## CREST event worker — ZeroGPU backup rung\n"
-                "Claims 2-D inundation jobs the HPC leaves unclaimed; "
-                "shadow mode unless PUBLISH=1.")
+with gr.Blocks(title="CREST GPU worker (ZeroGPU)") as demo:
+    gr.Markdown("## CREST event worker — ZeroGPU\n"
+                "The 2-D inundation engine since the HPC worker was released "
+                "(2026-10-16). Works within a daily GPU budget; shadow mode "
+                "unless PUBLISH=1.")
     st = gr.JSON(label="worker state")
     lg = gr.Textbox(label="log", lines=18, max_lines=18)
+    # the page only DISPLAYS (view); the worker advances through /tick,
+    # which needs the in-process key the self-drive loop sends
     t = gr.Timer(5)
-    t.tick(tick, outputs=[st, lg], concurrency_limit=1)
-    demo.load(tick, outputs=[st, lg])
+    t.tick(view, outputs=[st, lg], api_name=False)
+    demo.load(view, outputs=[st, lg], api_name=False)
+    key_in = gr.Textbox(visible=False)
+    tick_btn = gr.Button(visible=False)
+    tick_btn.click(tick_api, inputs=[key_in], outputs=[st, lg],
+                   api_name="tick", concurrency_limit=1)
 
 demo.queue().launch()
