@@ -44,16 +44,20 @@ CREST_AI = "https://huggingface.co/spaces/vincewin/CREST_demo"
 
 def _bootstrap():
     """Blobless sparse clones: crestimap/ from the fork's v2, hf_data/ from
-    the CREST_demo Space (eventsim/eventstore reuse — nothing reimplemented)."""
-    if not os.path.isdir(os.path.join(APP, "crestimap")):
-        d = os.path.join(APP, "_fork")
+    the CREST_demo Space (eventsim/eventstore reuse — nothing reimplemented).
+
+    crestimap is imported straight from the clone (kept as a git checkout), so
+    provenance.stamp() records the fork SHA on every manifest; a copied-out
+    package has no .git and stamped only "2.0.0.dev0"."""
+    fork = os.path.join(APP, "_fork")
+    if not os.path.isdir(os.path.join(fork, "crestimap")):
+        shutil.rmtree(fork, ignore_errors=True)
         subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout",
-                        "-b", "v2", FORK, d], check=True)
+                        "-b", "v2", FORK, fork], check=True)
         subprocess.run(["git", "checkout", "HEAD", "--", "crestimap"],
-                       cwd=d, check=True)
-        shutil.copytree(os.path.join(d, "crestimap"),
-                        os.path.join(APP, "crestimap"))
-        shutil.rmtree(d, ignore_errors=True)
+                       cwd=fork, check=True)
+    if fork not in sys.path:
+        sys.path.insert(0, fork)
     ai = os.path.join(APP, "_crest_ai")
     if not os.path.isdir(os.path.join(ai, "hf_data")):
         subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout",
@@ -65,6 +69,12 @@ def _bootstrap():
 
 
 _bootstrap()
+try:
+    _FORK_SHA = subprocess.run(
+        ["git", "-C", os.path.join(APP, "_fork"), "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=15).stdout.strip()[:12] or None
+except Exception:
+    _FORK_SHA = None
 
 import gradio as gr                                          # noqa: E402
 
@@ -144,6 +154,12 @@ W = {"phase": "idle", "job": None, "runner": None, "chunk_sim_s": CHUNK0_SIM_S,
      # balance at $0 so an over-run after a restart becomes a quota error
      "gpu_calls": [], "capacity_until": 0.0, "quota_until": 0.0,
      "paused_note": "", "auth_suspect": False,
+     # /tick calls by outcome (see tick_api); "accepted" must keep rising
+     "tick_api": {"accepted": 0, "rejected": 0, "empty": 0,
+                  "last_reject_log": 0.0},
+     # what the last _scan saw (status "scan"): time, queue ids, backlog,
+     # candidates and per-reason skip counts
+     "scan": {},
      # P1.6 resident sessions: ev -> {"session", "bbox", "visits", "last",
      # "root"}. RAM-only; a Space rebuild recovers via the bundle's
      # init_depth (state-hierarchy level 2).
@@ -298,13 +314,25 @@ def _scan():
         log(f"queue pressure: {backlog} pending jobs > {PRESSURE_N} — "
             f"claiming without deferral")
     cands = []
+    skip = W["scan"]["skipped"] = {}
+    W["scan"].update(at=now.strftime(TS), ids=len(ids), backlog=backlog)
+
+    def _skip(why):
+        skip[why] = skip.get(why, 0) + 1
+
     for ev in ids:
         if f"{QPREFIX}/{ev}.forcing.tar.gz" not in qf:
+            _skip("no_forcing")
             continue
         spec = _read_json(f"{QPREFIX}/{ev}.json")
-        if not spec or (ev, spec.get("queued", "")) in W["done"]:
+        if not spec:
+            _skip("spec_unreadable")
+            continue
+        if (ev, spec.get("queued", "")) in W["done"]:
+            _skip("done")
             continue
         if str(spec.get("dem_res", "1")) != "1":
+            _skip("not_30m")
             continue                              # 30 m only on this rung
         try:
             age = (now - datetime.datetime.strptime(spec["queued"], TS)
@@ -312,11 +340,13 @@ def _scan():
         except Exception:
             age = 0.0
         if age < delay:
+            _skip("deferred")
             continue
         if not spec.get("domain"):
             # pre-basin bundle (rectangular-window era): never solved as a
             # rectangle — the runner re-enqueues it with a HUC12 basin domain
             log(f"skip {ev}: no basin domain in spec — awaiting re-enqueue")
+            _skip("no_domain")
             continue
         w, s, e, n = spec["bbox_basin"]
         res = DEM_RES_DEG["1"]
@@ -325,12 +355,15 @@ def _scan():
         if cells > MAX_CELLS:
             log(f"skip {ev}: {cells / 1e6:.1f} M cells > "
                 f"{MAX_CELLS / 1e6:.1f} M budget (never coarsen)")
+            _skip("over_budget")
             continue
         if f"{QPREFIX}/{ev}.claim" in qf:
             claim = _read_json(f"{QPREFIX}/{ev}.claim")
             if _claim_fresh(claim) and claim.get("worker") != IDENT:
+                _skip("claimed")
                 continue
         cands.append({"id": ev, "spec": spec})
+    W["scan"]["candidates"] = len(cands)
     # P1.6: episodes with a resident session first — a catch-up visit is
     # minutes; new events (full anchored solve) fill the remaining time
     cands.sort(key=lambda j: (j["id"] not in W["sessions"],
@@ -560,9 +593,26 @@ def view():
 
 def tick_api(key: str = ""):
     """The /tick endpoint: advances the worker only for the self-drive loop,
-    which passes this process's secret; anyone else just gets the status."""
-    if not key or key != _SELF_KEY:
+    which passes this process's secret; anyone else just gets the status.
+
+    Every call is counted (status "tick_api"): from 10-19 to 10-20 the worker
+    sat idle next to an eligible job with no log line at all, which means
+    either the key never arrived or tick() found nothing. These counters tell
+    the two apart from outside."""
+    c = W["tick_api"]
+    if not key:
+        c["empty"] += 1
         return view()
+    if key != _SELF_KEY:
+        c["rejected"] += 1
+        if time.time() - c["last_reject_log"] > 3600:
+            c["last_reject_log"] = time.time()
+            log(f"tick_api: rejected a key (len {len(key)}; "
+                f"{c['rejected']} so far)")
+        return view()
+    c["accepted"] += 1
+    if c["accepted"] == 1:
+        log("tick_api: self-drive key accepted — worker advancing")
     return tick()
 
 
@@ -671,6 +721,10 @@ def _status():
                                           if r["session"] else None)}
                          for ev, r in W["sessions"].items()},
             "solved": W["solved"][-5:], "zero_gpu": HAS_ZERO,
+            "tick_api": {k: W["tick_api"][k]
+                         for k in ("accepted", "rejected", "empty")},
+            "scan": W["scan"],
+            "fork_sha": _FORK_SHA,
             "gpu_budget": {"used_min_24h": round(_used_s(time.time()) / 60, 1),
                            "budget_min": round(DAILY_BUDGET_S / 60, 1),
                            "authenticated": bool(ZERO_AUTH and _tok),
@@ -746,7 +800,8 @@ threading.Thread(target=_keep_awake, daemon=True).start()
 threading.Thread(target=_self_drive, daemon=True).start()
 log(f"boot: {IDENT} publish={PUBLISH} zero={HAS_ZERO} "
     f"delay={ZERO_DELAY_S:.0f}s budget={MAX_CELLS / 1e6:.1f}M cells "
-    f"gpu/day={DAILY_BUDGET_S / 60:.0f} min auth={bool(ZERO_AUTH and _tok)}")
+    f"gpu/day={DAILY_BUDGET_S / 60:.0f} min auth={bool(ZERO_AUTH and _tok)} "
+    f"crestimap={_FORK_SHA}")
 
 with gr.Blocks(title="CREST GPU worker (ZeroGPU)") as demo:
     gr.Markdown("## CREST event worker — ZeroGPU\n"
