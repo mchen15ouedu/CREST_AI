@@ -40,22 +40,40 @@ import traceback
 APP = os.path.dirname(os.path.abspath(__file__))
 FORK = "https://github.com/mchen15ouedu/CREST-iMAP.git"
 CREST_AI = "https://huggingface.co/spaces/vincewin/CREST_demo"
+# Solver commit, pinned like the CPU Spaces' Dockerfile CRESTIMAP_REF and the
+# Jetstream2 kit's FORK_REF: a push to v2 must never reach this worker on a
+# restart without review. c5184759 = draining-time outflow limiter +
+# interflow store, approved 2026-10-20. Full SHA only (a branch would float).
+FORK_REF = os.environ.get("CRESTIMAP_REF",
+                          "c518475956c933a9c0fc46962b3825685a54b181")
+
+
+def _git(*args, cwd=None):
+    return subprocess.run(["git", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout.strip()
 
 
 def _bootstrap():
-    """Blobless sparse clones: crestimap/ from the fork's v2, hf_data/ from
-    the CREST_demo Space (eventsim/eventstore reuse — nothing reimplemented).
+    """Blobless sparse clones: crestimap/ from the fork at FORK_REF, hf_data/
+    from the CREST_demo Space (eventsim/eventstore reuse — nothing
+    reimplemented).
 
-    crestimap is imported straight from the clone (kept as a git checkout), so
-    provenance.stamp() records the fork SHA on every manifest; a copied-out
-    package has no .git and stamped only "2.0.0.dev0"."""
+    crestimap is imported straight from the clone (a detached sparse checkout
+    of FORK_REF), so provenance.stamp() records the pinned SHA on every
+    manifest; a copied-out package has no .git and stamped only
+    "2.0.0.dev0"."""
     fork = os.path.join(APP, "_fork")
     if not os.path.isdir(os.path.join(fork, "crestimap")):
         shutil.rmtree(fork, ignore_errors=True)
-        subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout",
-                        "-b", "v2", FORK, fork], check=True)
-        subprocess.run(["git", "checkout", "HEAD", "--", "crestimap"],
-                       cwd=fork, check=True)
+        # all branches are fetched (blobless), so a pinned commit stays
+        # reachable whichever branch carries it
+        _git("clone", "--filter=blob:none", "--no-checkout", FORK, fork)
+        _git("sparse-checkout", "init", "--cone", cwd=fork)
+        _git("sparse-checkout", "set", "crestimap", cwd=fork)
+        _git("checkout", "--detach", FORK_REF, cwd=fork)
+    want = _git("rev-parse", "--verify", f"{FORK_REF}^{{commit}}", cwd=fork)
+    if _git("rev-parse", "HEAD", cwd=fork) != want:
+        raise RuntimeError(f"crestimap clone is not at the pinned {FORK_REF}")
     if fork not in sys.path:
         sys.path.insert(0, fork)
     ai = os.path.join(APP, "_crest_ai")
