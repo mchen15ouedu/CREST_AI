@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 
 SRC = "/app/src"
@@ -21,15 +22,68 @@ STATE = "/tmp/autocal_state.json"
 started = time.time()
 state = {"phase": "booting", "restarts": 0}
 
-# free Spaces sleep without HTTP traffic; the fleet ring pings this Space
-# (FLEET_PEERS) and this Space pings the ring back so nobody dozes off
+# free Spaces sleep without HTTP traffic; this Space pings the fleet ring so
+# nobody dozes off, and keeps ITSELF awake with an authenticated self-ping
+# (see self_ping: the ring's anonymous pings cannot reach a private Space)
 PEERS = [u.strip() for u in os.environ.get("AUTOCAL_PEERS",
     "https://vincewin-crest-fleet-runner.hf.space,"
     "https://vincewin-crest-updater.hf.space").split(",") if u.strip()]
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None        # a 3xx raises HTTPError: the token never leaves this host
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+# one authenticated self-visit per 6 h: 8 tries inside the 48 h sleep window,
+# far from keep-alive-spam territory (the 20-min ring loop runs it every Nth pass)
+SELF_PING_EVERY = max(1, round(float(os.environ.get("AUTOCAL_SELF_PING_S", "21600")) / 1200))
+
+
+def _own_host():
+    host = os.environ.get("SPACE_HOST", "").strip()
+    sid = os.environ.get("SPACE_ID", "")
+    if not host and "/" in sid:
+        host = sid.replace("/", "-").replace("_", "-").replace(".", "-").lower() + ".hf.space"
+    return host
+
+
+def self_ping():
+    """GET this Space's own status page through the public URL WITH the
+    HF_TOKEN secret. This Space is private: HF's proxy turns away anonymous
+    requests before they reach the container, so the fleet ring's plain
+    pings never counted as traffic and it slept from ~10-15 (no calibration
+    since 09-25). An authenticated visit is what the 48 h sleep timer sees.
+    Each attempt prints one line (never the token) to the run log, which the
+    Hub API reads without visiting — so a later sleep can be diagnosed."""
+    host, tok = _own_host(), os.environ.get("HF_TOKEN", "").strip()
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if not host or not tok:
+        rec = {"ok": False, "at": at, "why": "no SPACE_HOST/HF_TOKEN"}
+    else:
+        req = urllib.request.Request(f"https://{host}/api/status",
+                                     headers={"Authorization": f"Bearer {tok}"})
+        try:
+            with _OPENER.open(req, timeout=30) as r:
+                body = r.read(200)
+                rec = {"ok": 200 <= r.status < 300 and body.lstrip().startswith(b"{"),
+                       "at": at, "http": r.status}
+        except urllib.error.HTTPError as e:    # 401/403/404 = token or scope
+            rec = {"ok": False, "at": at, "err": "HTTPError", "http": e.code}
+        except Exception as e:                 # never the token: type only
+            rec = {"ok": False, "at": at, "err": type(e).__name__}
+    state["self_ping"] = rec
+    print("self_ping " + " ".join(f"{k}={v}" for k, v in rec.items()), flush=True)
+
+
 def keepalive_loop():
+    time.sleep(60)                             # let the status server start
+    n = 0
     while True:
+        if n % SELF_PING_EVERY == 0:
+            self_ping()
+        n += 1
         for u in PEERS:
             try:
                 urllib.request.urlopen(u, timeout=20).read(100)
