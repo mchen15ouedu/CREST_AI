@@ -58,14 +58,18 @@ RUN pip3 install --no-cache-dir --upgrade pip \
 # (v1 case data), so clone blobless+sparse: only crestimap/ is materialized.
 # CRESTIMAP_REF pins the fork commit: bump it to deploy a new engine (a bare
 # "origin/v2" checkout sits in a cached layer and silently keeps the old code)
-ARG CRESTIMAP_REF=4c55c0f6
+# c5184759 (2026-10-20, approved): draining-time outflow limiter + interflow
+# store; 4c55c0f6 before. CRESTIMAP_SHA lets provenance stamp the commit (the
+# package is copied without .git).
+ARG CRESTIMAP_REF=c518475956c933a9c0fc46962b3825685a54b181
+ENV CRESTIMAP_SHA=${CRESTIMAP_REF}
 RUN pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
  && git clone --filter=blob:none --no-checkout https://github.com/mchen15ouedu/CREST-iMAP.git /opt/crest-imap \
  && git -C /opt/crest-imap checkout ${CRESTIMAP_REF} -- crestimap \
  && test -f /opt/crest-imap/crestimap/__init__.py \
  && cp -r /opt/crest-imap/crestimap "$(python3 -c 'import site; print(site.getsitepackages()[0])')/" \
  && rm -rf /opt/crest-imap \
- && python3 -c "import crestimap; print('crestimap', crestimap.__version__)"
+ && python3 -c "import crestimap, os; print('crestimap', crestimap.__version__, os.environ.get('CRESTIMAP_SHA'))"
 
 # ---- App code + EF5 binary on the expected path (AQUAH uses ./EF5/bin/ef5) ----
 COPY . .

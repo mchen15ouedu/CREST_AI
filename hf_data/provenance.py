@@ -12,7 +12,9 @@ manifest["provenance"]:
                   clone (HPC / ZeroGPU bootstrap), else the Space repo's
                   current sha via HfApi (the Docker image COPYies the code
                   without .git)
-    crestimap     fork git SHA when the package is a clone, else __version__
+    crestimap     fork git SHA when the package is a clone, else the
+                  CRESTIMAP_SHA env the Space image bakes from its
+                  CRESTIMAP_REF build arg, else __version__
     ef5           EF5 fork git SHA (/EF5 clone in the Space image; absent on
                   workers, which never run EF5)
 
@@ -65,7 +67,9 @@ def stamp() -> dict:
     try:
         import crestimap
         d = os.path.dirname(os.path.abspath(crestimap.__file__))
-        imap_sha = _git_sha(d) or _git_sha(os.path.dirname(d))
+        imap_sha = (_git_sha(d) or _git_sha(os.path.dirname(d))
+                    or (os.environ.get("CRESTIMAP_SHA", "").strip()[:12]
+                        or None))
         imap_ver = getattr(crestimap, "__version__", None)
     except Exception:
         pass
