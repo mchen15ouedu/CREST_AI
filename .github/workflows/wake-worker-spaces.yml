@@ -1,8 +1,9 @@
 name: Wake worker Spaces
 
-# Keeps the 10 free worker Spaces awake: 6 fleet runners (gauge catalog
+# Keeps the 11 worker Spaces awake: 6 fleet runners (gauge catalog
 # precompute) + 3 ungauged keep-warm shards (hourly routed nowcasts) + the
-# event runner (CREST_runner: hourly 2-D event tick). The runner slept
+# event runner (CREST_runner: hourly 2-D event tick) + the ZeroGPU 2-D
+# worker (CREST_gpu_worker, sole 2-D engine since 2026-10-16). The runner slept
 # 2026-10-02..05 after its cpu-basic downgrade: the updater's hourly POST to
 # /api/event_tick neither keeps a Space awake nor wakes it; a GET does.
 # They otherwise rely only on their mutual keepalive ring, which deadlocks
@@ -35,7 +36,7 @@ jobs:
           for s in crest-fleet-runner crest-fleet-runner2 crest-fleet-runner3 \
                    crest-fleet-runner4 crest-fleet-runner5 crest-fleet-runner6 \
                    crest-ungauged crest-ungauged2 crest-ungauged3 \
-                   crest-runner; do
+                   crest-runner crest-gpu-worker; do
             curl -sk -m 45 "https://vincewin-${s}.hf.space/" -o /dev/null &
           done
           wait || true
