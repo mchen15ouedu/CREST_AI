@@ -1,0 +1,10 @@
+[Unit]
+Description=CREST fleet housekeeping (old run workdirs, disk guard)
+After=local-fs.target
+ConditionPathExists=/etc/crest-fleet/fleet.env
+
+[Service]
+Type=oneshot
+ExecStart=/opt/crest-fleet/bin/fleet-housekeep.sh
+SyslogIdentifier=crest-fleet-housekeep
+Nice=10

@@ -1,0 +1,2 @@
+# Everything here runs on Linux: keep LF in every checkout (core.autocrlf=true clones too).
+* text eol=lf

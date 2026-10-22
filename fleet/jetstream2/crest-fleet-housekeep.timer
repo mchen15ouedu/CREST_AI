@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly CREST fleet housekeeping
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

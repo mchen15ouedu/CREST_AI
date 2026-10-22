@@ -62,6 +62,23 @@ def _done_keys() -> set[str]:
     return {g + "_" for g in res & st}
 
 
+def _prune_basin_store(gid: str) -> None:
+    """Drop the gauge's per-basin clip stores (hourly forcing ~89k files over
+    5 years, plus clipped terrain/params) once its results are uploaded.
+    Opt-in (FLEET_PRUNE_FORCING=1) for hosts with a PERSISTENT cache, e.g. the
+    Jetstream2 VM: nothing else prunes these there (the datamgr janitor runs
+    only in server.py), while HF Spaces lose /tmp at every restart anyway.
+    Same bbox as the run: pipeline.basin_bbox(gauge_info(gid))."""
+    from hf_data import basic, forcing, pipeline
+    g = pipeline.gauge_info(gid)
+    if g is None:
+        return
+    bbox = pipeline.basin_bbox(g)
+    for var in ("mrms", "pet", "temp"):
+        shutil.rmtree(forcing.store_dir(var, bbox), ignore_errors=True)
+    shutil.rmtree(basic.store_dir(bbox), ignore_errors=True)
+
+
 def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict:
     """Child process: chunked run -> bundle -> upload -> local cleanup."""
     from hf_data import pipeline, statecache, statebundle
@@ -122,6 +139,8 @@ def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict
     for p in glob.glob(os.path.join(statecache.CACHE_DIR, "results",
                                     f"{str(gid).zfill(8)}_*.json")):
         os.remove(p)
+    if os.environ.get("FLEET_PRUNE_FORCING") == "1":
+        _prune_basin_store(gid)
     return {"gauge": gid, "ok": True, "key": key, "rows": n_rows,
             "states": n_states, "mb": round(len(blob) / 1e6, 1),
             "min": round((time.time() - t_start) / 60, 1)}

@@ -1,0 +1,43 @@
+# crest-fleet@K.service - gauged-fleet shard K of FLEET_N on the Jetstream2 VM.
+# Before enabling shard K, PAUSE the HF Space whose FLEET_SHARD is K/6
+# (CREST_fleet_runner = 0/6, runner2 = 1/6, ... runner6 = 5/6): one writer
+# per shard. The 2-D GPU worker (crest-worker.service) has priority: the fleet
+# runs niced with low CPU/IO weight and a memory ceiling.
+[Unit]
+Description=CREST gauged fleet shard %i (fleet/fleet_run.py -> vincewin/CREST_fleet)
+Documentation=https://github.com/mchen15ouedu/CREST_AI/blob/main/fleet/jetstream2/README.md
+Wants=network-online.target
+After=network-online.target crest-worker.service
+RequiresMountsFor=/media/volume/crest-data
+AssertFileNotEmpty=/etc/crest-fleet/hf_token
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=crest-fleet
+Group=crest-fleet
+EnvironmentFile=/etc/crest-fleet/fleet.env
+Environment=PYTHONUNBUFFERED=1
+Environment=FLEET_HOME=/opt/crest-fleet
+LoadCredential=hf_token:/etc/crest-fleet/hf_token
+UnsetEnvironment=HF_TOKEN HUGGING_FACE_HUB_TOKEN
+WorkingDirectory=/opt/crest-fleet/src
+ExecStart=/opt/crest-fleet/bin/run-fleet.sh %i
+# a finished pass (or a refused start) retries after 30 min, like the Spaces
+Restart=always
+RestartSec=1800
+KillMode=control-group
+TimeoutStopSec=60
+SyslogIdentifier=crest-fleet-%i
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryHigh=24G
+MemoryMax=28G
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
