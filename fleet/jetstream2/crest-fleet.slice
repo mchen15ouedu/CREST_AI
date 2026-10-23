@@ -1,0 +1,11 @@
+# crest-fleet.slice - one budget for ALL crest-fleet@K shards together, so
+# adding shards never adds memory: the 2-D GPU worker keeps the rest of the
+# 58 GB VM. Low CPU/IO weight: the fleet only gets what the worker leaves.
+[Unit]
+Description=CREST gauged fleet (all shards)
+
+[Slice]
+MemoryHigh=24G
+MemoryMax=28G
+CPUWeight=20
+IOWeight=20

@@ -22,37 +22,51 @@ import numpy as np
 _GEO_KEYS = (b"nrows", b"ncols", b"xllcorner", b"yllcorner", b"cellsize", b"nodata")
 
 
-def pack_dir(state_dir: str) -> bytes | None:
-    """All *.tif (+ *.txt) in a state dir -> one f16 parquet blob; None if empty."""
+# RAM budget for one row block of all grids while packing: a gauge has ~1,370
+# state grids (183 snapshots x vars), so loading them whole needs
+# 2 B x cells x grids (tens of GB for a big basin's box)
+PACK_BLOCK_BYTES = int(float(os.environ.get("CREST_BUNDLE_BLOCK_MB", "512")) * 1e6)
+
+
+def pack_dir(state_dir: str, out_path: str | None = None) -> bytes | str | None:
+    """All *.tif (+ *.txt) in a state dir -> one f16 parquet bundle; None if empty.
+
+    Streams: grid headers first, then one row block of every grid at a time
+    (PACK_BLOCK_BYTES), one parquet row group per block. Same columns, values
+    and metadata as a single-table write, so any reader that concatenates row
+    groups (pq.read_table, unpack) gets identical grids. Returns the bytes, or
+    with out_path writes the file there and returns the path (the compressed
+    bundle of a big basin need not sit in RAM either)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     import rasterio
+    from rasterio.windows import Window
 
-    cols, meta, shape = {}, None, None
+    keep, meta, shape = [], None, None
     skipped = []
     for p in sorted(glob.glob(os.path.join(state_dir, "*.tif"))):
         with rasterio.open(p) as ds:
             if ds.count != 1 or ds.dtypes[0] not in ("float32", "float64"):
                 skipped.append(os.path.basename(p))
                 continue
-            a = ds.read(1).astype("float32")
+            sh = (ds.height, ds.width)
             if shape is None:
-                shape = a.shape
+                shape = sh
                 cell = ds.res[0]
                 xll = ds.transform.c
                 yll = ds.transform.f - ds.height * cell
                 nodata = -9999.0 if ds.nodata is None else float(ds.nodata)
-                meta = {b"nrows": str(a.shape[0]).encode(),
-                        b"ncols": str(a.shape[1]).encode(),
+                meta = {b"nrows": str(sh[0]).encode(),
+                        b"ncols": str(sh[1]).encode(),
                         b"xllcorner": repr(float(xll)).encode(),
                         b"yllcorner": repr(float(yll)).encode(),
                         b"cellsize": repr(float(cell)).encode(),
                         b"nodata": repr(nodata).encode()}
-            elif a.shape != shape:                 # domain changed mid-history
+            elif sh != shape:                      # domain changed mid-history
                 skipped.append(os.path.basename(p))
                 continue
-        cols[os.path.splitext(os.path.basename(p))[0]] = a.reshape(-1).astype(np.float16)
-    if not cols:
+        keep.append(p)
+    if not keep:
         return None
     for p in sorted(glob.glob(os.path.join(state_dir, "*.txt"))):
         try:
@@ -62,11 +76,20 @@ def pack_dir(state_dir: str) -> bytes | None:
             pass
     if skipped:
         meta[b"skipped"] = ",".join(skipped).encode()
-    schema = pa.schema([pa.field(k, pa.float16()) for k in cols]).with_metadata(meta)
-    buf = io.BytesIO()
-    pq.write_table(pa.table(cols, schema=schema), buf,
-                   compression="zstd", use_dictionary=False)
-    return buf.getvalue()
+    names = [os.path.splitext(os.path.basename(p))[0] for p in keep]
+    schema = pa.schema([pa.field(k, pa.float16()) for k in names]).with_metadata(meta)
+    nr, nc = shape
+    rows = max(1, PACK_BLOCK_BYTES // (2 * nc * len(keep)))
+    sink = out_path if out_path else io.BytesIO()
+    with pq.ParquetWriter(sink, schema, compression="zstd", use_dictionary=False) as w:
+        for r0 in range(0, nr, rows):
+            win = Window(0, r0, nc, min(rows, nr - r0))
+            cols = {}
+            for p, k in zip(keep, names):
+                with rasterio.open(p) as ds:
+                    cols[k] = ds.read(1, window=win).astype("float32").reshape(-1).astype(np.float16)
+            w.write_table(pa.table(cols, schema=schema))
+    return out_path if out_path else sink.getvalue()
 
 
 def unpack(data: bytes | str, state_dir: str, overwrite: bool = False) -> int:
@@ -76,11 +99,10 @@ def unpack(data: bytes | str, state_dir: str, overwrite: bool = False) -> int:
     import rasterio
     from rasterio.transform import from_origin
 
-    if isinstance(data, str):
-        with open(data, "rb") as fh:
-            data = fh.read()
-    t = pq.read_table(io.BytesIO(data))
-    md = dict(t.schema.metadata or {})
+    # one grid (column) at a time: a big basin's bundle decoded whole would need
+    # 2 B x cells x ~1,370 grids of RAM
+    pf = pq.ParquetFile(data if isinstance(data, str) else io.BytesIO(data))
+    md = dict(pf.schema_arrow.metadata or {})
     nr, nc = int(md[b"nrows"]), int(md[b"ncols"])
     xll, yll = float(md[b"xllcorner"]), float(md[b"yllcorner"])
     cell, nodata = float(md[b"cellsize"]), float(md[b"nodata"])
@@ -94,11 +116,11 @@ def unpack(data: bytes | str, state_dir: str, overwrite: bool = False) -> int:
                 with open(p, "wb") as fh:
                     fh.write(v)
                 n += 1
-    for name in t.column_names:
+    for name in pf.schema_arrow.names:
         p = os.path.join(state_dir, name + ".tif")
         if not overwrite and os.path.exists(p):
             continue
-        a = t[name].to_numpy().astype("float32").reshape(nr, nc)
+        a = pf.read(columns=[name]).column(0).to_numpy().astype("float32").reshape(nr, nc)
         a[a == nod16] = nodata                     # restore exact nodata value
         tmp = p + ".tmp"
         # untiled/uncompressed/stripped: the EF5 reader is picky (persist.py profile)

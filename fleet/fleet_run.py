@@ -62,9 +62,34 @@ def _done_keys() -> set[str]:
     return {g + "_" for g in res & st}
 
 
+_SHARED_KEYS = None            # per worker process
+
+
+def _store_key(bbox) -> str:
+    """The key forcing.store_dir / basic.store_dir use (without their mkdir)."""
+    return "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p")
+
+
+def _shared_store_keys() -> set:
+    """Clip-store keys that more than one catalog gauge maps to (the key is the
+    rounded bbox, not the gauge). Never pruned: a sibling gauge, possibly in
+    another shard on the same cache, may be running on them right now."""
+    global _SHARED_KEYS
+    if _SHARED_KEYS is None:
+        from collections import Counter
+        from hf_data import gauges as G, pipeline
+        n = Counter()
+        for r in G._catalog().itertuples():
+            n[_store_key(pipeline.basin_bbox({"lat": float(r.LAT_GAGE), "lon": float(r.LNG_GAGE),
+                                              "area": float(r.DRAIN_SQKM)}))] += 1
+        _SHARED_KEYS = {k for k, c in n.items() if c > 1}
+    return _SHARED_KEYS
+
+
 def _prune_basin_store(gid: str) -> None:
     """Drop the gauge's per-basin clip stores (hourly forcing ~89k files over
-    5 years, plus clipped terrain/params) once its results are uploaded.
+    5 years, plus clipped terrain/params) when it finishes, uploaded or failed:
+    a retry re-clips them from the locally cached month tars.
     Opt-in (FLEET_PRUNE_FORCING=1) for hosts with a PERSISTENT cache, e.g. the
     Jetstream2 VM: nothing else prunes these there (the datamgr janitor runs
     only in server.py), while HF Spaces lose /tmp at every restart anyway.
@@ -74,13 +99,53 @@ def _prune_basin_store(gid: str) -> None:
     if g is None:
         return
     bbox = pipeline.basin_bbox(g)
+    if _store_key(bbox) in _shared_store_keys():
+        return
     for var in ("mrms", "pet", "temp"):
         shutil.rmtree(forcing.store_dir(var, bbox), ignore_errors=True)
     shutil.rmtree(basic.store_dir(bbox), ignore_errors=True)
 
 
+def _check_code_rev(gid: str) -> None:
+    """On a persistent cache a gauge's partial rows/states survive restarts,
+    and a restart pulls new CREST_AI code: one uploaded record could then mix
+    two code versions. FLEET_CODE_REV (set by the VM's run-fleet.sh to the
+    hf_data/ + fleet/ tree hashes) is stamped per gauge; on a mismatch the
+    gauge's partial work is dropped and it starts over. Unset on HF: no-op."""
+    rev = os.environ.get("FLEET_CODE_REV", "").strip()
+    if not rev:
+        return
+    from hf_data import statecache
+    g8 = str(gid).zfill(8)
+    sroot = os.path.join(statecache.CACHE_DIR, "states", g8)
+    stamp = os.path.join(sroot, ".code_rev")
+    try:
+        old = open(stamp).read().strip()
+    except OSError:
+        old = None
+    if old != rev:
+        partial = glob.glob(os.path.join(statecache.CACHE_DIR, "results", f"{g8}_*.json"))
+        if old is not None or partial or os.path.isdir(sroot):
+            shutil.rmtree(sroot, ignore_errors=True)
+            for p in partial:
+                os.remove(p)
+        os.makedirs(sroot, exist_ok=True)
+        with open(stamp, "w") as fh:
+            fh.write(rev + "\n")
+
+
 def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict:
     """Child process: chunked run -> bundle -> upload -> local cleanup."""
+    _check_code_rev(gid)
+    try:
+        return _run_one_gauge(gid, t0, t1, chunk_days)
+    finally:
+        if os.environ.get("FLEET_PRUNE_FORCING") == "1":
+            _prune_basin_store(gid)
+
+
+def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict:
+    import tempfile
     from hf_data import pipeline, statecache, statebundle
     from huggingface_hub import HfApi, CommitOperationAdd
 
@@ -121,15 +186,25 @@ def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict
     skey = f"{str(gid).zfill(8)}_{state_model}" if state_model else key
 
     sdir = statecache.state_dir(gid, skey.split("_", 1)[1])
-    blob = statebundle.pack_dir(sdir)
-    if blob is None:
-        return {"gauge": gid, "ok": False, "rc": -1, "last": "no state grids"}
-    api = HfApi(token=os.environ["HF_TOKEN"])
-    api.create_commit(repo_id=FLEET_REPO, repo_type="dataset",
-                      operations=[
-                          CommitOperationAdd(f"states/{skey}.pqf", blob),
-                          CommitOperationAdd(f"results/{key}.json", rec_path)],
-                      commit_message=f"fleet {key}")
+    # bundle to a temp FILE: streamed pack, and the compressed bundle of a big
+    # basin is never held in RAM (statebundle.pack_dir)
+    fd, bpath = tempfile.mkstemp(prefix=f"fleet_{skey}_", suffix=".pqf")
+    os.close(fd)
+    try:
+        if statebundle.pack_dir(sdir, out_path=bpath) is None:
+            return {"gauge": gid, "ok": False, "rc": -1, "last": "no state grids"}
+        mb = os.path.getsize(bpath) / 1e6
+        api = HfApi(token=os.environ["HF_TOKEN"])
+        api.create_commit(repo_id=FLEET_REPO, repo_type="dataset",
+                          operations=[
+                              CommitOperationAdd(f"states/{skey}.pqf", bpath),
+                              CommitOperationAdd(f"results/{key}.json", rec_path)],
+                          commit_message=f"fleet {key}")
+    finally:
+        try:
+            os.remove(bpath)
+        except OSError:
+            pass
     n_states = len(json.load(open(rec_path)).get("state_times", []))
     n_rows = len(json.load(open(rec_path)).get("rows", []))
 
@@ -139,10 +214,8 @@ def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict
     for p in glob.glob(os.path.join(statecache.CACHE_DIR, "results",
                                     f"{str(gid).zfill(8)}_*.json")):
         os.remove(p)
-    if os.environ.get("FLEET_PRUNE_FORCING") == "1":
-        _prune_basin_store(gid)
     return {"gauge": gid, "ok": True, "key": key, "rows": n_rows,
-            "states": n_states, "mb": round(len(blob) / 1e6, 1),
+            "states": n_states, "mb": round(mb, 1),
             "min": round((time.time() - t_start) / 60, 1)}
 
 

@@ -34,16 +34,26 @@ Space. Gauges already uploaded are skipped by either side.
 ```bash
 git clone --depth 1 https://github.com/mchen15ouedu/CREST_AI.git ~/crest-ai-kit
 sudo bash ~/crest-ai-kit/fleet/jetstream2/setup.sh
-sudo /opt/crest-fleet/src/fleet/jetstream2/setup.sh --set-token
+sudo /opt/crest-fleet/bin/setup.sh --set-token
 ```
 
+`setup.sh` copies the kit into `/opt/crest-fleet/bin`, owned by root. Root
+only ever runs that copy, or a fresh `~/crest-ai-kit` clone. It never runs
+`/opt/crest-fleet/src`, which the `crest-fleet` user owns and which is reset to
+`main` at every start.
+
+To update, `git -C ~/crest-ai-kit pull` and re-run the first `setup.sh`. It
+stops the running shards while it swaps code, venv or EF5, then starts them
+again.
+
 The token is a fine-grained HF token named `crest-js2-fleet`. It needs:
-- write on `vincewin/CREST_fleet`;
-- read on the private `vincewin/CREST_state`. Without it, calibrated gauges
-  silently fall back to a-priori parameters.
+- `repo.write` on `vincewin/CREST_fleet`;
+- `repo.content.read` on the private `vincewin/CREST_state`. Without it,
+  calibrated gauges silently fall back to a-priori parameters.
 
 It is stored in `/etc/crest-fleet/hf_token` (root:root 0600) and reaches the
-service only as a systemd credential.
+service only as a systemd credential. Check it with
+`sudo /opt/crest-fleet/bin/setup.sh --check-token`.
 
 ## Run
 
@@ -58,11 +68,27 @@ takes roughly 0.5–1.5 h. Each finished gauge prints `OK {...}` and adds one
 
 ## Limits
 
-- **Priority.** The unit runs at Nice 10, with CPUWeight=20, IOWeight=20 and
-  MemoryMax=28G, so the 2-D worker always wins the CPU and RAM it needs.
-- **Disk.** `crest-fleet-housekeep.timer` runs hourly. It removes old EF5 run
-  workdirs and stops every shard when the data volume has less than
-  `FLEET_STOP_FREE_GB` free. `run-fleet.sh` then refuses to start until
-  `FLEET_MIN_FREE_GB` is free.
+- **Priority.** All shards share `crest-fleet.slice`: MemoryMax=28G for the
+  whole fleet, CPUWeight=20 and IOWeight=20. Each shard also runs at Nice 10
+  with OOMScoreAdjust=500. The 2-D worker therefore keeps the RAM and CPU it
+  needs, and the fleet is the first process the OOM killer picks.
+- **Threads.** EF5 is built with OpenMP. The unit sets `OMP_NUM_THREADS=2`, so
+  4 workers use about 8 cores.
+- **Memory.** `statebundle.pack_dir` streams a gauge's ~1,370 state grids in
+  row blocks (`CREST_BUNDLE_BLOCK_MB`, default 512) into a temp file. A big
+  basin's bundle never sits in RAM whole.
+- **Disk.** `crest-fleet-housekeep.timer` runs hourly. It removes EF5 run
+  workdirs older than 24 h and clip stores untouched for 7 days. When the
+  volume runs short (`FLEET_STOP_FREE_GB`, `FLEET_MAX_INODE_PCT`), it first
+  drops hub blobs unread for 7 days, then restarts the running shards.
+  `run-fleet.sh` refuses to start until `FLEET_MIN_FREE_GB` is free, and
+  `Restart=always` retries every 30 min. The fleet therefore pauses and
+  resumes by itself.
+- **Code changes.** Each gauge's partial work is stamped with the hf_data/ and
+  fleet/ tree hashes (`FLEET_CODE_REV`). A restart on different code starts
+  that gauge over, so one uploaded record never mixes two code versions.
+- **Several shards.** They share one checkout, so `run-fleet.sh` refreshes it
+  only while no other shard is running. They also share one cache, so a clip
+  store that two catalog gauges map to is never pruned.
 - **Maintenance.** Jetstream2 maintenance reboots restart the units by
   themselves. `run-fleet.sh` refuses to run while the volume is not mounted.

@@ -1,8 +1,9 @@
 # crest-fleet@K.service - gauged-fleet shard K of FLEET_N on the Jetstream2 VM.
 # Before enabling shard K, PAUSE the HF Space whose FLEET_SHARD is K/6
 # (CREST_fleet_runner = 0/6, runner2 = 1/6, ... runner6 = 5/6): one writer
-# per shard. The 2-D GPU worker (crest-worker.service) has priority: the fleet
-# runs niced with low CPU/IO weight and a memory ceiling.
+# per shard. The 2-D GPU worker (crest-worker.service) has priority: all
+# shards share crest-fleet.slice (one memory ceiling, low CPU/IO weight),
+# run niced, and are the first OOM victims.
 [Unit]
 Description=CREST gauged fleet shard %i (fleet/fleet_run.py -> vincewin/CREST_fleet)
 Documentation=https://github.com/mchen15ouedu/CREST_AI/blob/main/fleet/jetstream2/README.md
@@ -19,6 +20,9 @@ Group=crest-fleet
 EnvironmentFile=/etc/crest-fleet/fleet.env
 Environment=PYTHONUNBUFFERED=1
 Environment=FLEET_HOME=/opt/crest-fleet
+# EF5 (fork 5a26a86) is built with OpenMP and would start one thread per vCPU
+# in every worker process; fleet.env may override
+Environment=OMP_NUM_THREADS=2
 LoadCredential=hf_token:/etc/crest-fleet/hf_token
 UnsetEnvironment=HF_TOKEN HUGGING_FACE_HUB_TOKEN
 WorkingDirectory=/opt/crest-fleet/src
@@ -29,11 +33,11 @@ RestartSec=1800
 KillMode=control-group
 TimeoutStopSec=60
 SyslogIdentifier=crest-fleet-%i
+Slice=crest-fleet.slice
 Nice=10
-CPUWeight=20
-IOWeight=20
-MemoryHigh=24G
-MemoryMax=28G
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+OOMScoreAdjust=500
 NoNewPrivileges=yes
 ProtectSystem=full
 ProtectHome=yes
