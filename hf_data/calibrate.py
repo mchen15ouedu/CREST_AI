@@ -214,6 +214,13 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
         yield ("status", f"gauge {gauge_id} not found")
         yield ("done", {"error": "gauge not found"})
         return
+    from hf_data import basinextent
+    try:                     # no basin outline -> no runs at all (never a box)
+        basinextent.ef5_extent(g)
+    except basinextent.BasinExtentError as e:
+        yield ("status", f"⚠️ {e} — not calibrated")
+        yield ("done", {"error": f"no basin boundary: {e.reason}", "no_basin": True})
+        return
     wb_model = "crest" if (model == "crest" or (model == "auto" and g["lon"] < -105)) else "crestphys"
     ef5_model = wb_model if model in ("auto", "crest", "crestphys") else model
 

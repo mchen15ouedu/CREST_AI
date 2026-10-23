@@ -253,23 +253,8 @@ def _ring_latlon(geom, max_pts=1500):
 # --------------------------------------------------------------------------- #
 # public entry
 # --------------------------------------------------------------------------- #
-def basin_bounds(gauge: dict, pad_deg: float = 0.05) -> tuple:
-    """(w, s, e, n) of the gauge's HUC12 basin (chain union) + pad — the
-    raster EXTENT the hydrologic model (EF5) must cover so it can carve the
-    whole catchment. EF5's old √area square centred on the outlet gauge
-    clipped elongated basins (Spoon R: 3,884 of 4,241 km²; Pope Ck 199 of
-    449) because a gauge sits at its basin's downstream end. Raises
-    DomainError if the gauge has no HUC12 chain."""
-    h0 = gauge_huc12(float(gauge["lat"]), float(gauge["lon"]))
-    chain = upstream_chain(h0)
-    d = index()
-    pos = d["_pos"]
-    ii = [pos[r["huc12"]] for r in chain]
-    w = float(d["minx"][ii].min()) - pad_deg
-    s = float(d["miny"][ii].min()) - pad_deg
-    e = float(d["maxx"][ii].max()) + pad_deg
-    n = float(d["maxy"][ii].max()) + pad_deg
-    return (w, s, e, n)
+# EF5 raster extents come from hf_data/basinextent (GAGES-II / HydroBASINS
+# outlines + the carved catchment); HUC12 chains here only build 2-D domains.
 def build_domain(gauge: dict, ef5_dir: str, dem_res: str = "1",
                  out_dir: str | None = None, max_cells: int | None = None,
                  log=print) -> dict:

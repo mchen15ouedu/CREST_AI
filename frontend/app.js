@@ -697,6 +697,10 @@ function handleSimEvent(simId, ev) {
     if (ev.returncode === -9) {                       // user stop / superseded — not an error
       if (aiInfo) setProgress(ev.gauge_id, 100, "stopped ⏹");
       allowResim();
+    } else if (ev.no_basin) {                         // deliberate skip, not a crash: no retry
+      if (aiInfo) setProgress(ev.gauge_id, 100, "not simulated");
+      addMsg(`ℹ️ <b>${ev.gauge_id}</b> is not simulated: it has no basin outline ` +
+        `(${ev.reason || "unknown"}). CREST-AI never falls back to a rectangle.`, "status");
     } else if (ev.returncode != null && ev.returncode !== 0) {
       if (aiInfo) setProgress(ev.gauge_id, 100, "failed ✗");
       explainError("simulation", `EF5 run failed (rc=${ev.returncode}), ` +

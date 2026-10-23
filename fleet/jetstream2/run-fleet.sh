@@ -6,7 +6,7 @@
 set -euo pipefail
 
 K=${1:?usage: run-fleet.sh <shard index>}
-N=${FLEET_N:-6}
+N=${FLEET_N:-1}
 FH=${FLEET_HOME:-/opt/crest-fleet}
 fail() {
   echo "run-fleet: REFUSING TO START: $*" >&2
@@ -14,6 +14,10 @@ fail() {
 }
 
 [[ $K =~ ^[0-9]+$ ]] && [ "$K" -lt "$N" ] || fail "bad shard '$K' for FLEET_N=$N"
+# the size class must be explicit: a missing or misspelt one would fall back to
+# the HF runners' small class and duplicate their work (README "Who runs what")
+SIZE=${FLEET_SIZE:-}
+case $SIZE in big | small | all) ;; *) fail "set FLEET_SIZE=big|small|all in /etc/crest-fleet/fleet.env (got '$SIZE')" ;; esac
 tokf=${CREDENTIALS_DIRECTORY:-/nonexistent}/hf_token
 [ -s "$tokf" ] || fail "credential hf_token is empty or missing"
 
@@ -61,4 +65,5 @@ exec "$FH/venv/bin/python" -u fleet/fleet_run.py \
   --gauges "${FLEET_GAUGES:-all}" \
   --start "${FLEET_START:-2021-07-01}" \
   --end "${FLEET_END:-2026-06-30}" \
+  --size "$SIZE" \
   --shard "$K/$N"

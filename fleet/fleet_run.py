@@ -11,6 +11,13 @@ record to the read-only fleet repo; local files are then deleted.
 Resumable at every level: gauges already in the repo are skipped, and within
 a gauge statecache.plan() fast-forwards chunks whose rows are already cached.
 
+Outlets: every USGS gauge plus every HydroBASINS level-07 pour point (virtual
+point), each on its basin outline (hf_data/basinextent: never a box; an outlet
+without one is skipped with the reason). --size splits them at FLEET_BIG_KM2:
+the HF runners take the small class (default), the Jetstream2 fleet the big.
+Each outlet's speed-scheme cut set is fixed once for the whole period
+(pipeline.plan_cut_set), so no chunk re-keys its record.
+
 Run from the repo root (CWD must contain ./EF5/bin/ef5):
     python fleet/fleet_run.py --workers 8
     python fleet/fleet_run.py --gauges "08167000, 08144500"     # subset
@@ -39,6 +46,15 @@ except Exception:
 FLEET_REPO = os.environ.get("CREST_FLEET_REPO", "vincewin/CREST_fleet")
 DEF_START, DEF_END = "2021-07-01", "2026-06-30"      # last 5 y of MRMS coverage
 PROGRESS = "fleet_progress.jsonl"
+# size split (PI 2026-10-23): basins at/above this drainage area run on the
+# Jetstream2 fleet (FLEET_SIZE=big); the HF runners take the rest (default
+# "small") - a 20,000 km2 basin needs ~15 h on a cpu-basic runner, which a
+# Space restart throws away
+BIG_KM2 = float(os.environ.get("FLEET_BIG_KM2", "5000"))
+# pour points (HydroBASINS level-07 virtual points) upload under their own
+# prefix: CREST_fleet's states/V*, results/V* are the ungauged nowcast's
+# rolling checkpoints, which a 5-year hindcast must never overwrite
+VP_PREFIX = "vp/"
 
 
 def _token():
@@ -48,62 +64,106 @@ def _token():
     return tok
 
 
+def _prefix(gid: str) -> str:
+    return VP_PREFIX if str(gid).upper().startswith("V") else ""
+
+
 def _done_keys() -> set[str]:
-    """gauge ids already fully uploaded (results + states present). By gauge,
+    """Outlet ids already fully uploaded (results + states present). By id,
     not by key: rows are keyed by model+scheme+parameter tag, state grids by
-    model+scheme only, so the two names differ for a calibrated gauge."""
+    model+scheme only, so the two names differ for a calibrated gauge.
+    A listing failure is retried, then fatal: treating it as "nothing done"
+    would re-run and re-upload every finished outlet of the shard."""
     from huggingface_hub import HfApi
-    try:
-        files = set(HfApi(token=_token()).list_repo_files(FLEET_REPO, repo_type="dataset"))
-    except Exception:
-        return set()
-    res = {f[len("results/"):].split("_", 1)[0] for f in files if f.startswith("results/")}
-    st = {f[len("states/"):].split("_", 1)[0] for f in files if f.startswith("states/")}
-    return {g + "_" for g in res & st}
+    for attempt in range(4):
+        try:
+            files = set(HfApi(token=_token()).list_repo_files(FLEET_REPO, repo_type="dataset"))
+            break
+        except Exception as e:
+            if attempt == 3:
+                sys.exit(f"cannot list {FLEET_REPO}: {type(e).__name__}: {e}")
+            time.sleep(30 * (attempt + 1))
+    done = set()
+    for pre in ("", VP_PREFIX):
+        res = {f[len(pre + "results/"):].split("_", 1)[0] for f in files
+               if f.startswith(pre + "results/")}
+        st = {f[len(pre + "states/"):].split("_", 1)[0] for f in files
+              if f.startswith(pre + "states/")}
+        ids = res & st
+        # gauges under the bare prefix; pour points only under vp/
+        done |= {g for g in ids if g.upper().startswith("V") == (pre == VP_PREFIX)}
+    return {g + "_" for g in done}
 
 
 _SHARED_KEYS = None            # per worker process
 
 
-def _store_key(bbox) -> str:
-    """The key forcing.store_dir / basic.store_dir use (without their mkdir)."""
-    return "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p")
+def _keys(bbox) -> tuple[str, str]:
+    """(terrain clip key, forcing store key) of an extent: basic.store_key and
+    the formula forcing.store_dir uses (without their mkdir)."""
+    from hf_data import basic
+    return (basic.store_key(bbox),
+            "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p"))
 
 
 def _shared_store_keys() -> set:
-    """Clip-store keys that more than one catalog gauge maps to (the key is the
-    rounded bbox, not the gauge). Never pruned: a sibling gauge, possibly in
-    another shard on the same cache, may be running on them right now."""
+    """Clip-store keys that more than one outlet maps to (nested basins share
+    an extent). Never pruned: a sibling, possibly in another shard on the same
+    cache, may be running on them right now. Extents come from the
+    basin-extent table, never computed at runtime."""
     global _SHARED_KEYS
     if _SHARED_KEYS is None:
         from collections import Counter
-        from hf_data import gauges as G, pipeline
+        from hf_data import basinextent
+        df, _ = basinextent._load()
         n = Counter()
-        for r in G._catalog().itertuples():
-            n[_store_key(pipeline.basin_bbox({"lat": float(r.LAT_GAGE), "lon": float(r.LNG_GAGE),
-                                              "area": float(r.DRAIN_SQKM)}))] += 1
+        for r in df[df.status == "ok"].itertuples():
+            for k in _keys((r.w, r.s, r.e, r.n)):
+                n[k] += 1
         _SHARED_KEYS = {k for k, c in n.items() if c > 1}
     return _SHARED_KEYS
 
 
 def _prune_basin_store(gid: str) -> None:
-    """Drop the gauge's per-basin clip stores (hourly forcing ~89k files over
+    """Drop the outlet's per-basin clip stores (hourly forcing ~89k files over
     5 years, plus clipped terrain/params) when it finishes, uploaded or failed:
     a retry re-clips them from the locally cached month tars.
     Opt-in (FLEET_PRUNE_FORCING=1) for hosts with a PERSISTENT cache, e.g. the
     Jetstream2 VM: nothing else prunes these there (the datamgr janitor runs
     only in server.py), while HF Spaces lose /tmp at every restart anyway.
-    Same bbox as the run: pipeline.basin_bbox(gauge_info(gid))."""
-    from hf_data import basic, forcing, pipeline
-    g = pipeline.gauge_info(gid)
-    if g is None:
-        return
-    bbox = pipeline.basin_bbox(g)
-    if _store_key(bbox) in _shared_store_keys():
-        return
-    for var in ("mrms", "pet", "temp"):
-        shutil.rmtree(forcing.store_dir(var, bbox), ignore_errors=True)
-    shutil.rmtree(basic.store_dir(bbox), ignore_errors=True)
+    Same extent as the run: basinextent.ef5_extent(gid)."""
+    from hf_data import basic, basinextent, forcing
+    try:
+        bbox = basinextent.ef5_extent(gid)["bounds"]
+    except basinextent.BasinExtentError:
+        return                         # never ran: nothing was clipped
+    kb, kf = _keys(bbox)
+    shared = _shared_store_keys()
+    if kf not in shared:
+        for var in ("mrms", "pet", "temp"):
+            shutil.rmtree(forcing.store_dir(var, bbox), ignore_errors=True)
+    if kb not in shared:
+        shutil.rmtree(basic.store_dir(bbox), ignore_errors=True)
+
+
+def select_outlets(ids: list[str], size: str):
+    """(runnable ids in input order, Counter of skip reasons). Outlets without
+    a basin outline are skipped once, with the reason - never retried in a
+    loop, never boxed; the rest are kept if they fall in the size class."""
+    from collections import Counter
+    from hf_data import basinextent
+    skipped = Counter()
+    runnable = []
+    for g in ids:
+        try:
+            basinextent.ef5_extent(g)
+        except basinextent.BasinExtentError as e:
+            skipped[e.reason] += 1
+            continue
+        a = basinextent.size_km2(g) or 0.0
+        if size == "all" or (a >= BIG_KM2) == (size == "big"):
+            runnable.append(g)
+    return runnable, skipped
 
 
 def _check_code_rev(gid: str) -> None:
@@ -149,15 +209,24 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
     from hf_data import pipeline, statecache, statebundle
     from huggingface_hub import HfApi, CommitOperationAdd
 
+    from hf_data import basinextent
     t_start = time.time()
     last_status = ""
     rows_model = state_model = None
+    try:
+        ext = basinextent.ef5_extent(gid)
+        # M3: one cut set for the whole period, so no chunk re-keys the record
+        cuts = pipeline.plan_cut_set(gid, t0, t1)
+    except basinextent.BasinExtentError as e:
+        return {"gauge": gid, "ok": False, "rc": -2, "no_basin": True,
+                "last": str(e)[-300:]}
     cur = t0
     while cur < t1:
         ce = min(cur + timedelta(days=chunk_days), t1)
         rc = None
         for kind, payload in pipeline.run_gauge(gid, cur, ce, use_mock=False,
-                                                grids=False, scheme="speed"):
+                                                grids=False, scheme="speed",
+                                                cut_ids=cuts):
             if kind == "status":
                 last_status = payload
             elif kind == "params":
@@ -186,6 +255,17 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
     skey = f"{str(gid).zfill(8)}_{state_model}" if state_model else key
 
     sdir = statecache.state_dir(gid, skey.split("_", 1)[1])
+    # provenance: which basin outline (and table version) these rows were
+    # simulated on - box-era records lack it
+    try:
+        rec = json.load(open(rec_path))
+        rec["extent"] = basinextent.provenance(ext)
+        rec["cut_ids"] = cuts
+        with open(rec_path, "w") as fh:
+            json.dump(rec, fh)
+    except (OSError, ValueError):
+        pass
+    pre = _prefix(gid)
     # bundle to a temp FILE: streamed pack, and the compressed bundle of a big
     # basin is never held in RAM (statebundle.pack_dir)
     fd, bpath = tempfile.mkstemp(prefix=f"fleet_{skey}_", suffix=".pqf")
@@ -197,9 +277,9 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
         api = HfApi(token=os.environ["HF_TOKEN"])
         api.create_commit(repo_id=FLEET_REPO, repo_type="dataset",
                           operations=[
-                              CommitOperationAdd(f"states/{skey}.pqf", bpath),
-                              CommitOperationAdd(f"results/{key}.json", rec_path)],
-                          commit_message=f"fleet {key}")
+                              CommitOperationAdd(f"{pre}states/{skey}.pqf", bpath),
+                              CommitOperationAdd(f"{pre}results/{key}.json", rec_path)],
+                          commit_message=f"fleet {pre}{key}")
     finally:
         try:
             os.remove(bpath)
@@ -227,7 +307,12 @@ def main():
                     help="state-save interval (matches CREST_STATE_TOL_DAYS x2)")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--gauges", default="all",
-                    help='"all", comma list, or path to a file of gauge ids')
+                    help='"all" (USGS gauges + HydroBASINS pour points), comma list, '
+                         "or path to a file of outlet ids")
+    ap.add_argument("--size", default=None, choices=("small", "big", "all"),
+                    help=f"basins < FLEET_BIG_KM2 ({BIG_KM2:,.0f} km2: the HF runners), "
+                         ">= it (the Jetstream2 fleet), or all. Default: FLEET_SIZE, "
+                         "else small for --gauges all and all for an explicit list")
     ap.add_argument("--limit", type=int, default=0, help="stop after N gauges (0=all)")
     ap.add_argument("--reverse", action="store_true",
                     help="walk the catalog backwards — lets two runners (Space + "
@@ -236,6 +321,13 @@ def main():
                     help='"K/N": run only gauges with catalog-index %% N == K — '
                          "N parallel runners split the catalog disjointly")
     args = ap.parse_args()
+    if args.size is None:
+        # an explicit list (e.g. a pilot) runs as given; the full roster takes
+        # the HF runners' class unless FLEET_SIZE says otherwise
+        args.size = os.environ.get("FLEET_SIZE", "").strip() or \
+            ("small" if args.gauges == "all" else "all")
+    if args.size not in ("small", "big", "all"):
+        sys.exit(f"FLEET_SIZE must be small|big|all, got {args.size!r}")
 
     if not os.path.exists(os.path.join("EF5", "bin", "ef5")):
         sys.exit("run from the repo root: ./EF5/bin/ef5 not found (see README_FLEET.md)")
@@ -254,19 +346,40 @@ def main():
           flush=True)
     basic.prefetch()
 
+    def _norm(s):
+        s = s.strip()
+        return s if s.upper().startswith("V") else s.zfill(8)
+
     if args.gauges == "all":
-        from hf_data import gauges as G
+        # gauges in catalog order (their shard membership never changes), then
+        # the pour points - seamless coverage of rivers without a gauge
+        from hf_data import gauges as G, virtualpoints
         cat = G.load_catalog()
         ids = [str(s).zfill(8) for s in cat["STAID"].tolist()]
+        vp = virtualpoints._load()
+        if vp is None:
+            sys.exit("virtual-point catalog unavailable")
+        ids += [str(v) for v in vp["vp"].tolist()]
     elif os.path.exists(args.gauges):
-        ids = [ln.strip().zfill(8) for ln in open(args.gauges) if ln.strip()]
+        ids = [_norm(ln) for ln in open(args.gauges) if ln.strip()]
     else:
-        ids = [s.strip().zfill(8) for s in args.gauges.split(",") if s.strip()]
+        ids = [_norm(s) for s in args.gauges.split(",") if s.strip()]
 
     if args.shard:
         k, n = map(int, args.shard.split("/"))
         ids = [g for i, g in enumerate(ids) if i % n == k]
-        print(f"shard {k}/{n}: {len(ids)} gauges in this slice", flush=True)
+        print(f"shard {k}/{n}: {len(ids)} outlets in this slice", flush=True)
+
+    runnable, skipped = select_outlets(ids, args.size)
+    if skipped:
+        print(f"no basin boundary (not simulated, never boxed): {dict(skipped)}", flush=True)
+    print(f"size class {args.size} (split at {BIG_KM2:,.0f} km2): "
+          f"{len(runnable)} of {len(ids) - sum(skipped.values())} outlets", flush=True)
+    if args.gauges != "all" and len(runnable) < len(ids) - sum(skipped.values()):
+        out = sorted(set(ids) - set(runnable))
+        print(f"outside size class {args.size}: {', '.join(out[:40])}"
+              f"{' ...' if len(out) > 40 else ''}", flush=True)
+    ids = runnable
     done = _done_keys()
     todo = [g for g in ids if not any(k.startswith(g + "_") for k in done)]
     if args.reverse:

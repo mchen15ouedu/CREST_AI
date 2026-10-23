@@ -114,19 +114,31 @@ def upstream_gauges(outlet: dict, bbox, basic_dir: str,
     nr, nc = fdir.shape
     max_steps = 4 * (nr + nc)                        # a D8 path can wiggle, but not this much
 
+    from hf_data import basinextent
     found = []
     for _, row in cat.iterrows():
+        gid = str(row.STAID).zfill(8)
         area = float(row.DRAIN_SQKM) if row.DRAIN_SQKM == row.DRAIN_SQKM else None
-        rc = _snap(acc, tr, float(row.LAT_GAGE), float(row.LNG_GAGE), area)
-        if rc is None or (abs(rc[0] - out_rc[0]) <= 1 and abs(rc[1] - out_rc[1]) <= 1):
-            continue                                  # off-grid, or same cell as outlet
+        # each gauge's own outlet cell from the basin-extent table (M1) - the
+        # cell its own runs use; a gauge without a usable row is no BC point
+        try:
+            sn = basinextent.ef5_extent(gid)["snap"]
+        except basinextent.BasinExtentError:
+            continue
+        rc = basinextent.cell_of(tr, sn["lat"], sn["lon"])
+        if not (0 <= rc[0] < nr and 0 <= rc[1] < nc) or not np.isfinite(acc[rc]):
+            continue
+        if abs(rc[0] - out_rc[0]) <= 1 and abs(rc[1] - out_rc[1]) <= 1:
+            continue                                  # same cell as the outlet
         if not _drains_to(fdir, rc, out_rc, max_steps):
             continue
         at_edge = (rc[0] < EDGE_CELLS or rc[1] < EDGE_CELLS
                    or rc[0] >= nr - EDGE_CELLS or rc[1] >= nc - EDGE_CELLS)
-        found.append({"id": str(row.STAID).zfill(8), "name": str(row.STANAME),
+        found.append({"id": gid, "name": str(row.STANAME),
                       "lat": float(row.LAT_GAGE), "lon": float(row.LNG_GAGE),
                       "area": area, "at_edge": bool(at_edge),
+                      # the pinned stream cell (EF5 gets it WITHOUT a BASINAREA)
+                      "snap_lat": sn["lat"], "snap_lon": sn["lon"], "snap_area": sn["area"],
                       "dist_km": 111.0 * math.hypot(float(row.LAT_GAGE) - outlet["lat"],
                                                     float(row.LNG_GAGE) - outlet["lon"])})
     found.sort(key=lambda g: -(g["area"] or 0.0))
@@ -153,8 +165,8 @@ def write_da_file(obs_series: dict[str, list], path: str) -> str | None:
 if __name__ == "__main__":
     # Allagash: outlet 01011000 (3187 km²) — 01010070 / 01010000 sit upstream
     outlet = {"id": "01011000", "lat": 47.0696, "lon": -69.0795, "area": 3186.8}
-    from hf_data import basic, pipeline
-    bbox = pipeline.basin_bbox(outlet)
+    from hf_data import basic, basinextent
+    bbox = basinextent.ef5_extent(outlet)["bounds"]
     bdir = basic.store_dir(bbox)
     basic.clip_basic_data(bbox, bdir)
     ups = upstream_gauges(outlet, bbox, bdir)

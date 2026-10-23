@@ -129,13 +129,19 @@ def derive_dir_acc(dem_path: str, fdir_path: str, facc_path: str) -> None:
             dst.write(out, 1)
 
 
+def store_key(bbox) -> str:
+    """Clip-store key of an extent. Five decimals: basin extents sit on the
+    1/1200 deg HydroSHEDS lattice, where three decimals would map extents one
+    cell apart to the same store (and serve one the other's clip)."""
+    return "_".join(f"{v:.5f}" for v in bbox).replace("-", "m").replace(".", "p")
+
+
 def store_dir(bbox) -> str:
     """Shared per-basin clip store: repeated runs (and every calibration
     candidate) reuse the same clipped DEM/DDM/FAM instead of re-reading the
     remote COGs — faster AND immune to transient network read failures."""
     from hf_data.statecache import CACHE_DIR
-    key = "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p")
-    d = os.path.join(CACHE_DIR, "basic", key)
+    d = os.path.join(CACHE_DIR, "basic", store_key(bbox))
     os.makedirs(d, exist_ok=True)
     return d
 

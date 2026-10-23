@@ -53,6 +53,13 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
     hist_start = t0 - timedelta(days=hist_days)
     t_end = t0 + timedelta(hours=horizon_h)
 
+    from hf_data import basinextent
+    try:                        # no basin outline: skipped before any download
+        basinextent.ef5_extent(info)
+    except basinextent.BasinExtentError as e:
+        return {"ok": False, "gid": str(gid), "no_basin": True,
+                "reason": f"no basin boundary ({e.reason})"}
+
     status: list[str] = []
 
     # A point with a qualifying upstream cut gauge runs the truncated SPEED
@@ -76,6 +83,9 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
     except Exception:
         pass
 
+    no_basin = []
+    cuts: list = []
+
     def _drain(gen, tag):
         rows: list[dict] = []
         model = None
@@ -91,6 +101,10 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
                     model = ev.get("state_model") or ev["cache_model"]
                 if ev.get("n_upstream") is not None:
                     n_up = ev["n_upstream"]
+                if ev.get("cut_ids") is not None:
+                    cuts[:] = list(ev["cut_ids"])
+            elif kind == "done" and ev.get("no_basin"):
+                no_basin.append(ev.get("reason"))
         return rows, model, n_up
 
     # Phase A: cached hindcast to t0 (advances + saves state; observed only).
@@ -98,12 +112,17 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
     hist, cache_model, n_upstream = _drain(pipeline.run_gauge(
         gid, hist_start, t0, use_mock=False, scheme="speed", grids=False,
         warmup_days=10), "A")
+    if no_basin:              # no basin outline: skipped, never boxed
+        return {"ok": False, "gid": str(gid), "no_basin": True,
+                "reason": f"no basin boundary ({no_basin[0]})", "status": status}
     cache_model = cache_model or spd_model
 
-    # Phase B: 12-h forecast warm-started from the t0 state (no cold warm-up)
+    # Phase B: 12-h forecast warm-started from the t0 state (no cold warm-up),
+    # on Phase A's own domain: its cut set is reused, so the state it just
+    # saved fits (a t0-only coverage gate could pick another cut set)
     fcst, _, _ = _drain(pipeline.run_gauge(
         gid, t0, t_end, use_mock=False, scheme="speed", grids=False,
-        warmup_days=0, nowcast_t0=t0), "B")
+        warmup_days=0, nowcast_t0=t0, cut_ids=list(cuts)), "B")
 
     # retention: keep newest + 10-day checkpoints, delete intermediate hourly states
     try:

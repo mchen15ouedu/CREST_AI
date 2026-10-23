@@ -110,14 +110,20 @@ def build_speed_domain(outlet: dict, bc_gauges: list[dict], basic_dir: str):
         return None
     snapped = []
     for g in bc_gauges:
-        rc = neighbors._snap(acc, tr, g["lat"], g["lon"], g.get("area"))
+        # a cut gauge's pinned cell (basin-extent table, via upstream_gauges);
+        # re-snapping a cell centre with its own FAM area returns that cell
+        rc = neighbors._snap(acc, tr, g.get("snap_lat", g["lat"]), g.get("snap_lon", g["lon"]),
+                             g.get("snap_area", g.get("area")))
         if rc is not None and not (abs(rc[0] - out_rc[0]) <= 1 and abs(rc[1] - out_rc[1]) <= 1):
             snapped.append((g, rc))
     cut = cut_set(out_rc, snapped, fdir)
     if not cut:
         return None
 
-    key = hashlib.sha1((",".join(sorted(g["id"] for g, _ in cut))).encode()).hexdigest()[:10]
+    # outlet id in the key: nested gauges now share one basin-extent clip store,
+    # and two outlets with the same cut set must not reuse each other's domain
+    key = hashlib.sha1((str(outlet["id"]) + "|" + ",".join(sorted(g["id"] for g, _ in cut)))
+                       .encode()).hexdigest()[:10]
     ddir = os.path.join(basic_dir, f"speed_{key}")
     meta_p = os.path.join(ddir, "domain.json")
     if all(os.path.exists(os.path.join(ddir, n)) for n in
@@ -190,9 +196,12 @@ def build_speed_domain(outlet: dict, bc_gauges: list[dict], basic_dir: str):
 
 
 if __name__ == "__main__":
-    from hf_data import basic, pipeline
+    from hf_data import basic, basinextent, pipeline
     outlet = pipeline.gauge_info("08167000")          # Guadalupe @ Comfort, TX
-    bbox = pipeline.basin_bbox(outlet)
+    ext = basinextent.ef5_extent(outlet)
+    bbox = ext["bounds"]
+    outlet = {**outlet, "lat": ext["snap"]["lat"], "lon": ext["snap"]["lon"],
+              "area": ext["snap"]["area"]}
     bdir = basic.store_dir(bbox)
     basic.clip_basic_data(bbox, bdir)
     bc = neighbors.upstream_gauges(outlet, bbox, bdir)

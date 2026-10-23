@@ -42,32 +42,42 @@ def pack_dir(state_dir: str, out_path: str | None = None) -> bytes | str | None:
     import rasterio
     from rasterio.windows import Window
 
-    keep, meta, shape = [], None, None
-    skipped = []
+    # grid headers; the bundle's geometry is that of the NEWEST state time (the
+    # domain the gauge runs on now), and a grid on any other raster - other
+    # size OR other origin/cell - is skipped, never packed under a wrong origin
+    heads, skipped = [], []
     for p in sorted(glob.glob(os.path.join(state_dir, "*.tif"))):
         with rasterio.open(p) as ds:
             if ds.count != 1 or ds.dtypes[0] not in ("float32", "float64"):
                 skipped.append(os.path.basename(p))
                 continue
-            sh = (ds.height, ds.width)
-            if shape is None:
-                shape = sh
-                cell = ds.res[0]
-                xll = ds.transform.c
-                yll = ds.transform.f - ds.height * cell
-                nodata = -9999.0 if ds.nodata is None else float(ds.nodata)
-                meta = {b"nrows": str(sh[0]).encode(),
-                        b"ncols": str(sh[1]).encode(),
-                        b"xllcorner": repr(float(xll)).encode(),
-                        b"yllcorner": repr(float(yll)).encode(),
-                        b"cellsize": repr(float(cell)).encode(),
-                        b"nodata": repr(nodata).encode()}
-            elif sh != shape:                      # domain changed mid-history
-                skipped.append(os.path.basename(p))
-                continue
-        keep.append(p)
-    if not keep:
+            cell = ds.res[0]
+            heads.append((p, (ds.height, ds.width), float(ds.transform.c),
+                          float(ds.transform.f - ds.height * cell), float(cell),
+                          -9999.0 if ds.nodata is None else float(ds.nodata)))
+    if not heads:
         return None
+
+    def _stamp(p):                     # "<var>_YYYYMMDD_HHMM.tif" -> sortable
+        parts = os.path.splitext(os.path.basename(p))[0].rsplit("_", 2)
+        return "".join(parts[-2:]) if len(parts) == 3 else ""
+
+    ref = max(heads, key=lambda h: (_stamp(h[0]), h[0]))
+    _, shape, xll, yll, cell, nodata = ref
+    tol = 1e-6 * cell
+    keep = []
+    for p, sh, x, y, c, _ in heads:
+        if sh == shape and abs(x - xll) <= tol and abs(y - yll) <= tol \
+                and abs(c - cell) <= tol:
+            keep.append(p)
+        else:                                  # domain changed mid-history
+            skipped.append(os.path.basename(p))
+    meta = {b"nrows": str(shape[0]).encode(),
+            b"ncols": str(shape[1]).encode(),
+            b"xllcorner": repr(xll).encode(),
+            b"yllcorner": repr(yll).encode(),
+            b"cellsize": repr(cell).encode(),
+            b"nodata": repr(nodata).encode()}
     for p in sorted(glob.glob(os.path.join(state_dir, "*.txt"))):
         try:
             with open(p, "rb") as fh:

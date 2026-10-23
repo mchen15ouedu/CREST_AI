@@ -184,6 +184,14 @@ class SimJob:
                                     "returncode": -9,
                                     "n": len(self.hydro.get(gid, []))})
                         continue
+                    if payload.get("no_basin"):
+                        # deliberate, permanent skip (no basin outline, never a
+                        # box) - not an EF5 crash, nothing to render or retry
+                        self._emit({"kind": "gauge_done", "gauge_id": gid,
+                                    "returncode": rc, "no_basin": True,
+                                    "reason": payload.get("reason"),
+                                    "n": len(self.hydro.get(gid, []))})
+                        continue
                     if payload.get("error") or rc not in (0, None):
                         from hf_data import crashlog
                         crashlog.capture(f"ef5:{gid}", message=payload.get("error")

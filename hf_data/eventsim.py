@@ -214,7 +214,7 @@ def detect(max_events: int = 1) -> list[dict]:
     triggers with zero USGS data and ~0 simulated flow), so a trigger also
     requires the gauge to be reporting AND already at >= EVENT_OBS_GATE of
     bankfull (Q2) within the last few hours."""
-    from . import nowcaststore, pipeline
+    from . import basinextent, nowcaststore, pipeline
     hs = nowcaststore.hotspots()
     picks = []
     if not hs.get("ok"):
@@ -229,8 +229,14 @@ def detect(max_events: int = 1) -> list[dict]:
         cands = []
         for m in reds:
             g = pipeline.gauge_info(m["id"])
-            if g and g["id"] not in seen:
-                cands.append((float(g.get("area") or 0.0), g))
+            if not g or g["id"] in seen:
+                continue
+            try:                      # no basin outline -> never a trigger
+                basinextent.ef5_extent(g)
+            except basinextent.BasinExtentError as e:
+                print(f"event trigger {g['id']}: SKIP — {e}")
+                continue
+            cands.append((float(g.get("area") or 0.0), g))
         for area, g in sorted(cands, reverse=True, key=lambda t: t[0]):
             gid = g["id"]
             obs = _recent_obs_max(gid)
@@ -385,25 +391,14 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                         started=datetime.datetime.utcnow().strftime(
                             "%Y-%m-%dT%H:%M:%SZ"))
     try:
-        # EF5's raster EXTENT must contain the WHOLE basin: the default
-        # √area square centred on the outlet gauge clips elongated
-        # catchments (Spoon R 3,884 of 4,241 km²; Pope Ck 199 of 449 — the
-        # gauge sits at the basin's downstream end). Use the HUC12 basin
-        # bounds, unioned with the default so the extent never shrinks. EF5
-        # still carves the catchment inside it (nodata outside).
-        from . import hucdomain
-        ef5_bbox = None
-        try:
-            hb = hucdomain.basin_bounds(g)
-            sq = pipeline.basin_bbox(g)
-            ef5_bbox = (min(hb[0], sq[0]), min(hb[1], sq[1]),
-                        max(hb[2], sq[2]), max(hb[3], sq[3]))
-            grew = any(abs(a - b) > 1e-6 for a, b in zip(ef5_bbox, sq))
-            log(f"EF5 extent from the HUC12 basin bounds "
-                f"{'(wider than the default square)' if grew else '(default square already covers it)'}")
-        except Exception as e:
-            log(f"EF5 extent: HUC12 bounds unavailable ({type(e).__name__}: "
-                f"{e}) — default square")
+        # EF5's raster extent and outlet cell come from the gauge's basin
+        # outline (basinextent: GAGES-II polygon ∪ the carved catchment, on
+        # the HydroSHEDS lattice) — the same extent as the dashboard's runs,
+        # so they share clip and forcing stores. No basin -> no event.
+        from . import basinextent, hucdomain
+        ext = basinextent.ef5_extent(g)
+        log(f"EF5 extent from the basin outline ({ext['source']}, "
+            f"{ext['carved_km2']:,.0f} km² catchment, {ext['cells']:,} cells)")
         log(f"EF5 nowcast-mode run {t_start:%m-%d %H}Z -> {t_end:%m-%d %H}Z "
             f"with gridded runoff output")
         meta = {}
@@ -419,7 +414,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         for kind, payload in pipeline.run_gauge(
                 gid, t_start, t_end, model="auto", use_mock=False,
                 grids=EVENT_TOKENS, workdir=work, nowcast_t0=t0,
-                warmup_days=WARMUP_D, domain_bbox=ef5_bbox):
+                warmup_days=WARMUP_D):
             if kind == "meta":
                 meta = payload
             elif kind == "status":
@@ -433,6 +428,9 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                             "time": str(r["time"]), "sim_q": _f(r.get("sim_q")),
                             "obs_q": _f(r.get("obs_q")),
                             "precip": _f(r.get("precip"))}
+            elif kind == "done" and payload.get("no_basin"):
+                raise hucdomain.DomainError(f"{gid}: no basin boundary "
+                                            f"({payload.get('reason')})")
             elif kind == "done" and payload.get("returncode", 0) not in (0, None):
                 raise RuntimeError(f"EF5 failed: {payload}")
         out_dir = os.path.join(work, "CREST_output")
@@ -503,7 +501,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                 f"{dom.get('of_area_km2')} km2) to fit EVENT_QUEUE_MAX_CELLS="
                 f"{QUEUE_MAX_CELLS / 1e6:.1f}M")
         basin_ring = dom["basin"]
-        basin_bbox = tuple(dom["bbox"])        # raster extent of the union
+        dom_extent = tuple(dom["bbox"])        # raster extent of the HUC12 union
         # worker spec = full anchored span (fixed episode window); the local
         # CPU fallback still solves only the fresh 24-h slice — its frames
         # merge into the fixed-start record at publish
@@ -555,7 +553,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
             spec = {"event_id": ev_id, "episode": bool(episode_id),
                     "gauge": {"id": gid, "lat": g["lat"], "lon": g["lon"],
                               "area_km2": g.get("area")},
-                    "bbox_basin": list(basin_bbox),
+                    "bbox_basin": list(dom_extent),
                     # basin domain summary (units, area, active/bbox cells);
                     # the label raster itself rides in the forcing tar
                     "domain": {k: v for k, v in dom.items() if k != "basin"},

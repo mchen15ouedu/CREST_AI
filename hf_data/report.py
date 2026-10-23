@@ -186,30 +186,36 @@ def _fig_peak_map(job, gid: str, meta: dict, path: str) -> bool:
 
 
 def _fig_basic(meta: dict, path: str) -> bool:
-    """AQUAH 'basic_data.png': DEM + flow accumulation from the basin clip store."""
+    """AQUAH 'basic_data.png': DEM + flow accumulation of the BASIN (the carved
+    catchment EF5 simulates, outlined), from the basin clip store."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
         import rasterio
-        from hf_data import basic
-        from hf_data.pipeline import basin_bbox
-        bdir = basic.store_dir(basin_bbox(meta))
+        from hf_data import basic, basinextent
+        ext = basinextent.ef5_extent(meta)
+        bdir = basic.store_dir(ext["bounds"])
         panels = [("dem_clip.tif", "DEM (m)", "terrain"),
                   ("facc_clip.tif", "Flow accumulation (log10 cells)", "Blues")]
         if not all(os.path.exists(os.path.join(bdir, f)) for f, _, _ in panels):
             return False
+        mask = basinextent.carve(bdir, ext, str(meta.get("id")))["mask"]
         fig, axes = plt.subplots(1, 2, figsize=(11, 4.6), dpi=130)
         for ax, (fname, title, cmap) in zip(axes, panels):
             with rasterio.open(os.path.join(bdir, fname)) as ds:
                 a = ds.read(1).astype("float64")
                 a[a == ds.nodata] = np.nan
                 b = ds.bounds
+            a[~mask] = np.nan                       # the basin, not the rectangle
             if "facc" in fname:
                 a = np.log10(np.clip(a, 1, None))
             im = ax.imshow(a, extent=(b.left, b.right, b.bottom, b.top),
                            origin="upper", cmap=cmap)
+            ax.contour(mask.astype(float), levels=[0.5], colors="#333333",
+                       linewidths=0.8, origin="upper",
+                       extent=(b.left, b.right, b.bottom, b.top))
             if meta.get("lon") and meta.get("lat"):
                 ax.plot(meta["lon"], meta["lat"], "^", color="#d0342c", ms=9,
                         mec="white", mew=1.2)

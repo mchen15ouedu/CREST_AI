@@ -11,23 +11,39 @@ every gauge. The fleet had no upload from 2026-10-14. On the VM the cache
 persists on the data volume. The month tars stay cached; the
 `fleet.env.example` comments explain the other choices.
 
-## One writer per shard
+## Who runs what: a size split, not a shard split
 
-A shard is `catalog index % FLEET_N == K`. Before starting shard K on the VM,
-PAUSE the HF Space that runs K/6:
+The roster is every USGS gauge plus every HydroBASINS level-07 pour point
+(the virtual points). Each is simulated on its basin outline from
+`hf_data/data/basin_extent.parquet`; there is never a box, and an outlet
+without an outline is skipped with the reason. The roster is split by
+drainage area at `FLEET_BIG_KM2` (5,000 km², PI 2026-10-23):
 
-| HF Space | FLEET_SHARD | VM unit |
+| Runner | `FLEET_SIZE` | Takes |
 |---|---|---|
-| CREST_fleet_runner | 0/6 | crest-fleet@0 |
-| CREST_fleet_runner2 | 1/6 | crest-fleet@1 |
-| CREST_fleet_runner3 | 2/6 | crest-fleet@2 |
-| CREST_fleet_runner4 | 3/6 | crest-fleet@3 |
-| CREST_fleet_runner5 | 4/6 | crest-fleet@4 |
-| CREST_fleet_runner6 | 5/6 | crest-fleet@5 |
+| HF Spaces CREST_fleet_runner..6 (shards 0/6..5/6) | `small` (the default) | basins under 5,000 km² |
+| this kit's `crest-fleet@K` units (shards K/`FLEET_N`) | `big` | basins of 5,000 km² or more |
 
-Read the Space's `FLEET_SHARD` variable before pausing it rather than trusting
-this table. To hand a shard back, stop and disable the unit, then restart the
-Space. Gauges already uploaded are skipped by either side.
+Once every HF runner runs the size-split code, the two classes don't
+overlap: no HF Space needs pausing and no outlet runs twice.
+
+- **Switch-over.** The HF runners load CREST_AI main only when they boot.
+  After the size split first reaches main, restart all six. Check that each
+  log shows `size class small (split at 5,000 km2)` before enabling any
+  `crest-fleet@K` unit.
+- **Several hosts.** `FLEET_N` splits the big class across all big-class
+  units: give the units on different hosts different K of the same N.
+- **Uploads.** Outlets already uploaded are skipped by either side.
+- **Explicit lists.** An explicit `FLEET_GAUGES` list, such as a pilot,
+  needs `FLEET_SIZE=all` to run every listed outlet.
+
+Pour-point runs upload under `vp/states/` and `vp/results/` in CREST_fleet.
+The bare `states/V*` names belong to the ungauged nowcast's rolling
+checkpoints.
+
+The kit also runs on a CPU-only Jetstream2 instance. There is no 2-D worker
+to share with there, so raise `crest-fleet.slice`'s MemoryMax and CPUWeight
+with a drop-in.
 
 ## Install (once; idempotent)
 

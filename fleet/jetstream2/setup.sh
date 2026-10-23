@@ -9,7 +9,7 @@
 #   sudo /opt/crest-fleet/bin/setup.sh                    # update (root-owned copy)
 #   sudo /opt/crest-fleet/bin/setup.sh --set-token        # fine-grained HF token, hidden input
 #   sudo /opt/crest-fleet/bin/setup.sh --check-token      # show its scope (read-only)
-# Then, after PAUSING the HF Space with FLEET_SHARD=K/6:
+# Then, with FLEET_SIZE / FLEET_N set in /etc/crest-fleet/fleet.env:
 #   sudo systemctl enable --now crest-fleet@K
 # Runbook: fleet/jetstream2/README.md
 set -euo pipefail
@@ -189,6 +189,11 @@ install_all() {
     install -o root -g root -m 0644 "$HERE/fleet.env.example" "$ETC/fleet.env"
     log "created $ETC/fleet.env from the example (no secrets go there)"
   fi
+  # an env from the pre-size-split kit would run the HF runners' class
+  case $(envget FLEET_SIZE) in
+    big | small | all) ;;
+    *) log "WARNING: $ETC/fleet.env has no valid FLEET_SIZE (big|small|all) - shards refuse to start until it is set (see fleet.env.example)" ;;
+  esac
   local d a cache hub tmpd
   cache=$(envget CREST_CACHE_DIR)
   hub=$(envget HF_HOME)
@@ -263,7 +268,7 @@ print('imports OK: gdal', gdal.__version__, 'rasterio', rasterio.__version__, 'n
   echo
   log "setup complete. Enabled shards: $(systemctl list-unit-files --plain --no-legend 'crest-fleet@*.service' --state=enabled | awk '{print $1}' | tr '\n' ' ')"
   [ -s "$TOKEN_FILE" ] || log "next: sudo $ME --set-token"
-  log "to add shard K: pause the HF Space with FLEET_SHARD=K/6, then: sudo systemctl enable --now crest-fleet@K"
+  log "to add shard K (of FLEET_N, size class FLEET_SIZE in $ETC/fleet.env): sudo systemctl enable --now crest-fleet@K"
 }
 
 case ${1:-} in

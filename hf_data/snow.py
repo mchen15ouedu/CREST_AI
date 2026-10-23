@@ -154,7 +154,9 @@ def build_temp_dem(bbox, dem_path: str, out_path: str) -> str | None:
         return None
 
 
-def _mean_elev(dem_path):
+def _mean_elev(dem_path, mask=None):
+    """Mean DEM elevation - over the basin's EF5 nodes when `mask` (bool, on
+    the DEM's grid) is given, else over the whole raster."""
     if not dem_path or not os.path.exists(dem_path):
         return None
     try:
@@ -162,14 +164,32 @@ def _mean_elev(dem_path):
         with rasterio.open(dem_path) as ds:
             a = ds.read(1).astype("float32")
             nod = ds.nodata
-        v = a[(a != nod) & np.isfinite(a) & (a > -500) & (a < 9000)] if nod is not None else a
+        ok = np.isfinite(a) & (a > -500) & (a < 9000)
+        if nod is not None:
+            ok &= a != nod
+        if mask is not None and mask.shape == a.shape:
+            ok &= mask
+        v = a[ok]
         return float(np.nanmean(v)) if v.size else None
     except Exception:
         return None
 
 
-def _basin_min_temp(bbox, t_start, t_end, sample_hours=6):
-    """Min basin temperature (°C) over the window from HF temp forcing (sampled)."""
+def _temp_pixels(lons, lats, nxll, nyll, cell, shape):
+    """Bool mask of the temp-clip pixels that contain at least one basin cell."""
+    top = nyll + shape[0] * cell
+    r = np.floor((top - lats) / cell).astype(np.int64)
+    c = np.floor((lons - nxll) / cell).astype(np.int64)
+    ok = (r >= 0) & (r < shape[0]) & (c >= 0) & (c < shape[1])
+    m = np.zeros(shape, dtype=bool)
+    m[r[ok], c[ok]] = True
+    return m
+
+
+def _basin_min_temp(bbox, t_start, t_end, sample_hours=6, cells=None):
+    """Min basin temperature (°C) over the window from HF temp forcing (sampled).
+    cells=(lons, lats) of the basin's EF5 nodes restricts the minimum to the
+    temperature pixels the basin touches (not the whole extent rectangle)."""
     import io
     import tarfile
     import truststore
@@ -186,6 +206,7 @@ def _basin_min_temp(bbox, t_start, t_end, sample_hours=6):
     for s in steps:
         by_month.setdefault((s.year, s.month), []).append(s)
     gmin = None
+    pix: dict = {}                     # temp-clip geometry -> basin pixel mask
     for (yr, mo), group in sorted(by_month.items()):
         ref = group[0]
         try:
@@ -208,24 +229,45 @@ def _basin_min_temp(bbox, t_start, t_end, sample_hours=6):
                 if clip is None:
                     continue
                 sub = clip[0]
-                v = sub[(sub > -90) & (sub < 60) & np.isfinite(sub)]     # plausible °C only
+                keep = (sub > -90) & (sub < 60) & np.isfinite(sub)       # plausible °C only
+                if cells is not None:
+                    # the basin's temp pixels: one clip geometry per run, so
+                    # map the (millions of) basin cells once, not per sample
+                    gkey = (round(clip[1], 9), round(clip[2], 9), cell, sub.shape)
+                    if gkey not in pix:
+                        pix[gkey] = _temp_pixels(cells[0], cells[1], clip[1], clip[2],
+                                                 cell, sub.shape)
+                    keep &= pix[gkey]
+                v = sub[keep]
                 if v.size:
                     m = float(v.min())
                     gmin = m if gmin is None else min(gmin, m)
     return gmin
 
 
-def detect_snow(bbox, t_start, t_end, dem_path=None, force: str | None = None, use_temp: bool = True) -> dict:
-    """Decide whether SNOW17 should be on. force in {'on','off',None}."""
+def detect_snow(bbox, t_start, t_end, dem_path=None, force: str | None = None,
+                use_temp: bool = True, basin=None) -> dict:
+    """Decide whether SNOW17 should be on. force in {'on','off',None}.
+    basin=(mask, transform): the run's EF5 nodes on dem_path's grid. Latitude,
+    mean elevation and the minimum temperature are then taken over the basin
+    itself (M2, PI OK 2026-10-23), not over the extent rectangle."""
     if force == "on":
         return {"snow": True, "reason": "user override: on"}
     if force == "off":
         return {"snow": False, "reason": "user override: off"}
 
+    mask = cells = None
     lat = (bbox[1] + bbox[3]) / 2.0
+    if basin is not None and basin[0] is not None and basin[0].any():
+        mask, tr = basin
+        rr, cc = np.nonzero(mask)
+        lats = tr.f + (rr + 0.5) * tr.e
+        lons = tr.c + (cc + 0.5) * tr.a
+        lat = float(lats.mean())
+        cells = (lons, lats)
     months = {t_start.month, t_end.month}
     cold_season = any(m in (10, 11, 12, 1, 2, 3, 4) for m in months)
-    elev = _mean_elev(dem_path)
+    elev = _mean_elev(dem_path, mask)
     warm = (not cold_season) and lat < 40 and (elev is None or elev < 1500)
     if warm:
         return {"snow": False, "reason": f"warm season/region (lat {lat:.0f}°, "
@@ -233,7 +275,7 @@ def detect_snow(bbox, t_start, t_end, dem_path=None, force: str | None = None, u
 
     if use_temp:                                          # data-driven confirmation
         try:
-            mn = _basin_min_temp(bbox, t_start, t_end)
+            mn = _basin_min_temp(bbox, t_start, t_end, cells=cells)
         except Exception:
             mn = None
         if mn is not None:
