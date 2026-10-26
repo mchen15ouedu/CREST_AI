@@ -17,7 +17,11 @@ basinextent.snap_cell - the nearest stream cell within 20 km whose HydroSHEDS
 3-arc-second drainage area matches the outlet's own within +-20%. The run
 hands EF5 that cell centre WITHOUT a BASINAREA (EF5 uses BASINAREA only for
 its own outlet search, BasicGrids.cpp:697), so EF5 carves exactly the D8
-catchment measured here. The extent is the union of that catchment and the
+catchment measured here. A gauge whose nearest cell finds no match or
+carves another creek (flat / urban terrain, where the D8 network and the
+GAGES-II polygon disagree) falls back to _poly_snap: the cell inside its
+polygon whose catchment overlaps the polygon best; the column snap_rule
+records which rule fixed the outlet. The extent is the union of that catchment and the
 outline, plus MARGIN_DEG, snapped outward to the HydroSHEDS lattice - the
 tightest rectangle EF5's raster reader needs; EF5 simulates only the carved
 catchment inside it.
@@ -69,6 +73,7 @@ MIN_IN_POLY = 0.70           # carve share inside the GAGES-II polygon (two DEMs
 WIN_PAD_DEG = 0.30           # first read window around the outline / point
 GROW_DEG = 1.0               # grow the window while the carve touches its edge
 MAX_WIN_CELLS = 72_000_000   # stop growing: the catchment is over the cap anyway
+POLY_WIN_PAD_DEG = 0.10      # window around the polygon for the overlap snap
 # (the carve peaks at ~32 B/cell, so one window stays under ~2.5 GB of RAM)
 GAGES_GLOB = "D:/usgs_gauge_boundaries/boundaries-shapefiles-by-aggeco/*.shp"
 HYBAS_SHP = r"E:/USGSproject/hybas_na_lev07_v1c.shp"
@@ -213,99 +218,211 @@ def _carve(gr, gc, w, s, e, n):
     return r0, c0, H, W, upstream_mask(d, gr - r0, gc - c0)
 
 
+def _accumulate(fdir: np.ndarray, wgt: np.ndarray) -> np.ndarray:
+    """Weighted D8 flow accumulation inside the window: each cell's weight
+    plus that of every cell upstream of it (paths leaving the window are cut).
+    Kahn order over the receiver index, one round per flow-path step."""
+    from hf_data.basinextent import _D8
+    H, W = fdir.shape
+    n = H * W
+    rec = np.full(n, -1, dtype=np.int64)
+    for code, (dr, dc) in _D8.items():
+        rr, cc = np.nonzero(fdir == code)
+        rr2, cc2 = rr + dr, cc + dc
+        ok = (rr2 >= 0) & (rr2 < H) & (cc2 >= 0) & (cc2 < W)
+        rec[rr[ok] * W + cc[ok]] = rr2[ok] * W + cc2[ok]
+    indeg = np.bincount(rec[rec >= 0], minlength=n)
+    acc = wgt.ravel().astype("float64")
+    fr = np.nonzero(indeg == 0)[0]
+    while len(fr):
+        fr = fr[rec[fr] >= 0]
+        if not len(fr):
+            break
+        t, inv = np.unique(rec[fr], return_inverse=True)
+        acc[t] += np.bincount(inv, weights=acc[fr])
+        indeg[t] -= np.bincount(inv)
+        fr = t[indeg[t] == 0]
+    return acc.reshape(H, W)
+
+
+def _poly_snap(site: dict):
+    """Fallback outlet of a gauge whose nearest-cell snap finds no cell or
+    lands on another creek (flat or urban terrain, where the 3-arc-second
+    network and the GAGES-II polygon disagree): among the cells inside the
+    polygon (+ SNAP_PAD_DEG) whose drainage area matches within +-SNAP_TOL,
+    the one whose D8 catchment overlaps the polygon best (intersection over
+    union). Returns (row, col, acc, iou) in global indices, or None."""
+    import shapely
+    from rasterio.features import rasterize
+    from rasterio.windows import Window
+    from hf_data.basinextent import cell_km2
+    dsd, dsa = _ds()
+    poly = shapely.from_wkb(site["poly_wkb"])
+    r0, c0, H, W = _window(dsa, site["ow"] - POLY_WIN_PAD_DEG, site["os"] - POLY_WIN_PAD_DEG,
+                           site["oe"] + POLY_WIN_PAD_DEG, site["on"] + POLY_WIN_PAD_DEG)
+    r0, c0 = max(0, r0), max(0, c0)
+    H, W = min(H, dsa.height - r0), min(W, dsa.width - c0)
+    if H <= 0 or W <= 0 or H * W > MAX_WIN_CELLS // 3:  # ~30 B/cell
+        return None
+    win = Window(c0, r0, W, H)
+    wtr = dsa.window_transform(win)
+    acc = dsa.read(1, window=win).astype("float64")
+    acc[(acc == float(dsa.nodata)) | (acc < 0)] = np.nan
+    inp = rasterize([(poly, 1)], out_shape=(H, W), transform=wtr,
+                    fill=0, dtype="uint8").astype(bool)
+    n_p = int(inp.sum())
+    if not n_p:
+        return None
+    lats = wtr.f + (np.arange(H) + 0.5) * wtr.e
+    a_km2 = acc * cell_km2(lats, wtr.a)[:, None]
+    cand = rasterize([(poly.buffer(SNAP_PAD_DEG), 1)], out_shape=(H, W), transform=wtr,
+                     fill=0, dtype="uint8").astype(bool)
+    cand &= np.isfinite(a_km2) & (np.abs(a_km2 / site["area"] - 1.0) <= SNAP_TOL)
+    if not cand.any():
+        return None
+    a_p = _accumulate(dsd.read(1, window=win), inp)    # polygon cells upstream
+    iou = np.where(cand, a_p / np.maximum(acc + n_p - a_p, 1.0), -1.0)
+    k = int(np.argmax(iou))
+    r, c = divmod(k, W)
+    if iou[r, c] <= 0:
+        return None
+    return r + r0, c + c0, float(acc[r, c]), float(iou[r, c])
+
+
+def _carve_site(site: dict, gr: int, gc: int, acc_cells: float) -> dict:
+    """Carve the catchment of global outlet cell (gr, gc) and measure it: the
+    catchment box and QA shares for the table, or a terminal flag
+    (no_terrain, over_cap, error)."""
+    dsd, dsa = _ds()
+    tr = dsa.transform
+    res = tr.a
+    out = {"flags": []}
+    has_outline = site.get("ow") is not None and np.isfinite(site["ow"])
+    slat = tr.f + (gr + 0.5) * tr.e
+    slon = tr.c + (gc + 0.5) * tr.a
+    from hf_data.basinextent import cell_km2
+    out.update(snap_lat=slat, snap_lon=slon, snap_row=int(gr), snap_col=int(gc),
+               snap_area_km2=max(acc_cells, 1.0) * float(cell_km2(slat, res)))
+    # over the cap before any carve: the raster holds every carved cell,
+    # and it holds the outline's extent
+    if acc_cells > CAP_CELLS or (has_outline and _lattice_cells(
+            site["ow"] - MARGIN_DEG, site["os"] - MARGIN_DEG,
+            site["oe"] + MARGIN_DEG, site["on"] + MARGIN_DEG, res) > CAP_CELLS):
+        out["flags"].append("over_cap")
+        return out
+    if has_outline:
+        w, s, e, n = site["ow"], site["os"], site["oe"], site["on"]
+    else:                            # first window <= ~5x5 deg; it grows as needed
+        rad = min(2.5, max(0.3, 1.2 * math.sqrt(max(site["area"], 1.0)) / 111.0))
+        w, s, e, n = slon - rad, slat - rad, slon + rad, slat + rad
+    w, s, e, n = (min(w, slon) - WIN_PAD_DEG, min(s, slat) - WIN_PAD_DEG,
+                  max(e, slon) + WIN_PAD_DEG, max(n, slat) + WIN_PAD_DEG)
+    while True:
+        cv = _carve(gr, gc, w, s, e, n)
+        if cv is None:
+            out["flags"].append("no_terrain")
+            return out
+        r0, c0, H, W, m = cv
+        rr = np.nonzero(m.any(axis=1))[0]
+        cc = np.nonzero(m.any(axis=0))[0]
+        hit = {"n": rr[0] == 0 and r0 > 0, "s": rr[-1] == H - 1 and r0 + H < dsd.height,
+               "w": cc[0] == 0 and c0 > 0, "e": cc[-1] == W - 1 and c0 + W < dsd.width}
+        if not any(hit.values()):
+            break
+        # the catchment found so far only grows: once ITS box (+ margin)
+        # is over the cap, so is the final extent - judged on the carve,
+        # not on the read window (which would flag elongated basins)
+        if (rr[-1] - rr[0] + 1 + 2 * MARGIN_DEG / res) * \
+                (cc[-1] - cc[0] + 1 + 2 * MARGIN_DEG / res) > CAP_CELLS:
+            out["flags"].append("over_cap")
+            return out
+        # grow the sides the catchment reaches and pull the others in to it
+        # (+ pad): an outlet-centred first window would otherwise carry its
+        # empty downstream half through every growth step. Safe: a carve that
+        # touches no side of its window is the whole catchment.
+        kw = tr.c + (c0 + cc[0]) * tr.a - WIN_PAD_DEG
+        ke = tr.c + (c0 + cc[-1] + 1) * tr.a + WIN_PAD_DEG
+        kn = tr.f + (r0 + rr[0]) * tr.e + WIN_PAD_DEG
+        ks = tr.f + (r0 + rr[-1] + 1) * tr.e - WIN_PAD_DEG
+        w2 = w - GROW_DEG if hit["w"] else max(w, kw)
+        s2 = s - GROW_DEG if hit["s"] else max(s, ks)
+        e2 = e + GROW_DEG if hit["e"] else min(e, ke)
+        n2 = n + GROW_DEG if hit["n"] else min(n, kn)
+        if _lattice_cells(w2, s2, e2, n2, res) > MAX_WIN_CELLS:
+            out["flags"].append("error")         # memory guard, not a cap verdict
+            out["error"] = "read window over MAX_WIN_CELLS"
+            return out
+        w, s, e, n = w2, s2, e2, n2
+    if rr[0] == 0 or cc[0] == 0 or rr[-1] == H - 1 or cc[-1] == W - 1:
+        out["flags"].append("carve_hits_terrain_edge")
+    lat_rows = tr.f + (r0 + rr + 0.5) * tr.e
+    ncell_row = m[rr].sum(axis=1)
+    out.update(
+        carved_cells=int(m.sum()),
+        carved_km2=float(np.sum(ncell_row * (res * 111.32) ** 2
+                                * np.cos(np.radians(lat_rows)))),
+        cw=tr.c + (c0 + cc[0]) * tr.a, ce=tr.c + (c0 + cc[-1] + 1) * tr.a,
+        cn=tr.f + (r0 + rr[0]) * tr.e, cs=tr.f + (r0 + rr[-1] + 1) * tr.e)
+    if has_outline:                  # QA: share of the catchment inside the outline box
+        rlat = tr.f + (r0 + np.arange(H) + 0.5) * tr.e
+        clon = tr.c + (c0 + np.arange(W) + 0.5) * tr.a
+        rin = (rlat >= site["os"]) & (rlat <= site["on"])
+        cin = (clon >= site["ow"]) & (clon <= site["oe"])
+        out["carve_in_outline"] = float(m[np.ix_(rin, cin)].sum()) / max(int(m.sum()), 1)
+    if _has_poly(site):
+        # share of the catchment inside the gauge's own basin POLYGON: a
+        # neighbouring creek inside the outline's box fails this
+        import shapely
+        from rasterio.features import rasterize
+        from rasterio.transform import Affine
+        sub = m[rr[0]:rr[-1] + 1, cc[0]:cc[-1] + 1]
+        str_ = Affine(tr.a, 0, tr.c + (c0 + cc[0]) * tr.a, 0, tr.e, tr.f + (r0 + rr[0]) * tr.e)
+        poly = rasterize([(shapely.from_wkb(site["poly_wkb"]), 1)], out_shape=sub.shape,
+                         transform=str_, fill=0, dtype="uint8").astype(bool)
+        out["carve_in_poly"] = float((sub & poly).sum()) / max(int(sub.sum()), 1)
+    return out
+
+
+def _has_poly(site: dict) -> bool:
+    pw = site.get("poly_wkb")
+    return isinstance(pw, (bytes, bytearray)) and len(pw) > 0
+
+
+def _wrong_basin(r: dict, area: float) -> bool:
+    """The assembly's snap_mismatch verdict on a finished carve (a terminal
+    flag - over_cap, no_terrain, error - is not a wrong basin)."""
+    if {"over_cap", "no_terrain", "error"} & set(r["flags"]) or "carved_km2" not in r:
+        return False
+    cip = r.get("carve_in_poly", np.nan)
+    return bool(cip < MIN_IN_POLY) or abs(r["carved_km2"] / area - 1.0) > SNAP_TOL
+
+
 def process(site: dict) -> dict:
     """Snap + carve one outlet; never raises (errors become flags)."""
     t0 = time.time()
     out = {"id": site["id"], "kind": site["kind"], "flags": [], "secs": 0.0}
     try:
-        dsd, dsa = _ds()
-        res = dsa.transform.a
         has_outline = site.get("ow") is not None and np.isfinite(site["ow"])
         within = ((site["ow"] - SNAP_PAD_DEG, site["os"] - SNAP_PAD_DEG,
                    site["oe"] + SNAP_PAD_DEG, site["on"] + SNAP_PAD_DEG)
                   if has_outline else None)
         sn = _snap(site["lat"], site["lon"], site["area"], within)
-        if isinstance(sn, str):
-            out["flags"].append(sn)                  # no_terrain | snap_mismatch
+        if sn == "no_terrain":
+            out["flags"].append(sn)
             return out
-        gr, gc, acc_cells = sn
-        tr = dsa.transform
-        slat = tr.f + (gr + 0.5) * tr.e
-        slon = tr.c + (gc + 0.5) * tr.a
-        from hf_data.basinextent import cell_km2
-        out.update(snap_lat=slat, snap_lon=slon, snap_row=int(gr), snap_col=int(gc),
-                   snap_area_km2=max(acc_cells, 1.0) * float(cell_km2(slat, res)))
-        # over the cap before any carve: the raster holds every carved cell,
-        # and it holds the outline's extent
-        if acc_cells > CAP_CELLS or (has_outline and _lattice_cells(
-                site["ow"] - MARGIN_DEG, site["os"] - MARGIN_DEG,
-                site["oe"] + MARGIN_DEG, site["on"] + MARGIN_DEG, res) > CAP_CELLS):
-            out["flags"].append("over_cap")
+        got = None if isinstance(sn, str) else {**_carve_site(site, *sn), "snap_rule": "nearest"}
+        if _has_poly(site) and (got is None or _wrong_basin(got, site["area"])):
+            alt = _poly_snap(site)
+            if alt is not None and (got is None or alt[:2] != sn[:2]):
+                alt_got = _carve_site(site, *alt[:3])
+                # kept when it passes, or when the nearest rule found no cell
+                if got is None or not _wrong_basin(alt_got, site["area"]):
+                    got = {**alt_got, "snap_rule": "poly", "poly_iou": alt[3]}
+        if got is None:
+            out["flags"].append("snap_mismatch")
             return out
-        if has_outline:
-            w, s, e, n = site["ow"], site["os"], site["oe"], site["on"]
-        else:                            # first window <= ~5x5 deg; it grows as needed
-            rad = min(2.5, max(0.3, 1.2 * math.sqrt(max(site["area"], 1.0)) / 111.0))
-            w, s, e, n = slon - rad, slat - rad, slon + rad, slat + rad
-        w, s, e, n = (min(w, slon) - WIN_PAD_DEG, min(s, slat) - WIN_PAD_DEG,
-                      max(e, slon) + WIN_PAD_DEG, max(n, slat) + WIN_PAD_DEG)
-        while True:
-            cv = _carve(gr, gc, w, s, e, n)
-            if cv is None:
-                out["flags"].append("no_terrain")
-                return out
-            r0, c0, H, W, m = cv
-            rr = np.nonzero(m.any(axis=1))[0]
-            cc = np.nonzero(m.any(axis=0))[0]
-            hit = {"n": rr[0] == 0 and r0 > 0, "s": rr[-1] == H - 1 and r0 + H < dsd.height,
-                   "w": cc[0] == 0 and c0 > 0, "e": cc[-1] == W - 1 and c0 + W < dsd.width}
-            if not any(hit.values()):
-                break
-            # the catchment found so far only grows: once ITS box (+ margin)
-            # is over the cap, so is the final extent - judged on the carve,
-            # not on the read window (which would flag elongated basins)
-            if (rr[-1] - rr[0] + 1 + 2 * MARGIN_DEG / res) * \
-                    (cc[-1] - cc[0] + 1 + 2 * MARGIN_DEG / res) > CAP_CELLS:
-                out["flags"].append("over_cap")
-                return out
-            # grow only the sides the catchment reaches
-            w2 = w - GROW_DEG * hit["w"]
-            s2 = s - GROW_DEG * hit["s"]
-            e2 = e + GROW_DEG * hit["e"]
-            n2 = n + GROW_DEG * hit["n"]
-            if _lattice_cells(w2, s2, e2, n2, res) > MAX_WIN_CELLS:
-                out["flags"].append("error")         # memory guard, not a cap verdict
-                out["error"] = "read window over MAX_WIN_CELLS"
-                return out
-            w, s, e, n = w2, s2, e2, n2
-        if rr[0] == 0 or cc[0] == 0 or rr[-1] == H - 1 or cc[-1] == W - 1:
-            out["flags"].append("carve_hits_terrain_edge")
-        lat_rows = tr.f + (r0 + rr + 0.5) * tr.e
-        ncell_row = m[rr].sum(axis=1)
-        out.update(
-            carved_cells=int(m.sum()),
-            carved_km2=float(np.sum(ncell_row * (res * 111.32) ** 2
-                                    * np.cos(np.radians(lat_rows)))),
-            cw=tr.c + (c0 + cc[0]) * tr.a, ce=tr.c + (c0 + cc[-1] + 1) * tr.a,
-            cn=tr.f + (r0 + rr[0]) * tr.e, cs=tr.f + (r0 + rr[-1] + 1) * tr.e)
-        if has_outline:                  # QA: share of the catchment inside the outline box
-            rlat = tr.f + (r0 + np.arange(H) + 0.5) * tr.e
-            clon = tr.c + (c0 + np.arange(W) + 0.5) * tr.a
-            rin = (rlat >= site["os"]) & (rlat <= site["on"])
-            cin = (clon >= site["ow"]) & (clon <= site["oe"])
-            out["carve_in_outline"] = float(m[np.ix_(rin, cin)].sum()) / max(int(m.sum()), 1)
-        pw = site.get("poly_wkb")
-        if isinstance(pw, (bytes, bytearray)) and len(pw):
-            # share of the catchment inside the gauge's own basin POLYGON: a
-            # neighbouring creek inside the outline's box fails this
-            import shapely
-            from rasterio.features import rasterize
-            from rasterio.transform import Affine
-            sub = m[rr[0]:rr[-1] + 1, cc[0]:cc[-1] + 1]
-            str_ = Affine(tr.a, 0, tr.c + (c0 + cc[0]) * tr.a, 0, tr.e, tr.f + (r0 + rr[0]) * tr.e)
-            poly = rasterize([(shapely.from_wkb(pw), 1)], out_shape=sub.shape,
-                             transform=str_, fill=0, dtype="uint8").astype(bool)
-            out["carve_in_poly"] = float((sub & poly).sum()) / max(int(sub.sum()), 1)
+        out["flags"] += got.pop("flags")
+        out.update(got)
     except MemoryError:
         out["flags"].append("error")
         out["error"] = "MemoryError"
@@ -519,7 +636,7 @@ def main() -> int:
     keep = ["kind", "status", "source", "flags", "lat", "lon", "area", "snap_lat", "snap_lon",
             "snap_area_km2", "carved_cells", "carved_km2", "w", "s", "e", "n", "cells",
             "cw", "cs", "ce", "cn", "ow", "os", "oe", "on", "outline_km2", "carve_in_outline",
-            "carve_in_poly",
+            "carve_in_poly", "snap_rule", "poly_iou",
             "hybas_id", "hybas_ratio", "secs", "error"]
     T = T[[c for c in keep if c in T.columns]].reset_index()
     for c in ("carved_cells", "cells", "hybas_id"):
