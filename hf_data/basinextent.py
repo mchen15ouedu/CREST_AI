@@ -121,12 +121,14 @@ def ef5_extent(g) -> dict:
             "source": str(r["source"]), "cells": int(r["cells"]),
             "carved_km2": float(r["carved_km2"]),
             "flags": [f for f in str(r.get("flags") or "").split(",") if f],
+            "snap_rule": str(r.get("snap_rule") or "nearest"),
             "table": table_version()}
 
 
 def provenance(ext: dict) -> dict:
     """Small record stamp: which outline a result was simulated on."""
     return {"extent": "basin", "source": ext["source"], "table": ext["table"],
+            "snap_rule": ext.get("snap_rule", "nearest"),
             "bounds": [round(v, 6) for v in ext["bounds"]]}
 
 
