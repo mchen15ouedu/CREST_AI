@@ -300,6 +300,8 @@ def lattice_out(w, s, e, n, tr):
 
 
 def _git_sha() -> str:
+    if os.environ.get("BUILDER_SHA"):        # a bundle copied to an HPC/VM has no .git
+        return os.environ["BUILDER_SHA"]
     try:
         return subprocess.check_output(["git", "-C", ROOT, "rev-parse", "HEAD"],
                                        text=True).strip()
