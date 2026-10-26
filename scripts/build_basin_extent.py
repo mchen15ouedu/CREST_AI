@@ -65,6 +65,7 @@ OUTLINE_TOL = 0.20           # HydroBASINS UP_AREA vs the point's own area
 SNAP_TOL = 0.20              # carved area vs reference area -> snap_mismatch
 SNAP_PAD_DEG = 0.02          # the snap stays inside the outline (+ ~2 km)
 MIN_IN_OUTLINE = 0.80        # carve share inside the outline box, else not this basin
+MIN_IN_POLY = 0.70           # carve share inside the GAGES-II polygon (two DEMs differ)
 WIN_PAD_DEG = 0.30           # first read window around the outline / point
 GROW_DEG = 1.0               # grow the window while the carve touches its edge
 MAX_WIN_CELLS = 72_000_000   # stop growing: the catchment is over the cap anyway
@@ -91,10 +92,15 @@ def gages_outlines(pattern: str) -> pd.DataFrame:
         P = P.dissolve(by="GAGE_ID", as_index=False)
     P["geometry"] = shapely.make_valid(P.geometry.values)
     km2 = P.geometry.area / 1e6                      # equal-area projection
-    b = P.to_crs(4326).geometry.bounds
+    ll = P.to_crs(4326).geometry
+    b = ll.bounds
+    # the polygon itself (~50 m simplified) for the carve-inside-basin check:
+    # a box test passes a wrong creek inside the box but outside the basin
+    wkb = shapely.to_wkb(shapely.make_valid(ll.simplify(0.0005).values))
     return pd.DataFrame({"id": P.GAGE_ID.values, "outline_km2": km2.values,
                          "ow": b.minx.values, "os": b.miny.values,
-                         "oe": b.maxx.values, "on": b.maxy.values}).set_index("id")
+                         "oe": b.maxx.values, "on": b.maxy.values,
+                         "poly_wkb": wkb}).set_index("id")
 
 
 def hybas_outlines(shp: str, vp: pd.DataFrame) -> pd.DataFrame:
@@ -238,8 +244,8 @@ def process(site: dict) -> dict:
             return out
         if has_outline:
             w, s, e, n = site["ow"], site["os"], site["oe"], site["on"]
-        else:
-            rad = max(0.3, 1.2 * math.sqrt(max(site["area"], 1.0)) / 111.0)
+        else:                            # first window <= ~5x5 deg; it grows as needed
+            rad = min(2.5, max(0.3, 1.2 * math.sqrt(max(site["area"], 1.0)) / 111.0))
             w, s, e, n = slon - rad, slat - rad, slon + rad, slat + rad
         w, s, e, n = (min(w, slon) - WIN_PAD_DEG, min(s, slat) - WIN_PAD_DEG,
                       max(e, slon) + WIN_PAD_DEG, max(n, slat) + WIN_PAD_DEG)
@@ -255,13 +261,21 @@ def process(site: dict) -> dict:
                    "w": cc[0] == 0 and c0 > 0, "e": cc[-1] == W - 1 and c0 + W < dsd.width}
             if not any(hit.values()):
                 break
-            # grow only the sides the catchment reaches; check the size first
+            # the catchment found so far only grows: once ITS box (+ margin)
+            # is over the cap, so is the final extent - judged on the carve,
+            # not on the read window (which would flag elongated basins)
+            if (rr[-1] - rr[0] + 1 + 2 * MARGIN_DEG / res) * \
+                    (cc[-1] - cc[0] + 1 + 2 * MARGIN_DEG / res) > CAP_CELLS:
+                out["flags"].append("over_cap")
+                return out
+            # grow only the sides the catchment reaches
             w2 = w - GROW_DEG * hit["w"]
             s2 = s - GROW_DEG * hit["s"]
             e2 = e + GROW_DEG * hit["e"]
             n2 = n + GROW_DEG * hit["n"]
             if _lattice_cells(w2, s2, e2, n2, res) > MAX_WIN_CELLS:
-                out["flags"].append("over_cap")
+                out["flags"].append("error")         # memory guard, not a cap verdict
+                out["error"] = "read window over MAX_WIN_CELLS"
                 return out
             w, s, e, n = w2, s2, e2, n2
         if rr[0] == 0 or cc[0] == 0 or rr[-1] == H - 1 or cc[-1] == W - 1:
@@ -280,6 +294,18 @@ def process(site: dict) -> dict:
             rin = (rlat >= site["os"]) & (rlat <= site["on"])
             cin = (clon >= site["ow"]) & (clon <= site["oe"])
             out["carve_in_outline"] = float(m[np.ix_(rin, cin)].sum()) / max(int(m.sum()), 1)
+        pw = site.get("poly_wkb")
+        if isinstance(pw, (bytes, bytearray)) and len(pw):
+            # share of the catchment inside the gauge's own basin POLYGON: a
+            # neighbouring creek inside the outline's box fails this
+            import shapely
+            from rasterio.features import rasterize
+            from rasterio.transform import Affine
+            sub = m[rr[0]:rr[-1] + 1, cc[0]:cc[-1] + 1]
+            str_ = Affine(tr.a, 0, tr.c + (c0 + cc[0]) * tr.a, 0, tr.e, tr.f + (r0 + rr[0]) * tr.e)
+            poly = rasterize([(shapely.from_wkb(pw), 1)], out_shape=sub.shape,
+                             transform=str_, fill=0, dtype="uint8").astype(bool)
+            out["carve_in_poly"] = float((sub & poly).sum()) / max(int(sub.sum()), 1)
     except MemoryError:
         out["flags"].append("error")
         out["error"] = "MemoryError"
@@ -369,8 +395,9 @@ def main() -> int:
             sites.append({"id": r.STAID, "kind": "g", "lat": float(r.LAT_GAGE),
                           "lon": float(r.LNG_GAGE), "area": float(r.DRAIN_SQKM),
                           "outline_src": "gages2" if o is not None else "none",
-                          **({k: float(o[k]) for k in ("ow", "os", "oe", "on", "outline_km2")}
-                             if o is not None else {})})
+                          **({**{k: float(o[k]) for k in ("ow", "os", "oe", "on",
+                                                           "outline_km2")},
+                              "poly_wkb": o["poly_wkb"]} if o is not None else {})})
         for r in vp.itertuples():
             site = {"id": r.vp, "kind": "v", "lat": float(r.lat), "lon": float(r.lon),
                     "area": float(r.area_km2), "hybas_id": int(r.hybas_id),
@@ -421,13 +448,20 @@ def main() -> int:
 
     res = []
     if args.workers > 1:
-        from multiprocessing import Pool
-        with Pool(args.workers, initializer=_init_worker,
-                  initargs=(dir_cog, acc_cog)) as pool:
-            for i, r in enumerate(pool.imap_unordered(process, sites, chunksize=1), 1):
-                res.append(r)
-                if i % 200 == 0 or i == len(sites):
-                    print(f"  {i}/{len(sites)} ({time.time() - t0:.0f}s)", flush=True)
+        # a worker killed by the OOM killer / a memory cap breaks the pool
+        # loudly here (multiprocessing.Pool would wait for it forever)
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures.process import BrokenProcessPool
+        try:
+            with ProcessPoolExecutor(args.workers, initializer=_init_worker,
+                                     initargs=(dir_cog, acc_cog)) as pool:
+                futs = [pool.submit(process, s) for s in sites]
+                for i, fu in enumerate(as_completed(futs), 1):
+                    res.append(fu.result())
+                    if i % 200 == 0 or i == len(sites):
+                        print(f"  {i}/{len(sites)} ({time.time() - t0:.0f}s)", flush=True)
+        except BrokenProcessPool as e:
+            sys.exit(f"a worker died ({e}) - likely out of memory; rerun with fewer --workers")
         # a worker that ran out of memory beside others gets one serial retry
         retry = {r["id"] for r in res if r.get("error") == "MemoryError"}
         if retry:
@@ -465,9 +499,13 @@ def main() -> int:
         if np.isfinite(getattr(r, "carved_km2", np.nan)) and np.isfinite(ref) \
                 and abs(r.carved_km2 / ref - 1.0) > SNAP_TOL:
             flags.append("snap_mismatch")            # the carve is not this basin
+        # it lies outside the outlet's own basin: the polygon for gauges, the
+        # outline box for pour points (their HydroBASINS union is not carried)
+        cip = getattr(r, "carve_in_poly", np.nan)
         cio = getattr(r, "carve_in_outline", np.nan)
-        if cio == cio and cio < MIN_IN_OUTLINE and "snap_mismatch" not in flags:
-            flags.append("snap_mismatch")            # it lies outside the outline
+        outside = (cip < MIN_IN_POLY) if cip == cip else (cio == cio and cio < MIN_IN_OUTLINE)
+        if outside and "snap_mismatch" not in flags:
+            flags.append("snap_mismatch")
         ext.append((lw, ls, le, ln, nr * nc, None, flags))
     E = pd.DataFrame(ext, index=T.index,
                      columns=["w", "s", "e", "n", "cells", "_", "flags"]).drop(columns="_")
@@ -481,6 +519,7 @@ def main() -> int:
     keep = ["kind", "status", "source", "flags", "lat", "lon", "area", "snap_lat", "snap_lon",
             "snap_area_km2", "carved_cells", "carved_km2", "w", "s", "e", "n", "cells",
             "cw", "cs", "ce", "cn", "ow", "os", "oe", "on", "outline_km2", "carve_in_outline",
+            "carve_in_poly",
             "hybas_id", "hybas_ratio", "secs", "error"]
     T = T[[c for c in keep if c in T.columns]].reset_index()
     for c in ("carved_cells", "cells", "hybas_id"):

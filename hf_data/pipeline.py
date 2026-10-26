@@ -225,14 +225,20 @@ def plan_cut_set(gauge_id: str, t_start: datetime, t_end: datetime,
     gs = {**g, "lat": sn["lat"], "lon": sn["lon"], "area": sn["area"]}
     f0 = t_start - timedelta(days=warmup_days)
     keep = []
-    for b_ in neighbors.upstream_gauges(gs, bbox, basic_dir):
+    bc = neighbors.upstream_gauges(gs, bbox, basic_dir)
+    for b_ in bc:
         try:
             s = obs.get_series(b_["id"], f0, t_end)
         except Exception:
             s = []
         if s and _obs_coverage(s, f0, t_end) >= BC_MIN_COVER:
             keep.append(b_["id"])
-    return keep
+    if keep:              # a set the speed domain cannot be built from -> full basin
+        from hf_data import domain as _domain
+        if not _domain.build_speed_domain(gs, [b_ for b_ in bc if b_["id"] in keep],
+                                          basic_dir):
+            return []
+    return sorted(keep)
 
 # one EF5 run per (gauge, model) at a time: concurrent runs of the SAME gauge
 # would race on the shared state dir + result-cache JSON. A second request
@@ -561,15 +567,24 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                                  "running the full basin")
                 speed = None
             if speed:
-                cut_ids = ", ".join(c["id"] for c in speed["cut"])
+                cut_str = ", ".join(c["id"] for c in speed["cut"])
                 yield ("status", f"⚡ speed run: domain cut at {len(speed['cut'])} "
-                                 f"boundary gauge(s) [{cut_ids}] — simulating "
+                                 f"boundary gauge(s) [{cut_str}] — simulating "
                                  f"{speed['kept_frac']:.0%} of the basin "
                                  f"(≈{speed['speedup']:.1f}× faster); observed flow "
                                  "is injected at the cut gauges")
             elif bc_gauges:
                 yield ("status", "⚡ speed run not possible here (no qualifying cut "
                                  "gauges) — running the full basin")
+    if cut_ids and scheme == "speed" and (
+            speed is None or {b_["id"] for b_ in bc_gauges} & set(cut_ids) != set(cut_ids)):
+        # a run-wide cut set (fleet chunks, nowcast Phase B) must be rebuilt
+        # exactly: falling back to the full basin would re-key the record
+        yield ("status", f"⚠️ the run's fixed cut set [{', '.join(cut_ids)}] could not "
+                         "be rebuilt in this window (upstream scan or domain build "
+                         "failed) — not simulated rather than switching domain")
+        yield ("done", {"returncode": -4, "cut_failed": True})
+        return
     # the cells EF5 simulates on its raster: the carved catchment, or the kept
     # part of a speed domain. Snow is decided over them (M2) and a saved state
     # is used only if it holds values on them (M4)
@@ -780,12 +795,13 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     load_t = pl.get("warmup_from") or (pl.get("load_state_time")
                                        if not pl["need_warmup"] else None)
     if load_t is not None and not use_mock:
-        # a state followed by a long warm-up may cover less of the basin: the
-        # warm-up spins the rest up (conusstate's partial-tier mosaics); one
-        # loaded as-is, or bridged by a short warm-up, must cover nearly all
+        # only a stitched fleet mosaic followed by a long warm-up may cover
+        # part of the basin (its partial tier: the warm-up spins the rest up);
+        # any other saved state - box-era ones included - must cover nearly all
         gap_d = (run_start - load_t).total_seconds() / 86400.0
         need = (runstates.PARTIAL_COVER if pl.get("warmup_from")
-                and gap_d >= runstates.PARTIAL_GAP_DAYS else runstates.MIN_COVER)
+                and gap_d >= runstates.PARTIAL_GAP_DAYS
+                and runstates.is_mosaic(sdir, load_t) else runstates.MIN_COVER)
         staged, cov = runstates.stage(sdir, rdir, load_t, nodes, nodes_tr, need)
         if not staged:
             if nowcast_t0 and warmup_days <= 0:

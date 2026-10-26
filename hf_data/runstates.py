@@ -9,10 +9,10 @@ leave part of the basin cold without a word.
 So EF5 never reads the shared per-gauge state folder directly. Before a run,
 stage() hard-links (or copies) into <workdir>/states only the grids of the
 time EF5 will load, and only when they sit on the run's lattice and hold
-valid values on enough of the run's EF5 nodes: MIN_COVER when the state is
-loaded as-is or bridged by a short warm-up, PARTIAL_COVER when a warm-up of
-at least PARTIAL_GAP_DAYS follows and spins the rest up (conusstate's
-partial-tier mosaics). After a successful run, commit() moves the states EF5
+valid values on enough of the run's EF5 nodes: MIN_COVER as a rule, and
+PARTIAL_COVER only for a conusstate mosaic (is_mosaic) followed by a warm-up
+of at least PARTIAL_GAP_DAYS that spins the rest up (its partial tier).
+After a successful run, commit() moves the states EF5
 wrote back to the shared folder - unless the run used custom parameters
 (calibration candidates, panel overrides): their trial-parameter warm-up
 states must never reach the shared cache. run_gauge removes the private
@@ -30,6 +30,22 @@ import numpy as np
 MIN_COVER = float(os.environ.get("CREST_MOSAIC_MIN_COVER", "0.90"))
 PARTIAL_COVER = float(os.environ.get("CREST_STATE_PARTIAL_COVER", "0.50"))
 PARTIAL_GAP_DAYS = float(os.environ.get("CREST_STATE_PARTIAL_GAP_DAYS", "30"))
+
+
+def is_mosaic(shared_dir: str, t) -> bool:
+    """True when the state set at t was stitched by conusstate.warm_state
+    (recorded in its .mosaic.json). Only those may cover part of the basin
+    (PARTIAL_COVER): any other saved state - e.g. one from an old outlet-
+    square run that clipped the headwaters - must cover nearly all of it."""
+    import json
+    stamp = t.strftime("%Y%m%d_%H%M")
+    try:
+        with open(os.path.join(shared_dir, ".mosaic.json")) as fh:
+            m = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return any(isinstance(v, dict) and v.get("at") == stamp
+               for k, v in m.items() if not k.startswith("_"))
 
 
 def _files_at(shared_dir: str, t) -> list[str]:
