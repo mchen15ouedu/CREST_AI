@@ -192,10 +192,13 @@ def cell_km2(lat, res: float):
 
 
 def snap_cell(acc: np.ndarray, tr, lat: float, lon: float, area_km2: float,
-              radius_km: float = SNAP_RADIUS_KM, tol: float = SNAP_TOL):
+              radius_km: float = SNAP_RADIUS_KM, tol: float = SNAP_TOL, within=None):
     """The outlet cell of a point with known drainage area (M1 snap rule):
     among the stream cells within radius_km whose FAM drainage area matches
     area_km2 within +-tol, the NEAREST one (ties: the better area match).
+    within=(w, s, e, n): only cells whose centre lies inside (the outlet's
+    own outline) - for small basins the 3-arc-second network may not resolve
+    the gauge's creek, and the nearest same-size cell is then another creek.
     None when no cell qualifies - the outlet is then not simulated, never
     pinned to a hillslope or to another river. acc: flow accumulation in
     cells (NaN = nodata) on the north-up grid with affine tr."""
@@ -209,6 +212,10 @@ def snap_cell(acc: np.ndarray, tr, lat: float, lon: float, area_km2: float,
     a_km2 = acc * cell_km2(lats, res)[:, None]
     ratio = a_km2 / area_km2
     ok = np.isfinite(ratio) & (np.abs(ratio - 1.0) <= tol)
+    if within is not None:
+        w, s, e, n = within
+        clon = tr.c + (np.arange(W) + 0.5) * tr.a
+        ok &= ((lats >= s) & (lats <= n))[:, None] & ((clon >= w) & (clon <= e))[None, :]
     if not ok.any():
         return None
     rr, cc = np.nonzero(ok)

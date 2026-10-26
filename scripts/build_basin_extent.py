@@ -63,6 +63,8 @@ MARGIN_DEG = 0.05            # ~5 km around the basin (raster edge never touches
 CAP_CELLS = 36_000_000       # largest raster the old 5x5 deg square could produce
 OUTLINE_TOL = 0.20           # HydroBASINS UP_AREA vs the point's own area
 SNAP_TOL = 0.20              # carved area vs reference area -> snap_mismatch
+SNAP_PAD_DEG = 0.02          # the snap stays inside the outline (+ ~2 km)
+MIN_IN_OUTLINE = 0.80        # carve share inside the outline box, else not this basin
 WIN_PAD_DEG = 0.30           # first read window around the outline / point
 GROW_DEG = 1.0               # grow the window while the carve touches its edge
 MAX_WIN_CELLS = 72_000_000   # stop growing: the catchment is over the cap anyway
@@ -156,7 +158,7 @@ def _window(ds, w, s, e, n):
     return r0, c0, r1 - r0, c1 - c0
 
 
-def _snap(lat, lon, area):
+def _snap(lat, lon, area, within=None):
     """basinextent.snap_cell (the M1 rule: nearest stream cell within 20 km
     whose drainage area matches within +-20%) on a window around the point.
     Returns (row, col, acc) in global indices, "no_terrain" (no HydroSHEDS
@@ -179,7 +181,7 @@ def _snap(lat, lon, area):
     acc[acc < 0] = np.nan
     if not np.isfinite(acc).any():
         return "no_terrain"
-    rc = snap_cell(acc, dsa.window_transform(win), lat, lon, area)
+    rc = snap_cell(acc, dsa.window_transform(win), lat, lon, area, within=within)
     if rc is None:
         return "snap_mismatch"
     return rc[0] + r0, rc[1] + c0, float(acc[rc])
@@ -212,7 +214,11 @@ def process(site: dict) -> dict:
     try:
         dsd, dsa = _ds()
         res = dsa.transform.a
-        sn = _snap(site["lat"], site["lon"], site["area"])
+        has_outline = site.get("ow") is not None and np.isfinite(site["ow"])
+        within = ((site["ow"] - SNAP_PAD_DEG, site["os"] - SNAP_PAD_DEG,
+                   site["oe"] + SNAP_PAD_DEG, site["on"] + SNAP_PAD_DEG)
+                  if has_outline else None)
+        sn = _snap(site["lat"], site["lon"], site["area"], within)
         if isinstance(sn, str):
             out["flags"].append(sn)                  # no_terrain | snap_mismatch
             return out
@@ -225,7 +231,6 @@ def process(site: dict) -> dict:
                    snap_area_km2=max(acc_cells, 1.0) * float(cell_km2(slat, res)))
         # over the cap before any carve: the raster holds every carved cell,
         # and it holds the outline's extent
-        has_outline = site.get("ow") is not None and np.isfinite(site["ow"])
         if acc_cells > CAP_CELLS or (has_outline and _lattice_cells(
                 site["ow"] - MARGIN_DEG, site["os"] - MARGIN_DEG,
                 site["oe"] + MARGIN_DEG, site["on"] + MARGIN_DEG, res) > CAP_CELLS):
@@ -460,6 +465,9 @@ def main() -> int:
         if np.isfinite(getattr(r, "carved_km2", np.nan)) and np.isfinite(ref) \
                 and abs(r.carved_km2 / ref - 1.0) > SNAP_TOL:
             flags.append("snap_mismatch")            # the carve is not this basin
+        cio = getattr(r, "carve_in_outline", np.nan)
+        if cio == cio and cio < MIN_IN_OUTLINE and "snap_mismatch" not in flags:
+            flags.append("snap_mismatch")            # it lies outside the outline
         ext.append((lw, ls, le, ln, nr * nc, None, flags))
     E = pd.DataFrame(ext, index=T.index,
                      columns=["w", "s", "e", "n", "cells", "_", "flags"]).drop(columns="_")

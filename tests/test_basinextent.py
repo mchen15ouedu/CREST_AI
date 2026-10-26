@@ -78,6 +78,9 @@ def test_snap_cell_picks_nearest_matching_stream_cell():
     assert snap_cell(acc, tr, lat, lon, area * 10) is None
     # the matching river exists but lies beyond the search radius
     assert snap_cell(acc, tr, lat, lon, area, radius_km=0.2) is None
+    # restricted to the outlet's own outline: the river column lies outside it
+    west_box = (-90.0, 41.0 - 50 * RES, -90.0 + 22 * RES, 41.0)
+    assert snap_cell(acc, tr, lat, lon, area, within=west_box) is None
     # a cell centre with its own FAM area snaps to itself (idempotent)
     s_lat, s_lon = 41.0 - 30.5 * RES, -90.0 + 25.5 * RES
     assert snap_cell(acc, tr, s_lat, s_lon, area) == (30, 25)
