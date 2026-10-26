@@ -144,31 +144,36 @@ def upstream_mask(fdir: np.ndarray, r: int, c: int) -> np.ndarray:
     the D8 set, e.g. -9999 nodata, drain nowhere). Vectorised BFS over a donor
     index - the same carve EF5 does from that outlet cell."""
     H, W = fdir.shape
-    rec = np.full(H * W, -1, dtype=np.int64)
-    rows, cols = np.indices((H, W))
-    for code, (dr, dc) in _D8.items():
-        m = fdir == code
-        rr, cc = rows[m] + dr, cols[m] + dc
-        ok = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W)
-        rec[(rows[m] * W + cols[m])[ok]] = rr[ok] * W + cc[ok]
-    del rows, cols
-    donors = np.nonzero(rec >= 0)[0]
+    n = H * W
+    it = np.int32 if n < 2 ** 31 - 1 else np.int64   # ~half the RAM of int64
+    rec = np.full(n, -1, dtype=it)
+    blk = max(1, (1 << 22) // max(W, 1))         # ~4M cells per block: bounded temps
+    for b0 in range(0, H, blk):
+        sub = fdir[b0:b0 + blk]
+        for code, (dr, dc) in _D8.items():
+            rr, cc = np.nonzero(sub == code)
+            rr += b0
+            rr2, cc2 = rr + dr, cc + dc
+            ok = (rr2 >= 0) & (rr2 < H) & (cc2 >= 0) & (cc2 < W)
+            rec[rr[ok] * W + cc[ok]] = (rr2[ok] * W + cc2[ok]).astype(it)
+    donors = np.nonzero(rec >= 0)[0].astype(it)
     donors = donors[np.argsort(rec[donors], kind="stable")]
-    recs = rec[donors]
+    counts = np.bincount(rec[donors], minlength=n)
     del rec
-    start = np.searchsorted(recs, np.arange(H * W), side="left")
-    end = np.searchsorted(recs, np.arange(H * W), side="right")
-    inb = np.zeros(H * W, dtype=bool)
-    fr = np.array([r * W + c])
+    start = np.zeros(n + 1, dtype=np.int64)     # donors of cell k: donors[start[k]:start[k+1]]
+    np.cumsum(counts, out=start[1:])
+    del counts
+    inb = np.zeros(n, dtype=bool)
+    fr = np.array([r * W + c], dtype=np.int64)
     inb[fr] = True
     while len(fr):
-        st, en = start[fr], end[fr]
+        st, en = start[fr], start[fr + 1]
         cnt = en - st
         tot = int(cnt.sum())
         if tot == 0:
             break
         idx = np.repeat(st, cnt) + (np.arange(tot) - np.repeat(np.cumsum(cnt) - cnt, cnt))
-        nx = donors[idx]
+        nx = donors[idx].astype(np.int64)
         nx = nx[~inb[nx]]
         inb[nx] = True
         fr = nx

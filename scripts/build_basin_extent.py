@@ -26,9 +26,18 @@ Outlets without terrain (AK/HI/PR, outside the HydroSHEDS NA tiles), without a
 matching stream cell (snap_mismatch) or above CAP_CELLS are flagged; the
 runtime skips them with the reason - never a box, never a hillslope cell.
 
-    python scripts/build_basin_extent.py [--workers 10] [--sample 50] [--ids a,b]
+Two stages, so the heavy one can run on an HPC / the Jetstream2 VM (the
+carve peaks at ~32 B per window cell, up to ~2.5 GB per worker; on the 32 GB
+laptop a 6-worker run froze the machine on 2026-10-23):
 
-Inputs default to the PI's laptop paths; see the argparse block.
+    # 1. outlines (light, needs the local GAGES-II / HydroBASINS shapefiles)
+    python scripts/build_basin_extent.py --sites-out sites.parquet
+    # 2. snap + carve + table (heavy; fetches the HydroSHEDS COGs from
+    #    CREST_data when --dir-cog/--acc-cog are not given)
+    python scripts/build_basin_extent.py --sites sites.parquet --workers 4
+
+One-step runs (no --sites/--sites-out) do both. --sample N / --ids a,b give a
+partial QA table that the runtime refuses to load.
 """
 from __future__ import annotations
 
@@ -56,7 +65,8 @@ OUTLINE_TOL = 0.20           # HydroBASINS UP_AREA vs the point's own area
 SNAP_TOL = 0.20              # carved area vs reference area -> snap_mismatch
 WIN_PAD_DEG = 0.30           # first read window around the outline / point
 GROW_DEG = 1.0               # grow the window while the carve touches its edge
-MAX_WIN_CELLS = 160_000_000  # stop growing: the catchment is over the cap anyway
+MAX_WIN_CELLS = 72_000_000   # stop growing: the catchment is over the cap anyway
+# (the carve peaks at ~32 B/cell, so one window stays under ~2.5 GB of RAM)
 GAGES_GLOB = "D:/usgs_gauge_boundaries/boundaries-shapefiles-by-aggeco/*.shp"
 HYBAS_SHP = r"E:/USGSproject/hybas_na_lev07_v1c.shp"
 DIR_COG = "E:/hydrosheds/cog/na_dir_3s.tif"
@@ -118,6 +128,14 @@ def hybas_outlines(shp: str, vp: pd.DataFrame) -> pd.DataFrame:
 # per-outlet carve (worker process)
 # --------------------------------------------------------------------------- #
 _DS = {}
+
+
+def _init_worker(dir_cog: str, acc_cog: str) -> None:
+    """Pool initializer: spawned workers (Windows) re-import this module, so
+    the COG paths travel explicitly."""
+    global DIR_COG, ACC_COG
+    DIR_COG, ACC_COG = dir_cog, acc_cog
+    _DS.clear()
 
 
 def _ds():
@@ -299,10 +317,18 @@ def _fingerprint(paths) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    ap.add_argument("--workers", type=int, default=4,
+                    help="parallel carves; each peaks at up to ~2.5 GB of RAM")
     ap.add_argument("--sample", type=int, default=0, help="random N outlets (QA run)")
     ap.add_argument("--ids", default="", help="comma list of outlet ids")
     ap.add_argument("--out", default=OUT)
+    ap.add_argument("--sites-out", default="",
+                    help="stage 1 only: write the outlet list + outlines here and stop")
+    ap.add_argument("--sites", default="",
+                    help="stage 2: read the outlet list written by --sites-out")
+    ap.add_argument("--dir-cog", default="", help="HydroSHEDS na_dir_3s.tif (default: "
+                    "the laptop copy, else CREST_data basic/)")
+    ap.add_argument("--acc-cog", default="", help="HydroSHEDS na_acc_3s.tif (likewise)")
     args = ap.parse_args()
 
     try:                       # OU network TLS inspection: use the OS trust store
@@ -313,38 +339,60 @@ def main() -> int:
     import rasterio
     from huggingface_hub import hf_hub_download
     t0 = time.time()
-    cat_p = hf_hub_download("vincewin/CREST_data", "gauges/gagesII_9322.parquet",
-                            repo_type="dataset")
-    vp_p = hf_hub_download("vincewin/CREST_data", "gauges/virtual_points.parquet",
-                           repo_type="dataset")
-    cat = pd.read_parquet(cat_p)
-    cat["STAID"] = cat.STAID.astype(str).str.zfill(8)
-    vp = pd.read_parquet(vp_p)
-    G = gages_outlines(GAGES_GLOB)
-    V = hybas_outlines(HYBAS_SHP, vp)
-    print(f"outlines: {len(G)} GAGES-II, {len(V)} HydroBASINS ({time.time() - t0:.0f}s)",
-          flush=True)
+    if args.sites:
+        sites = pd.read_parquet(args.sites).to_dict("records")
+        src_files = [args.sites]
+        print(f"{len(sites)} outlets from {args.sites}", flush=True)
+    else:
+        cat_p = hf_hub_download("vincewin/CREST_data", "gauges/gagesII_9322.parquet",
+                                repo_type="dataset")
+        vp_p = hf_hub_download("vincewin/CREST_data", "gauges/virtual_points.parquet",
+                               repo_type="dataset")
+        cat = pd.read_parquet(cat_p)
+        cat["STAID"] = cat.STAID.astype(str).str.zfill(8)
+        vp = pd.read_parquet(vp_p)
+        G = gages_outlines(GAGES_GLOB)
+        V = hybas_outlines(HYBAS_SHP, vp)
+        print(f"outlines: {len(G)} GAGES-II, {len(V)} HydroBASINS ({time.time() - t0:.0f}s)",
+              flush=True)
 
-    sites = []
-    for r in cat.itertuples():
-        o = G.loc[r.STAID] if r.STAID in G.index else None
-        sites.append({"id": r.STAID, "kind": "g", "lat": float(r.LAT_GAGE),
-                      "lon": float(r.LNG_GAGE), "area": float(r.DRAIN_SQKM),
-                      "outline_src": "gages2" if o is not None else "none",
-                      **({k: float(o[k]) for k in ("ow", "os", "oe", "on", "outline_km2")}
-                         if o is not None else {})})
-    for r in vp.itertuples():
-        site = {"id": r.vp, "kind": "v", "lat": float(r.lat), "lon": float(r.lon),
-                "area": float(r.area_km2), "hybas_id": int(r.hybas_id),
-                "outline_src": "none"}
-        if r.vp in V.index:
-            o = V.loc[r.vp]
-            ratio = float(o.outline_km2) / max(float(r.area_km2), 1e-6)
-            site["hybas_ratio"] = ratio
-            if abs(ratio - 1.0) <= OUTLINE_TOL:
-                site.update(outline_src="hybas",
-                            **{k: float(o[k]) for k in ("ow", "os", "oe", "on", "outline_km2")})
-        sites.append(site)
+        sites = []
+        for r in cat.itertuples():
+            o = G.loc[r.STAID] if r.STAID in G.index else None
+            sites.append({"id": r.STAID, "kind": "g", "lat": float(r.LAT_GAGE),
+                          "lon": float(r.LNG_GAGE), "area": float(r.DRAIN_SQKM),
+                          "outline_src": "gages2" if o is not None else "none",
+                          **({k: float(o[k]) for k in ("ow", "os", "oe", "on", "outline_km2")}
+                             if o is not None else {})})
+        for r in vp.itertuples():
+            site = {"id": r.vp, "kind": "v", "lat": float(r.lat), "lon": float(r.lon),
+                    "area": float(r.area_km2), "hybas_id": int(r.hybas_id),
+                    "outline_src": "none"}
+            if r.vp in V.index:
+                o = V.loc[r.vp]
+                ratio = float(o.outline_km2) / max(float(r.area_km2), 1e-6)
+                site["hybas_ratio"] = ratio
+                if abs(ratio - 1.0) <= OUTLINE_TOL:
+                    site.update(outline_src="hybas",
+                                **{k: float(o[k]) for k in ("ow", "os", "oe", "on",
+                                                            "outline_km2")})
+            sites.append(site)
+        src_files = [cat_p, vp_p, HYBAS_SHP] + sorted(glob.glob(GAGES_GLOB))
+        if args.sites_out:
+            pd.DataFrame(sites).to_parquet(args.sites_out, index=False)
+            print(f"wrote {args.sites_out}: {len(sites)} outlets "
+                  f"({time.time() - t0:.0f}s)")
+            return 0
+
+    def _cog(given, local, name):
+        if given:
+            return given
+        if os.path.exists(local):
+            return local
+        return hf_hub_download("vincewin/CREST_data", f"basic/{name}", repo_type="dataset")
+    dir_cog = _cog(args.dir_cog, DIR_COG, "na_dir_3s.tif")
+    acc_cog = _cog(args.acc_cog, ACC_COG, "na_acc_3s.tif")
+    _init_worker(dir_cog, acc_cog)
     if args.ids:
         want = {s.strip() for s in args.ids.split(",")}
         sites = [s for s in sites if s["id"] in want]
@@ -367,7 +415,8 @@ def main() -> int:
     res = []
     if args.workers > 1:
         from multiprocessing import Pool
-        with Pool(args.workers) as pool:
+        with Pool(args.workers, initializer=_init_worker,
+                  initargs=(dir_cog, acc_cog)) as pool:
             for i, r in enumerate(pool.imap_unordered(process, sites, chunksize=1), 1):
                 res.append(r)
                 if i % 200 == 0 or i == len(sites):
@@ -385,7 +434,7 @@ def main() -> int:
     S = pd.DataFrame(sites).set_index("id")
     T = S.join(R.drop(columns=["kind"]), how="left")
 
-    with rasterio.open(DIR_COG) as ds:
+    with rasterio.open(dir_cog) as ds:
         tr = ds.transform
     ext = []
     for r in T.itertuples():
@@ -434,8 +483,7 @@ def main() -> int:
     body = T.to_csv(index=False).encode()
     meta = {"table_version": f"{built}-{hashlib.sha1(body).hexdigest()[:10]}",
             "built": built, "builder_sha": _git_sha(),
-            "inputs": _fingerprint([cat_p, vp_p, HYBAS_SHP, DIR_COG, ACC_COG]
-                                   + sorted(glob.glob(GAGES_GLOB))),
+            "inputs": _fingerprint(src_files + [dir_cog, acc_cog]),
             "margin_deg": MARGIN_DEG, "cap_cells": CAP_CELLS,
             "outline_tol": OUTLINE_TOL, "snap_tol": SNAP_TOL,
             "lattice": [tr.c, tr.f, tr.a], "partial": bool(args.sample or args.ids)}
