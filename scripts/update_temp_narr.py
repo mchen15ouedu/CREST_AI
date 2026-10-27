@@ -43,7 +43,7 @@ import truststore
 truststore.inject_into_ssl()
 import urllib.request
 
-from hf_data.forcing import TEMP_GRID, VARS, _write_pqf  # noqa: E402
+from hf_data.forcing import TEMP_GRID, VARS, _write_pqf, check_temp_units  # noqa: E402
 
 HF_REPO = "vincewin/CREST_data"
 PSL_URLS = ("https://psl.noaa.gov/thredds/fileServer/Datasets/NARR/monolevel/air.2m.{year}.nc",
@@ -249,6 +249,8 @@ def update_month(year: int, month: int, years: dict[int, NarrYear], api,
         v = hourly_field(years, t)
         if v is None:
             continue
+        # never upload a non-°C member (raises; the month is skipped, nothing committed)
+        check_temp_units(v, TEMP_GRID[5], t.strftime(cfg.out_fmt), convert=False)
         buf = os.path.join(tempfile.gettempdir(), "narr_member.pqf")
         _write_pqf(buf, v, xll, yll, cell, TEMP_GRID[5])
         new.append((t.strftime(cfg.out_fmt), open(buf, "rb").read()))

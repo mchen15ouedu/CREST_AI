@@ -60,6 +60,42 @@ VARS = {
 # geometry. (xll, yll, cellsize, nrows, ncols, nodata)
 TEMP_GRID = (-124.9375, 25.0625, 0.12473060344827586, 224, 464, -9999.0)
 
+# Temperature members must be °C (EF5 UNIT=C). Every upstream source ships
+# Kelvin (NLDAS/NARR/RTMA/HRRR 2-m TMP), and 76 NLDAS gap-fill hours of
+# 2023-07..2024-02 reached the store unconverted: SNOW17 read ~270 °C and
+# melted all SWE in one hour. A field whose valid-cell median is above
+# TEMP_K_MEDIAN is Kelvin; anything else outside plausible °C is garbage.
+TEMP_K_MEDIAN = 100.0
+K_OFFSET = 273.15
+
+
+class TempUnitsError(ValueError):
+    pass
+
+
+def check_temp_units(a: np.ndarray, nodata: float, name: str,
+                     convert: bool) -> tuple[np.ndarray, bool]:
+    """(°C grid, was_kelvin). A Kelvin grid is converted on valid cells only
+    (nodata stays nodata) when `convert`, else raises; a grid that is neither
+    plausible °C nor plausible K always raises — never run on it silently.
+    Writers call this with convert=False, readers with convert=True."""
+    valid = np.isfinite(a) & (a != nodata) & (a > -9000)
+    if not valid.any():
+        return a, False
+    v = a[valid]
+    med = float(np.median(v))
+    if med <= TEMP_K_MEDIAN:
+        if v.min() < -90 or v.max() > 70:
+            raise TempUnitsError(f"temperature {name}: values {v.min():.1f}..{v.max():.1f} "
+                                 f"are not plausible °C")
+        return a, False
+    if not convert or not (200 <= med <= 340 and v.min() > 150):
+        raise TempUnitsError(f"temperature {name}: median {med:.1f} — stored in "
+                             f"Kelvin (or corrupt), expected °C")
+    out = a.copy()
+    out[valid] = (v.astype("float64") - K_OFFSET).astype(a.dtype)
+    return out, True
+
 
 def clip_window(bbox, xll, yll, cell, nr, nc):
     """Row/col window of bbox on a grid — the SAME arithmetic as _clip, so a
@@ -139,6 +175,8 @@ class ForcingResult:
     reused: int = 0                 # timesteps already in the store (merged, not redone)
     missing: list[str] = field(default_factory=list)
     recent: int = 0                 # timesteps filled from the near-real-time store
+    converted: list[str] = field(default_factory=list)   # temp members stored in K
+    purged: int = 0                 # pre-guard Kelvin clips dropped from the store
     control_block: str = ""
 
 
@@ -163,6 +201,32 @@ def store_dir(var: str, bbox) -> str:
     return d
 
 
+TEMP_STORE_MARK = ".temp_units_ok_v1"
+
+
+def _purge_kelvin_clips(out_dir: str) -> int:
+    """Once per store: drop clipped temp files written before the units guard
+    existed — the merge below reuses stored timesteps as-is, so a Kelvin clip
+    would otherwise outlive the archive repair (persistent caches, e.g. the
+    Jetstream2 VM). Dropped hours are re-clipped from the tar."""
+    mark = os.path.join(out_dir, TEMP_STORE_MARK)
+    if os.path.exists(mark):
+        return 0
+    n = 0
+    for f in os.listdir(out_dir):
+        if not f.endswith(".pqf"):
+            continue
+        p = os.path.join(out_dir, f)
+        with open(p, "rb") as fh:
+            a, _, _, _, nod = _read_pqf(fh.read())
+        v = a[np.isfinite(a) & (a != nod) & (a > -9000)]
+        if v.size and float(np.median(v)) > TEMP_K_MEDIAN:
+            os.remove(p)
+            n += 1
+    open(mark, "w").close()
+    return n
+
+
 def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir: str,
                     repo: str = HF_REPO, cache_dir: str | None = None,
                     cancel=None) -> ForcingResult:
@@ -171,6 +235,8 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
     cfg = VARS[var]
     os.makedirs(out_dir, exist_ok=True)
     res = ForcingResult(var=var, out_dir=out_dir)
+    if var == "temp":
+        res.purged = _purge_kelvin_clips(out_dir)
 
     # temporal merge: timesteps already present in out_dir are reused as-is;
     # only the missing ones are fetched + clipped
@@ -221,12 +287,16 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
                     missing_ts.append(t)
                     continue
                 a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())
+                out_name = t.strftime(cfg.out_fmt)
+                if var == "temp":              # judged on the full grid, before clipping
+                    a, was_k = check_temp_units(a, nod, member, convert=True)
+                    if was_k:
+                        res.converted.append(out_name)
                 clip = _clip(a, xll, yll, cell, nod, bbox)
                 if clip is None:
                     missing_ts.append(t)
                     continue
                 sub, nxll, nyll = clip
-                out_name = t.strftime(cfg.out_fmt)
                 _write_pqf(os.path.join(out_dir, out_name), sub, nxll, nyll, cell, nod)
                 res.written.append(out_name)
 

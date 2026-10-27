@@ -1027,6 +1027,10 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             yield ("status", "❄ preparing temperature forcing (snow module)…")
             tr = forcing.prepare_forcing("temp", bbox, f0, force_end, temp_dir,
                                          cancel=cancel)
+            if tr.converted:
+                yield ("status", f"⚠️ {len(tr.converted)} temperature hour(s) were "
+                                 f"stored in Kelvin — converted to °C for this run "
+                                 f"(first: {tr.converted[0]})")
             if tr.missing:
                 # NARR lags weeks and its 2026 file has no August (PSL rewrite
                 # 2026-10-07): say so instead of letting SNOW17 run blind
