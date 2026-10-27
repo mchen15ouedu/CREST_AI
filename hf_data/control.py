@@ -77,6 +77,8 @@ class ControlSpec:
     # to the spec-level (outlet) scalars. EF5 applies each gauge's block to its
     # own sub-basin partition, so upstream areas keep their own calibration.
     per_gauge: dict | None = None
+    # --- lake module (PI 2026-10-27; hf_data/lakes.py) ---
+    lakes_csv: str | None = None                     # [Basin] LAKES_CSV= + LAKEMODULE=true
 
 
 def _param_block(header: str, gauges, scalar_keys, scalars, grids: dict | None,
@@ -138,7 +140,9 @@ def build_control(spec: ControlSpec) -> str:
         return s + "\n"
 
     gauges_sec = "".join(_gauge_sec(g) for g in spec.gauges)
-    basin_sec = "[Basin 0]\n" + "".join(f"GAUGE={g.id}\n" for g in spec.gauges) + "\n"
+    basin_sec = ("[Basin 0]\n" + "".join(f"GAUGE={g.id}\n" for g in spec.gauges)
+                 + (f"LAKES_CSV={os.path.abspath(spec.lakes_csv)}\n" if spec.lakes_csv else "")
+                 + "\n")
 
     # param grids: split the {..._grid} map into crest vs kw sets
     crest_grids = {k: v for k, v in (spec.param_grids or {}).items()
@@ -170,6 +174,8 @@ def build_control(spec: ControlSpec) -> str:
               f"ROUTING_PARAM_Set=KWParam\nTIMESTEP={spec.timestep}\n")
         if spec.da_file:               # assimilate upstream-gauge observations
             b += f"DA_FILE={os.path.abspath(spec.da_file)}\n"
+        if spec.lakes_csv:             # lakes/reservoirs in the KW router
+            b += "LAKEMODULE=true\n"
         if grids:
             toks = grids if isinstance(grids, str) else "streamflow"
             b += f"output_grids={toks}\n"             # pipe-separated GriddedOutputText tokens

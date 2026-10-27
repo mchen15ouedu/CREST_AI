@@ -50,8 +50,11 @@ def is_mosaic(shared_dir: str, t) -> bool:
 
 def _files_at(shared_dir: str, t) -> list[str]:
     stamp = t.strftime("%Y%m%d_%H%M")
+    # lake_set_<stamp>.json: the lake set the lake grids belong to (lakes.py);
+    # lake_relationships_*.txt is never staged - EF5 rebuilds it per lake set
     return sorted(glob.glob(os.path.join(shared_dir, f"*_{stamp}.tif"))
-                  + glob.glob(os.path.join(shared_dir, f"gauge_relationships_{stamp}.txt")))
+                  + glob.glob(os.path.join(shared_dir, f"gauge_relationships_{stamp}.txt"))
+                  + glob.glob(os.path.join(shared_dir, f"lake_set_{stamp}.json")))
 
 
 def coverage(state_path: str, nodes: np.ndarray, tr) -> float:
@@ -100,9 +103,10 @@ def stage(shared_dir: str, run_dir: str, t, nodes: np.ndarray, tr,
     files = _files_at(shared_dir, t)
     # coverage is judged on the water-balance/routing grids: snow17 grids are
     # filled only from pre-runs that had snow at that time, and a run with
-    # snow off never reads them
+    # snow off never reads them; lake grids hold values at lake cells only
+    # (lakes.prepare_states decides per lake)
     grids = [f for f in files if f.endswith(".tif")
-             and not os.path.basename(f).startswith("snow17_")]
+             and not os.path.basename(f).startswith(("snow17_", "lake_"))]
     if not grids:
         return False, 0.0
     try:

@@ -23,7 +23,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from hf_data import basic, forcing, gauges, multipliers, obs, params, paramstore, statecache
+from hf_data import (basic, forcing, gauges, lakes, multipliers, obs, params, paramstore,
+                     statecache)
 from hf_data import snow as _snow
 from hf_data.control import build_control, ControlSpec, Gauge
 from hf_data.runner import MockEF5, run_ef5, stream_run
@@ -743,11 +744,23 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     if overrides:                                     # advanced-panel overrides
         wb = {**wb, **{k: v for k, v in overrides.items() if k in wb}}
         kw = {**kw, **{k: v for k, v in overrides.items() if k in kw}}
+    # lake module (PI 2026-10-27, west first): the lakes, reservoirs and ponds
+    # whose outlet cell is one of this run's EF5 nodes (hf_data/lakes.py)
+    lake_set, lake_mult = None, (1.0, 1.0)
+    if not use_mock and lakes.enabled(g["lon"]):
+        lake_mult = lakes.multipliers(overrides, (stored or {}).get("lake"))
+        lake_set = lakes.for_run(nodes, nodes_tr, lake_mult)
+        if lake_set is None:
+            yield ("status", "⚠️ lake table unavailable — simulating without lakes/reservoirs")
+        elif len(lake_set):
+            yield ("status", f"🏞 lake module: {len(lake_set)} lake(s)/reservoir(s)/pond(s) "
+                             f"in the basin, {lake_set.th_volume_mm3.sum():,.1f} Mm³ of storage")
     yield ("params", {"wb": wb, "kw": kw, "model": ef5_model,
                       "cache_model": cache_model,      # frames-cache key (scheme-aware)
                       "state_model": state_model,      # EF5 state-grid key
                       "n_upstream": len(bc_gauges),    # 0 => headwater (no injection possible)
                       "cut_ids": cut_now,              # this run's speed cut set ([] = full)
+                      "lakes": lakes.provenance(lake_set, lake_mult),
                       "source": ("override" if overrides else
                                  stored.get("source", "stored") if stored else "a-priori")})
     pgrids = params.clip_param_grids(bbox, param_dir)
@@ -949,8 +962,19 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         # run-private folder; runstates.commit() moves non-custom states back
         state_dir=rdir, warmup_start=warmup_start, save_state_end=(not no_cache and not custom),   # never a custom run
         snow_on=snow_on, snow_scalars=snow_scalars, snow_grids=snow_grids, temp_dir=temp_dir,
-        temp_dem=temp_dem, da_file=da_file, per_gauge=per_gauge or None)
+        temp_dem=temp_dem, da_file=da_file, per_gauge=per_gauge or None,
+        lakes_csv=(lakes.write_csv(os.path.join(work, "lakes.csv"), lake_set)
+                   if lake_set is not None and len(lake_set) else None))
     build_control(spec)
+    if spec.lakes_csv:
+        # the storage EF5 starts each lake from: its saved storage when the
+        # state it loads was saved with this lake set, else its normal pool
+        # (EF5 alone would start every lake full)
+        li = lakes.prepare_states(rdir, warmup_start or run_start, lake_set,
+                                  os.path.join(grid_dir, "dem_clip.tif"), lake_mult)
+        if li["initial"]:
+            yield ("status", f"🏞 {li['initial']} lake(s) start at their normal pool"
+                             + (f", {li['kept']} from the saved state" if li["kept"] else ""))
 
     if cancel is not None and cancel.is_set():
         yield ("status", "⏹ stopped")
@@ -1078,6 +1102,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             # done event, which some callers stop reading at. Nowcast/event
             # runs never replace a state the hindcast chain already saved
             try:
+                if spec.lakes_csv:
+                    lakes.tag_states(rdir, lake_set, lake_mult)
                 runstates.commit(rdir, sdir, clobber=not nowcast_t0)
             except Exception as e:
                 from hf_data import crashlog

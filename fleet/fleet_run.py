@@ -214,6 +214,7 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
     t_start = time.time()
     last_status = ""
     rows_model = state_model = None
+    lakes_prov = None
     try:
         ext = basinextent.ef5_extent(gid)
         # M3: one cut set for the whole period, so no chunk re-keys the record
@@ -233,6 +234,7 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
             elif kind == "params":
                 rows_model = payload.get("cache_model") or rows_model
                 state_model = payload.get("state_model") or state_model
+                lakes_prov = payload.get("lakes") or lakes_prov
             elif kind == "done":
                 rc = payload.get("returncode")
         if rc != 0:
@@ -262,6 +264,7 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
         rec = json.load(open(rec_path))
         rec["extent"] = basinextent.provenance(ext)
         rec["cut_ids"] = cuts
+        rec["lakes"] = lakes_prov                      # lake set (None: lake module off)
         with open(rec_path, "w") as fh:
             json.dump(rec, fh)
     except (OSError, ValueError):
