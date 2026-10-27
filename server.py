@@ -917,6 +917,7 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0,
     poll /api/events for progress.
     t0: backdate the event window ("YYYY-MM-DDTHH:MM" UTC) — refill a flood
     the trigger pipeline missed; the window is [t0-backset, t0+horizon].
+    Explicit t0 values older than 24 hours are labeled retrospective.
     defer=1: enqueue for the GPU worker only (no CPU fallback) — the runner
     stays free and the result publishes whenever the worker gets to it.
     episode=<event id>: re-simulate an EXISTING listed episode under its own
@@ -956,12 +957,23 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0,
             return JSONResponse({"ok": False,
                                  "reason": "t0 must be YYYY-MM-DDTHH:MM (UTC)"},
                                 status_code=422)
+    trigger = None
+    if t0_dt is not None:
+        requested_at = _dt.datetime.now(_dt.timezone.utc)
+        if requested_at - t0_dt.replace(tzinfo=_dt.timezone.utc) > _dt.timedelta(hours=24):
+            trigger = {"retrospective": {
+                "label": "Retrospective reconstruction",
+                "requested_at": requested_at.isoformat().replace("+00:00", "Z"),
+                "reason": "Recovery of missed event dispatch",
+                "data_caveat": ("Realized historical USGS observations may be used; "
+                                "this is not the original operational forecast."),
+            }}
     import threading
     if episode and not gid:
         gid = episode.split("_", 1)[-1]          # ids are <YYYYMMDDHH>_<gid>
     if gid:
         threading.Thread(target=eventsim.run_one, args=(gid, t0_dt),
-                         kwargs={"defer": bool(defer),
+                         kwargs={"trigger": trigger, "defer": bool(defer),
                                  "episode_id": episode or None,
                                  "cold": bool(cold and episode)},
                          daemon=True).start()

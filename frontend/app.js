@@ -3089,6 +3089,13 @@ async function loadEvents() {
         `${s.demoted ? " (archived: max-depth only)" : ""}` +
         `${mergedHtml ? ` · ${mergedHtml}` : ""}</span>`;
     }
+    const retrospective = s.trigger && s.trigger.retrospective;
+    if (retrospective) {
+      b.innerHTML += '<br><span style="color:#f0b060">Retrospective reconstruction</span>';
+      b.title = `${retrospective.reason || "Recovery of missed event dispatch"}` +
+        ` · requested ${retrospective.requested_at || "unknown"}. ` +
+        `${retrospective.data_caveat || "Realized historical USGS observations may be used; this is not the original operational forecast."}`;
+    }
     b.onclick = () => selectEvent(id, s);
     evtPanel.appendChild(b);
   });
@@ -3209,6 +3216,13 @@ async function selectEvent(id, summary) {
   try {
     map.fitBounds(man.bounds, { padding: [40, 40], maxZoom: 13, animate: false });
   } catch (_) {}
+  const retrospective = man.trigger && man.trigger.retrospective;
+  if (retrospective) {
+    addMsg(`<b>Retrospective reconstruction</b> — ` +
+      `${escapeHtml(retrospective.data_caveat || "Realized historical USGS observations may be used; this is not the original operational forecast.")}` +
+      `<br>${escapeHtml(retrospective.reason || "Recovery of missed event dispatch")}` +
+      ` · requested ${escapeHtml(retrospective.requested_at || "unknown")}`, "status");
+  }
   const nF = (man.frames || []).length;
   const canAnim = nF > 0 && !evtManifest._demoted;
   renderEvtCtl();
