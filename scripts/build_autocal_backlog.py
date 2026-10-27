@@ -20,8 +20,9 @@ Within a tier, smaller drainage area first (cheaper EF5 runs).
 
 Writes hf_data/data/autocal_west_backlog.json and
 hf_data/data/gagesii_reservoir_stor.json (every CONUS GAGES-II gauge with
-STOR_NOR_2009 >= 10 mm: the autocal loop holds these back from EVERY trigger
-until AUTOCAL_LAKES_ON=1; the Space has no copy of the GAGES-II tables), both
+STOR_NOR_2009 >= 10 mm: the autocal loop holds the WESTERN ones back from
+every trigger until AUTOCAL_LAKES_ON=1; the Space has no copy of the GAGES-II
+tables), both
 committed with the code the Space clones. Light: ~15 small HTTP requests, no
 rasters. --reservoirs-only rewrites just the reservoir table (local file only).
 
@@ -98,8 +99,9 @@ def write_reservoirs(dams: dict[str, float], path: str) -> int:
     res = {g: round(v, 2) for g, v in sorted(dams.items()) if v >= STOR_MM_MAX}
     head = {"source": "GAGES-II conterm_hydromod_dams.txt STOR_NOR_2009 (ML/km2 == mm)",
             "stor_mm_min": STOR_MM_MAX,
-            "rule": "PI 2026-10-27: reservoir gauges are not auto-calibrated from any "
-                    "trigger until the lake module simulates them (AUTOCAL_LAKES_ON=1)"}
+            "rule": "PI 2026-10-27: western reservoir gauges (lon < WEST_LON) are not "
+                    "auto-calibrated from any trigger until the lake module simulates "
+                    "them (AUTOCAL_LAKES_ON=1, CREST_LAKES=west)"}
     lines = ["{"] + [f" {json.dumps(k)}: {json.dumps(v)}," for k, v in head.items()]
     lines += [' "gauges": {', ",\n".join(f"  {json.dumps(g)}: {v}" for g, v in res.items()),
               " }", "}"]

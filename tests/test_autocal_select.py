@@ -116,10 +116,10 @@ def test_west_oversim_before_west_miss_east_miss_before_east_oversim():
 
 
 # --------------------------------------------------------------------------- #
-# reservoir hold (PI 2026-10-27): no trigger calibrates a >= 10 mm gauge
-# until AUTOCAL_LAKES_ON=1
+# reservoir hold (PI 2026-10-27): no trigger calibrates a WESTERN >= 10 mm
+# gauge until AUTOCAL_LAKES_ON=1; eastern gauges are never held
 # --------------------------------------------------------------------------- #
-def test_reservoir_gauges_held_from_event_triggers(monkeypatch):
+def test_western_reservoir_gauges_held_from_event_triggers(monkeypatch):
     t0 = NOW - dt.timedelta(hours=30)
     idx = {"W": index_entry("09000004", t0), "E": index_entry("07000003", t0)}
     mf = {"W": manifest(t0, [1, 5, 40], [1, 2, 4]), "E": manifest(t0, [1, 5, 90], [1, 2, 4])}
@@ -127,27 +127,38 @@ def test_reservoir_gauges_held_from_event_triggers(monkeypatch):
     RESV.update({"09000004": 267.0, "09000001": 11.0, "07000003": 40.0})
     held = []
     rec, why = ar.pick_candidate(missed, idx, [], NOW, manifest=mf.get, held=held)
-    assert (rec["kind"], rec["gauge"]) == ("miss", "07000001")   # the only dam-free one
-    assert "3 reservoir-gauge event(s) held until AUTOCAL_LAKES_ON=1" in why
+    assert (rec["kind"], rec["gauge"]) == ("miss", "07000001")   # east: miss first
+    assert "2 western reservoir-gauge event(s) held until AUTOCAL_LAKES_ON=1" in why
     assert sorted((h["kind"], h["gauge"], h["stor_mm"], h["west"]) for h in held) == [
-        ("miss", "09000001", 11.0, True), ("oversim", "07000003", 40.0, False),
-        ("oversim", "09000004", 267.0, True)]
+        ("miss", "09000001", 11.0, True), ("oversim", "09000004", 267.0, True)]
+    # the eastern reservoir gauge (40 mm) keeps its previous behaviour: eligible
+    assert _order_events(missed, idx, mf) == [("miss", "07000001"), ("oversim", "07000003")]
     # nothing at all when every candidate is held: falls through to the backlog
     held = []
     rec, why = ar.pick_candidate(missed[:12], {"W": idx["W"]}, [], NOW, manifest=mf.get,
                                  held=held)
     assert rec is None and len(held) == 2
-    assert why.startswith("no eligible event; 2 reservoir-gauge event(s) held")
+    assert why.startswith("no eligible event; 2 western reservoir-gauge event(s) held")
     # the held list stays current while the daily cap is reached
     done = [{"gauge": "x", "ran": True, "at": _t(1)}, {"gauge": "y", "ran": True, "at": _t(2)}]
     held = []
     rec, why = ar.pick_candidate(missed, idx, done, NOW, manifest=mf.get, held=held)
-    assert rec is None and why.startswith("daily cap") and len(held) == 3
+    assert rec is None and why.startswith("daily cap") and len(held) == 2
     # lakes on: the hold lifts and the western over-prediction leads again
     monkeypatch.setattr(ar, "LAKES_ON", True)
     held = []
     rec, _ = ar.pick_candidate(missed, idx, [], NOW, manifest=mf.get, held=held)
     assert (rec["kind"], rec["gauge"]) == ("oversim", "09000004") and held == []
+
+
+def test_held_stor_west_only(monkeypatch):
+    RESV.update({"09000001": 11.0, "07000003": 40.0})
+    assert ar.held_stor("09000001") == 11.0      # west, reservoir -> held
+    assert ar.held_stor("07000003") is None      # east, reservoir -> never held
+    assert ar.held_stor("09000002") is None      # west, dam-free
+    assert ar.held_stor("05999999") is None      # unknown longitude counts as east
+    monkeypatch.setattr(ar, "LAKES_ON", True)
+    assert ar.held_stor("09000001") is None
 
 
 def test_note_held_state_and_log(monkeypatch):
@@ -159,7 +170,7 @@ def test_note_held_state_and_log(monkeypatch):
     ar._note_held(h)
     ar._note_held(list(h))                       # unchanged set: no second log line
     assert ar.state["held_reservoir"] == h and len(lines) == 1
-    assert "10171000 (oversim, 267 mm, west)" in lines[0]
+    assert "10171000 (oversim, 267 mm)" in lines[0]
 
 
 def test_reservoir_table_reader(monkeypatch):

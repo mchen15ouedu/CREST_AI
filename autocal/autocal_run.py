@@ -15,13 +15,16 @@ east a miss beats an over-prediction (the original trigger keeps its place).
 Then each kind's own keys (miss: more checks, bigger obs peak; oversim:
 bigger ratio, bigger obs peak).
 
-Reservoir hold (PI 2026-10-27): a reservoir-affected gauge (GAGES-II
-STOR_NOR_2009 >= 10 mm, hf_data/data/gagesii_reservoir_stor.json) is not
-calibrated from ANY trigger until AUTOCAL_LAKES_ON=1 — the lake/reservoir
-module is being switched on for the west, and calibrating before it simulates
-the reservoirs would bake them into the parameters (e.g. 10171000 Jordan
-River, 267 mm). Held events are filtered out of eligibility without a Hub
-write; they are listed in the state file (held_reservoir) and the phase line.
+Reservoir hold (PI 2026-10-27): a WESTERN reservoir-affected gauge (lon <
+WEST_LON and GAGES-II STOR_NOR_2009 >= 10 mm,
+hf_data/data/gagesii_reservoir_stor.json) is not calibrated from ANY trigger
+until AUTOCAL_LAKES_ON=1 — the lake/reservoir module is being switched on
+for the west (CREST_LAKES=west), and calibrating before it simulates the
+reservoirs would bake them into the parameters (e.g. 10171000 Jordan River,
+267 mm; 09337500 Escalante, 11 mm). Eastern gauges are not held: their lakes
+are not simulated any time soon, so a hold would block them indefinitely.
+Held events are filtered out of eligibility without a Hub write; they are
+listed in the state file (held_reservoir) and the phase line.
 
 Triggers:
   * MISS (kind "miss", EF5 under-predicted) — events/missed.json rows written
@@ -279,8 +282,11 @@ def reservoir_stor(gid: str) -> float | None:
 
 def held_stor(gid: str) -> float | None:
     """Reservoir storage (mm) when this gauge is held back from calibration
-    (reservoir-affected and AUTOCAL_LAKES_ON off), else None."""
-    return None if LAKES_ON else reservoir_stor(gid)
+    (western, reservoir-affected and AUTOCAL_LAKES_ON off), else None. The
+    lake module is switched on for the west only (CREST_LAKES=west)."""
+    if LAKES_ON or not is_west(gid):
+        return None
+    return reservoir_stor(gid)
 
 
 def _history(done: list, now: dt.datetime):
@@ -483,13 +489,14 @@ def pick_candidate(missed: list, index: dict, done: list, now: dt.datetime,
     """The one candidate to work on next (or None) and a reason string: the
     first eligible event (miss streak or over-prediction, western gauges
     first), else the next western backlog gauge. Event candidates on held
-    reservoir gauges are appended to `held` (when given), never picked."""
+    (western reservoir) gauges are appended to `held` (when given), never
+    picked."""
     # candidates first (cheap: verdicts are memoised) so the held list stays
     # current on the status page even while the daily cap is reached
     held = [] if held is None else held
     cands = (miss_candidates(missed, index, done, now, held=held)
              + oversim_candidates(index, done, now, manifest=manifest, held=held))
-    hold = (f"; {len(held)} reservoir-gauge event(s) held until AUTOCAL_LAKES_ON=1"
+    hold = (f"; {len(held)} western reservoir-gauge event(s) held until AUTOCAL_LAKES_ON=1"
             if held else "")
     _, _, today = _history(done, now)
     if today >= MAX_PER_DAY:
@@ -645,10 +652,10 @@ def _note_held(held: list):
     write, they are simply not eligible."""
     key = sorted((h["gauge"], h["event"]) for h in held)
     if key != sorted((h["gauge"], h["event"]) for h in state["held_reservoir"]):
-        log(f"holding {len(held)} reservoir-gauge event candidate(s) until "
+        log(f"holding {len(held)} western reservoir-gauge event candidate(s) until "
             f"AUTOCAL_LAKES_ON=1: " + (", ".join(
-                f"{h['gauge']} ({h['kind']}, {h['stor_mm']:.0f} mm"
-                f"{', west' if h['west'] else ''})" for h in held) or "none"))
+                f"{h['gauge']} ({h['kind']}, {h['stor_mm']:.0f} mm)" for h in held)
+                or "none"))
     state["held_reservoir"] = held
 
 

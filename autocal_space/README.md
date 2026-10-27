@@ -31,11 +31,12 @@ western = longitude < -105). It picks, in order:
    gauges with suspect parameters, then other dam-free gauges, smaller
    basins first), each calibrated once.
 
-**Reservoir hold:** a reservoir-affected gauge (GAGES-II normal storage >=
-10 mm, `hf_data/data/gagesii_reservoir_stor.json`) is not calibrated from any
-trigger until `AUTOCAL_LAKES_ON=1` — the lake module is being switched on for
-the west, and calibrating first would bake the missing reservoirs into the
-parameters. Held events are listed under `held_reservoir` in `/api/status`.
+**Reservoir hold (west only):** a western reservoir-affected gauge (GAGES-II
+normal storage >= 10 mm, `hf_data/data/gagesii_reservoir_stor.json`) is not
+calibrated from any trigger until `AUTOCAL_LAKES_ON=1` — the lake module is
+being switched on for the west (`CREST_LAKES=west`), and calibrating first
+would bake the missing reservoirs into the parameters. Eastern gauges are not
+held. Held events are listed under `held_reservoir` in `/api/status`.
 
 It calibrates that gauge over the preceding six months (LLM-proposed
 multiplier updates within hydrologic bounds, judged by real EF5 runs), saves

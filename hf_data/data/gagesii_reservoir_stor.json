@@ -1,7 +1,7 @@
 {
  "source": "GAGES-II conterm_hydromod_dams.txt STOR_NOR_2009 (ML/km2 == mm)",
  "stor_mm_min": 10.0,
- "rule": "PI 2026-10-27: reservoir gauges are not auto-calibrated from any trigger until the lake module simulates them (AUTOCAL_LAKES_ON=1)",
+ "rule": "PI 2026-10-27: western reservoir gauges (lon < WEST_LON) are not auto-calibrated from any trigger until the lake module simulates them (AUTOCAL_LAKES_ON=1, CREST_LAKES=west)",
  "gauges": {
   "01011000": 30.2,
   "01015800": 12.2,
