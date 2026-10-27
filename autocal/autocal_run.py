@@ -9,9 +9,19 @@ LLM-guided calibrations it starts per day.
 Priority (PI 2026-10-27: "The auto-calibration, we should prioritize the
 western part of the USA, since those areas have more issues"): every
 candidate list sorts western gauges (lon < pipeline.WEST_LON) first. An
-eligible event beats the backlog; within a region a whole-event miss beats an
-over-prediction, then each kind's own keys (miss: more checks, bigger obs
-peak; oversim: bigger ratio, bigger obs peak).
+eligible event beats the backlog. In the WEST an over-prediction beats a
+whole-event miss (the western problem is EF5 running far too high); in the
+east a miss beats an over-prediction (the original trigger keeps its place).
+Then each kind's own keys (miss: more checks, bigger obs peak; oversim:
+bigger ratio, bigger obs peak).
+
+Reservoir hold (PI 2026-10-27): a reservoir-affected gauge (GAGES-II
+STOR_NOR_2009 >= 10 mm, hf_data/data/gagesii_reservoir_stor.json) is not
+calibrated from ANY trigger until AUTOCAL_LAKES_ON=1 — the lake/reservoir
+module is being switched on for the west, and calibrating before it simulates
+the reservoirs would bake them into the parameters (e.g. 10171000 Jordan
+River, 267 mm). Held events are filtered out of eligibility without a Hub
+write; they are listed in the state file (held_reservoir) and the phase line.
 
 Triggers:
   * MISS (kind "miss", EF5 under-predicted) — events/missed.json rows written
@@ -91,6 +101,8 @@ OVERSIM_MIN_OBS = float(os.environ.get("AUTOCAL_OVERSIM_MIN_OBS", "1.0"))
 LAKES_ON = os.environ.get("AUTOCAL_LAKES_ON", "0") == "1"
 BACKLOG_PATH = os.environ.get("AUTOCAL_BACKLOG", os.path.join(
     os.path.dirname(HERE), "hf_data", "data", "autocal_west_backlog.json"))
+RESERVOIR_PATH = os.environ.get("AUTOCAL_RESERVOIRS", os.path.join(
+    os.path.dirname(HERE), "hf_data", "data", "gagesii_reservoir_stor.json"))
 SKIP_TTL_D = float(os.environ.get("AUTOCAL_SKIP_TTL_D", "30"))
 SKIP_SUMMARY_H = float(os.environ.get("AUTOCAL_SKIP_SUMMARY_H", "24"))
 # Idle gate (user 2026-10-12: "auto_cal has the lowest priority — only when
@@ -105,7 +117,7 @@ IDLE_FOR_S = float(os.environ.get("AUTOCAL_IDLE_FOR_S", "1800"))
 
 TS = "%Y-%m-%dT%H:%M:%SZ"
 state = {"phase": "booting", "current": None, "last": None, "runs": 0, "skips": 0,
-         "backlog_skips": {}, "skips_summarized": None}
+         "backlog_skips": {}, "skips_summarized": None, "held_reservoir": []}
 
 
 def log(s: str):
@@ -243,6 +255,34 @@ def is_west(gid: str) -> bool:
     return lon is not None and lon < WEST_LON
 
 
+_resv: dict | None = None
+
+
+def reservoir_stor(gid: str) -> float | None:
+    """GAGES-II normal reservoir storage (mm) of a reservoir-affected gauge
+    (>= the table's stor_mm_min, 10 mm), else None (dam-free or no GAGES-II
+    record). Raises when the committed table is unreadable: the hold must not
+    silently lapse (the loop then shows the error and retries)."""
+    global _resv
+    if _resv is None:
+        try:
+            with open(RESERVOIR_PATH, encoding="utf-8") as fp:
+                d = json.load(fp)
+            lim = float(d.get("stor_mm_min", 10.0))
+            _resv = {str(g).zfill(8): float(v) for g, v in d["gauges"].items()
+                     if float(v) >= lim}
+        except (OSError, ValueError, KeyError, AttributeError, TypeError) as e:
+            raise RuntimeError(f"reservoir table {RESERVOIR_PATH} unreadable "
+                               f"({type(e).__name__}: {e})")
+    return _resv.get(str(gid).zfill(8))
+
+
+def held_stor(gid: str) -> float | None:
+    """Reservoir storage (mm) when this gauge is held back from calibration
+    (reservoir-affected and AUTOCAL_LAKES_ON off), else None."""
+    return None if LAKES_ON else reservoir_stor(gid)
+
+
 def _history(done: list, now: dt.datetime):
     """(last ran=True time per gauge, handled (gauge, event) pairs, ran=True
     records started in the last 24 h) from events/autocal.json rows."""
@@ -258,8 +298,21 @@ def _history(done: list, now: dt.datetime):
     return last_run, handled, today
 
 
-def miss_candidates(missed: list, index: dict, done: list, now: dt.datetime) -> list[dict]:
-    """Whole-event miss streaks that are eligible now (kind "miss")."""
+def _hold(c: dict, held: list | None) -> bool:
+    """True (and noted in `held`) when candidate c is a held reservoir gauge."""
+    stor = held_stor(c["gauge"])
+    if stor is None:
+        return False
+    if held is not None:
+        held.append({"gauge": c["gauge"], "event": c["event"], "kind": c["kind"],
+                     "west": c["west"], "stor_mm": stor})
+    return True
+
+
+def miss_candidates(missed: list, index: dict, done: list, now: dt.datetime,
+                    held: list | None = None) -> list[dict]:
+    """Whole-event miss streaks that are eligible now (kind "miss").
+    Reservoir gauges held until AUTOCAL_LAKES_ON=1 go to `held` instead."""
     last_run, handled, _ = _history(done, now)
     cands = []
     for st in streaks(missed, index):
@@ -273,7 +326,9 @@ def miss_candidates(missed: list, index: dict, done: list, now: dt.datetime) -> 
         lr = last_run.get(gid)
         if lr and now - lr < dt.timedelta(days=COOLDOWN_D):
             continue
-        cands.append({**st, "kind": "miss", "west": is_west(gid)})
+        c = {**st, "kind": "miss", "west": is_west(gid)}
+        if not _hold(c, held):
+            cands.append(c)
     return cands
 
 
@@ -324,10 +379,11 @@ def _event_stats(ev: str, summary: dict, manifest=None) -> dict | None:
 
 
 def oversim_candidates(index: dict, done: list, now: dt.datetime,
-                       manifest=None) -> list[dict]:
+                       manifest=None, held: list | None = None) -> list[dict]:
     """Published events whose EF5 peak was >= OVERSIM_RATIO x the observed
     peak (kind "oversim"). The cheap index-only rules run first, so only
-    events that could still qualify ever have their manifest read."""
+    events that could still qualify ever have their manifest read. Reservoir
+    gauges held until AUTOCAL_LAKES_ON=1 go to `held` instead."""
     last_run, handled, _ = _history(done, now)
     for key in [k for k in _verdicts if k[0] not in (index or {})]:
         del _verdicts[key]                       # rolled off the list
@@ -350,17 +406,20 @@ def oversim_candidates(index: dict, done: list, now: dt.datetime,
         if (not st or st["obs_peak_m3s"] < OVERSIM_MIN_OBS
                 or st["ratio"] < OVERSIM_RATIO):
             continue
-        cands.append({**st, "kind": "oversim", "gauge": gid, "event": ev, "events": [ev],
-                      "west": is_west(gid), "t0": s.get("t0"), "t_end": s.get("t_end"),
-                      "_end": end})
+        c = {**st, "kind": "oversim", "gauge": gid, "event": ev, "events": [ev],
+             "west": is_west(gid), "t0": s.get("t0"), "t_end": s.get("t_end"), "_end": end}
+        if not _hold(c, held):
+            cands.append(c)
     return cands
 
 
 def _event_key(c: dict):
-    """West first, then a miss before an over-prediction, then the kind's keys."""
-    if c["kind"] == "miss":
-        return (not c["west"], 0, -c["n_checks"], -c["obs_peak_m3s"])
-    return (not c["west"], 1, -c["ratio"], -c["obs_peak_m3s"])
+    """West first; in the west an over-prediction before a miss, in the east a
+    miss before an over-prediction; then the kind's own keys."""
+    first = "oversim" if c["west"] else "miss"
+    own = ((-c["n_checks"], -c["obs_peak_m3s"]) if c["kind"] == "miss"
+           else (-c["ratio"], -c["obs_peak_m3s"]))
+    return (not c["west"], c["kind"] != first) + own
 
 
 def load_backlog(path: str | None = None) -> list:
@@ -420,21 +479,27 @@ def backlog_candidate(backlog: list, done: list, skips: dict,
 
 def pick_candidate(missed: list, index: dict, done: list, now: dt.datetime,
                    backlog: list | None = None, skips: dict | None = None,
-                   manifest=None):
+                   manifest=None, held: list | None = None):
     """The one candidate to work on next (or None) and a reason string: the
     first eligible event (miss streak or over-prediction, western gauges
-    first), else the next western backlog gauge."""
+    first), else the next western backlog gauge. Event candidates on held
+    reservoir gauges are appended to `held` (when given), never picked."""
+    # candidates first (cheap: verdicts are memoised) so the held list stays
+    # current on the status page even while the daily cap is reached
+    held = [] if held is None else held
+    cands = (miss_candidates(missed, index, done, now, held=held)
+             + oversim_candidates(index, done, now, manifest=manifest, held=held))
+    hold = (f"; {len(held)} reservoir-gauge event(s) held until AUTOCAL_LAKES_ON=1"
+            if held else "")
     _, _, today = _history(done, now)
     if today >= MAX_PER_DAY:
-        return None, f"daily cap reached ({today}/{MAX_PER_DAY} in 24 h)"
-    cands = (miss_candidates(missed, index, done, now)
-             + oversim_candidates(index, done, now, manifest=manifest))
+        return None, f"daily cap reached ({today}/{MAX_PER_DAY} in 24 h){hold}"
     if cands:
         cands.sort(key=_event_key)
         n_west = sum(1 for c in cands if c["west"])
-        return cands[0], f"{len(cands)} eligible event(s), {n_west} western"
+        return cands[0], f"{len(cands)} eligible event(s), {n_west} western{hold}"
     rec, why = backlog_candidate(backlog or [], done, skips or {})
-    return rec, f"no eligible event; {why}"
+    return rec, f"no eligible event{hold}; {why}"
 
 
 def skip_summary(done: list, local: dict, now: dt.datetime,
@@ -574,6 +639,19 @@ def _summarize_skips(done: list, now: dt.datetime):
         log(f"backlog skip summary committed: {rec['reason']}")
 
 
+def _note_held(held: list):
+    """Reservoir-gauge event candidates held until AUTOCAL_LAKES_ON=1: kept in
+    the state file (status page) and logged when the set changes — no Hub
+    write, they are simply not eligible."""
+    key = sorted((h["gauge"], h["event"]) for h in held)
+    if key != sorted((h["gauge"], h["event"]) for h in state["held_reservoir"]):
+        log(f"holding {len(held)} reservoir-gauge event candidate(s) until "
+            f"AUTOCAL_LAKES_ON=1: " + (", ".join(
+                f"{h['gauge']} ({h['kind']}, {h['stor_mm']:.0f} mm"
+                f"{', west' if h['west'] else ''})" for h in held) or "none"))
+    state["held_reservoir"] = held
+
+
 def main():
     from hf_data import eventstore, llm
     _load_local_state()
@@ -610,8 +688,10 @@ def main():
             index = eventstore.load_index()
             done = eventstore.load_autocal()
             skips = backlog_skips(done, state["backlog_skips"], now)
-            rec, why = pick_candidate(missed, index, done, now,
-                                      backlog=load_backlog(), skips=skips)
+            held = []
+            rec, why = pick_candidate(missed, index, done, now, backlog=load_backlog(),
+                                      skips=skips, held=held)
+            _note_held(held)
             if rec is None:
                 _summarize_skips(done, now)
                 state["phase"] = (f"idle — {why} ({len(missed)} miss rows, "

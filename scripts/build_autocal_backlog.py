@@ -18,10 +18,14 @@ Tiers, in order:
      Event-prone reservoir gauges land here too (same reason).
 Within a tier, smaller drainage area first (cheaper EF5 runs).
 
-Writes hf_data/data/autocal_west_backlog.json (committed with the code the
-Space clones). Light: ~15 small HTTP requests, no rasters.
+Writes hf_data/data/autocal_west_backlog.json and
+hf_data/data/gagesii_reservoir_stor.json (every CONUS GAGES-II gauge with
+STOR_NOR_2009 >= 10 mm: the autocal loop holds these back from EVERY trigger
+until AUTOCAL_LAKES_ON=1; the Space has no copy of the GAGES-II tables), both
+committed with the code the Space clones. Light: ~15 small HTTP requests, no
+rasters. --reservoirs-only rewrites just the reservoir table (local file only).
 
-    python scripts/build_autocal_backlog.py [--dams PATH] [--out PATH]
+    python scripts/build_autocal_backlog.py [--dams PATH] [--out PATH] [--reservoirs-only]
 """
 from __future__ import annotations
 
@@ -39,6 +43,7 @@ truststore.inject_into_ssl()
 
 DAMS_PATH = "D:/gageII_char/spreadsheets-in-csv-format/conterm_hydromod_dams.txt"
 OUT_PATH = os.path.join(ROOT, "hf_data", "data", "autocal_west_backlog.json")
+RESV_PATH = os.path.join(ROOT, "hf_data", "data", "gagesii_reservoir_stor.json")
 SITE_URL = "https://waterservices.usgs.gov/nwis/site/"
 STOR_MM_MAX = 10.0         # STOR_NOR_2009 (ML/km2 == mm) below this = dam-free
 WM_MIN = 0.01
@@ -85,6 +90,23 @@ def load_dams(path: str) -> dict[str, float]:
     df = pd.read_csv(path, dtype={"STAID": str})
     df["STAID"] = df["STAID"].str.zfill(8)
     return {s: float(v) for s, v in zip(df.STAID, df.STOR_NOR_2009) if v == v and v >= 0}
+
+
+def write_reservoirs(dams: dict[str, float], path: str) -> int:
+    """{gauge: STOR_NOR_2009 mm} of the reservoir-affected gauges, one per
+    line (small, reviewable diffs). Returns how many."""
+    res = {g: round(v, 2) for g, v in sorted(dams.items()) if v >= STOR_MM_MAX}
+    head = {"source": "GAGES-II conterm_hydromod_dams.txt STOR_NOR_2009 (ML/km2 == mm)",
+            "stor_mm_min": STOR_MM_MAX,
+            "rule": "PI 2026-10-27: reservoir gauges are not auto-calibrated from any "
+                    "trigger until the lake module simulates them (AUTOCAL_LAKES_ON=1)"}
+    lines = ["{"] + [f" {json.dumps(k)}: {json.dumps(v)}," for k, v in head.items()]
+    lines += [' "gauges": {', ",\n".join(f"  {json.dumps(g)}: {v}" for g, v in res.items()),
+              " }", "}"]
+    with open(path, "w", encoding="utf-8", newline="\n") as fp:
+        fp.write("\n".join(lines) + "\n")
+    json.load(open(path, encoding="utf-8"))           # round-trip check
+    return len(res)
 
 
 def event_gauges(index: dict, missed: list) -> set[str]:
@@ -141,7 +163,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dams", default=DAMS_PATH, help="GAGES-II conterm_hydromod_dams.txt")
     ap.add_argument("--out", default=OUT_PATH)
+    ap.add_argument("--reservoirs-out", default=RESV_PATH)
+    ap.add_argument("--reservoirs-only", action="store_true",
+                    help="only rewrite the reservoir table (no network)")
     a = ap.parse_args()
+    dams = load_dams(a.dams)
+    n = write_reservoirs(dams, a.reservoirs_out)
+    print(f"wrote {a.reservoirs_out}: {n} of {len(dams)} gauges >= {STOR_MM_MAX:g} mm")
+    if a.reservoirs_only:
+        return 0
 
     from hf_data import basinextent, gauges, multipliers
     from hf_data.pipeline import WEST_LON
@@ -175,7 +205,6 @@ def main() -> int:
 
     index, missed = _hub_json("events/index.json"), _hub_json("events/missed.json")
     prone = event_gauges(index, missed)
-    dams = load_dams(a.dams)
     entries = []
     for gid in ok:
         m = tbl.loc[gid]

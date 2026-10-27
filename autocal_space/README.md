@@ -15,18 +15,27 @@ prioritize the western part of the USA, since those areas have more issues";
 western = longitude < -105). It picks, in order:
 
 1. an **event**, western gauges first —
-   * a *miss*: the runner's CREST-miss guard recorded that EF5 missed **every
-     hourly check of a whole flood event** at a trigger gauge
-     (`events/missed.json` on `vincewin/CREST_data`), or
    * an *over-prediction*: a published event (`events/index.json`) whose
      manifest shows EF5 peaking at >= `AUTOCAL_OVERSIM_RATIO` x the observed
-     peak (paired hours up to t0, obs peak >= `AUTOCAL_OVERSIM_MIN_OBS` m3/s);
+     peak (paired hours up to t0, obs peak >= `AUTOCAL_OVERSIM_MIN_OBS` m3/s),
+     or
+   * a *miss*: the runner's CREST-miss guard recorded that EF5 missed **every
+     hourly check of a whole flood event** at a trigger gauge
+     (`events/missed.json` on `vincewin/CREST_data`)
+
+   (in the west an over-prediction comes before a miss, in the east a miss
+   comes first);
 2. when no event is eligible, the next gauge of the **western backlog**
    (`hf_data/data/autocal_west_backlog.json`, built by
    `scripts/build_autocal_backlog.py`: event-prone gauges, then dam-free
    gauges with suspect parameters, then other dam-free gauges, smaller
-   basins first; reservoir gauges wait until `AUTOCAL_LAKES_ON=1`), each
-   calibrated once.
+   basins first), each calibrated once.
+
+**Reservoir hold:** a reservoir-affected gauge (GAGES-II normal storage >=
+10 mm, `hf_data/data/gagesii_reservoir_stor.json`) is not calibrated from any
+trigger until `AUTOCAL_LAKES_ON=1` — the lake module is being switched on for
+the west, and calibrating first would bake the missing reservoirs into the
+parameters. Held events are listed under `held_reservoir` in `/api/status`.
 
 It calibrates that gauge over the preceding six months (LLM-proposed
 multiplier updates within hydrologic bounds, judged by real EF5 runs), saves
