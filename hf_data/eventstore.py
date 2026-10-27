@@ -247,7 +247,10 @@ AUTOCAL_KEEP = 500
 def load_autocal() -> list:
     """Auto-calibration records (newest last): one per (event, gauge) the
     CREST_autocal Space looked at — ran (with before/after NSE and whether
-    the winner was saved) or skipped with a reason. [] on any failure."""
+    the winner was saved) or skipped with a reason. `kind` is "miss",
+    "oversim" or "backlog" (older rows: no kind = miss); western-backlog
+    skips arrive only in periodic kind "backlog_skips" summaries (gauge None).
+    [] on any failure."""
     try:
         from huggingface_hub import hf_hub_download
         p = hf_hub_download(REPO, AUTOCAL_FILE, repo_type="dataset",
@@ -274,7 +277,7 @@ def note_autocal(rec: dict) -> bool:
                 repo_id=REPO, repo_type="dataset",
                 operations=[CommitOperationAdd(
                     AUTOCAL_FILE, io.BytesIO(json.dumps(rows).encode()))],
-                commit_message=f"autocal {rec.get('gauge')}: "
+                commit_message=f"autocal {rec.get('gauge') or rec.get('kind')}: "
                                f"{'ran' if rec.get('ran') else 'skipped'} "
                                f"({rec.get('reason') or 'NSE %s -> %s' % (rec.get('baseline_nse'), rec.get('best_nse'))})")
             return True
@@ -471,6 +474,20 @@ def _prior_manifest(ev: str) -> dict | None:
                             repo_type="dataset",
                             token=os.environ.get("HF_TOKEN"),
                             force_download=True)
+        with open(p, encoding="utf-8") as fp:
+            return json.load(fp)
+    except Exception:
+        return None
+
+
+def load_manifest(ev: str) -> dict | None:
+    """A published event's manifest, HF-cached (re-downloaded only when it
+    changed on the Hub) — for readers that scan many events, e.g. the
+    autocal over-prediction trigger. None on any failure."""
+    try:
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(REPO, f"{PREFIX}/{ev}/manifest.json",
+                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
         with open(p, encoding="utf-8") as fp:
             return json.load(fp)
     except Exception:
