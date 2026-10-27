@@ -19,6 +19,7 @@ import numpy as np
 VERSION = 1
 POLICY = "usgs-fallback-v1"
 FILENAME = "boundary_forcing.json"
+DEPLOYMENT_TAG = "usgs-boundary-1.1-control-lattice"
 _D8 = {1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1),
        16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (-1, 1)}
 
@@ -134,10 +135,104 @@ def _digest(value):
                                      allow_nan=False).encode()).hexdigest()
 
 
+def control_context(path):
+    """Read only the generated EF5 control's Basic/Gauge coordinate inputs.
+
+    The run's actual terrain paths are authoritative. Never reconstruct a
+    cache path from a different basin-extent implementation or key version.
+    """
+    sections, current = {}, None
+    with open(path, encoding="utf-8") as fp:
+        for raw in fp:
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current = line[1:-1].strip()
+                sections.setdefault(current, {})
+            elif current and "=" in line:
+                key, value = line.split("=", 1)
+                sections[current][key.strip().lower()] = value.strip().strip('"')
+    basic = next((v for k, v in sections.items() if k.lower() == "basic"), {})
+    if not all(basic.get(key) for key in ("dem", "ddm", "fam")):
+        raise ValueError("generated control lacks Basic DEM/DDM/FAM")
+    if basic.get("esriddm", "true").lower() != "true":
+        raise ValueError("boundary network requires ESRI D8 control directions")
+    gauges = {key.split(None, 1)[1]: value for key, value in sections.items()
+              if key.lower().startswith("gauge ")}
+    return basic, gauges
+
+
+def _actual_network(output_dir, qpath, control_path):
+    """Put the generated control's D8/FAM on the actual output Q lattice."""
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+    basic, controls = control_context(control_path)
+    with rasterio.open(qpath) as ds:
+        q, qtr, qcrs, qshape = ds.read(1), ds.transform, ds.crs, ds.shape
+        valid = np.isfinite(q) & (q >= 0)
+        if ds.nodata is not None:
+            valid &= q != ds.nodata
+    arrays, terrain_paths = [], {}
+    for key in ("ddm", "fam"):
+        path = basic[key]
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(control_path), path)
+        terrain_paths[key] = path
+        with rasterio.open(path) as ds:
+            if (ds.crs != qcrs or abs(ds.transform.a - qtr.a) > 1e-10
+                    or abs(ds.transform.e - qtr.e) > 1e-10):
+                raise ValueError("control terrain and Q lattices differ in CRS/cell size")
+            for offset in ((qtr.c - ds.transform.c) / qtr.a,
+                           (qtr.f - ds.transform.f) / qtr.e):
+                if abs(offset - round(offset)) > 1e-6:
+                    raise ValueError("control terrain and Q lattice origins are unaligned")
+            arr = np.zeros(qshape, dtype="float64")
+            reproject(ds.read(1), arr, src_transform=ds.transform, src_crs=ds.crs,
+                      src_nodata=ds.nodata, dst_transform=qtr, dst_crs=qcrs,
+                      dst_nodata=0, resampling=Resampling.nearest)
+            arrays.append(arr)
+    fdir, acc = arrays
+    fdir = np.where(valid, fdir, 0)
+    # The unique terminal cell of the actual EF5 catchment identifies its
+    # outlet even when the old control supplied BASINAREA and EF5 moved it.
+    exits = []
+    for r, c in np.argwhere(valid):
+        step = _D8.get(int(fdir[r, c]))
+        rr, cc = (r + step[0], c + step[1]) if step else (-1, -1)
+        if not (0 <= rr < qshape[0] and 0 <= cc < qshape[1] and valid[rr, cc]):
+            exits.append((int(r), int(c)))
+    if len(exits) != 1:
+        raise ValueError(f"actual EF5 catchment has {len(exits)} D8 exits; boundary cut is ambiguous")
+    basic_dir = os.path.dirname(os.path.abspath(terrain_paths["ddm"]))
+    return fdir, acc, qtr, qcrs, qshape, exits[0], basic_dir, controls
+
+
+def _cell(transform, lat, lon):
+    c, r = ~transform * (lon, lat)
+    return int(math.floor(r)), int(math.floor(c))
+
+
+def _reaches(fdir, cell, outlet):
+    seen = set()
+    while cell not in seen:
+        if cell == outlet:
+            return True
+        seen.add(cell)
+        step = _D8.get(int(fdir[cell]))
+        if step is None:
+            return False
+        cell = cell[0] + step[0], cell[1] + step[1]
+        if not (0 <= cell[0] < fdir.shape[0] and 0 <= cell[1] < fdir.shape[1]):
+            return False
+    return False
+
+
 def _write_policy(output_dir, policy, mask_digest):
     topology = {k: policy[k] for k in ("version", "policy", "mode", "dem_res",
                                       "allow_simulated_inlets", "min_sim_obs_ratio")}
     topology["domain_mask_sha256"] = mask_digest
+    topology["implementation"] = policy.get("implementation")
     topology["q_grid"] = policy.get("q_grid")
     topology["subsurface_routing"] = policy.get("subsurface_routing")
     topology["cuts"] = [{k: inlet[k] for k in
@@ -177,7 +272,7 @@ def _cut_domain(path, excluded, fdir_transform, fdir_crs, inlets):
 
 
 def prepare(gauge, output_dir, domain, start, end, *, dem_res="1",
-            min_ratio=0.3, model=None, log=print):
+            min_ratio=0.3, model=None, control_path=None, log=print):
     """Create a closed forcing bundle; return (policy, updated domain).
 
     Complete observation coverage is required before cutting a branch.
@@ -190,9 +285,10 @@ def prepare(gauge, output_dir, domain, start, end, *, dem_res="1",
     if not 0 < min_ratio < 1:
         raise ValueError("boundary minimum ratio must lie strictly between 0 and 1")
     import rasterio
-    from . import basic, basinextent, neighbors, obs
+    from . import neighbors, obs
     times = hourly_times(start, end)
     policy = {"version": VERSION, "policy": POLICY, "mode": "runoff-only",
+              "implementation": DEPLOYMENT_TAG,
               "dem_res": "1", "allow_simulated_inlets": False,
               "min_sim_obs_ratio": min_ratio, "max_sim_obs_ratio": 1 / min_ratio,
               "max_observation_gap_s": 3600, "required_hour_coverage": 1.0,
@@ -218,39 +314,46 @@ def prepare(gauge, output_dir, domain, start, end, *, dem_res="1",
             qpaths.append((when, os.path.join(output_dir, filename)))
     candidates = []
     try:
-        ext = basinextent.ef5_extent(gauge)
-        basic_dir = basic.store_dir(ext["bounds"])
-        gs = {**gauge, "lat": ext["snap"]["lat"], "lon": ext["snap"]["lon"],
-              "area": ext["snap"]["area"]}
-        with rasterio.open(os.path.join(basic_dir, "fdir_clip.tif")) as ds:
-            fdir, fdtr, fdcrs = ds.read(1), ds.transform, ds.crs
-            if ds.nodata is not None:
-                fdir = np.where(fdir == ds.nodata, 0, fdir)
-        outlet_rc = basinextent.cell_of(fdtr, gs["lat"], gs["lon"])
-        upstream = neighbors.upstream_gauges(gs, ext["bounds"], basic_dir,
-                                              max_gauges=4096)
         if not qpaths:
             raise ValueError("no routed Q grid lattice for upstream-gauge mapping")
-        with rasterio.open(qpaths[0][1]) as ds:
-            qtr, qcrs, qshape = ds.transform, ds.crs, ds.shape
+        control_path = control_path or os.path.join(os.path.dirname(output_dir), "control.txt")
+        fdir, acc, qtr, qcrs, qshape, outlet_rc, basic_dir, controls = _actual_network(
+            output_dir, qpaths[0][1], control_path)
+        fdtr, fdcrs = qtr, qcrs
         policy["q_grid"] = {"transform": list(qtr)[:6], "crs": str(qcrs),
                             "shape": list(qshape)}
-        if qcrs != fdcrs:
-            raise ValueError("Q and D8 lattice CRSs differ")
-        if abs(qtr.a - fdtr.a) > 1e-10 or abs(qtr.e - fdtr.e) > 1e-10:
-            raise ValueError("Q and D8 lattice cell sizes differ")
-        for offset in ((qtr.c - fdtr.c) / fdtr.a, (qtr.f - fdtr.f) / fdtr.e):
-            if abs(offset - round(offset)) > 1e-6:
-                raise ValueError("Q and D8 lattice origins are not aligned")
+        outlet_lon, outlet_lat = qtr * (outlet_rc[1] + .5, outlet_rc[0] + .5)
+        area = float(acc[outlet_rc]) * neighbors._cell_area_km2(outlet_lat, qtr.a)
+        gs = {**gauge, "lat": outlet_lat, "lon": outlet_lon, "area": area}
+        bbox = rasterio.transform.array_bounds(*qshape, qtr)
+        upstream = neighbors.upstream_gauges(gs, bbox, basic_dir, max_gauges=4096)
         for g in upstream:
             if str(g["id"]) == str(gauge["id"]):
                 continue
-            lat, lon = g["snap_lat"], g["snap_lon"]
-            rc = basinextent.cell_of(fdtr, lat, lon)
-            qr, qc = basinextent.cell_of(qtr, lat, lon)
+            declared = controls.get(str(g["id"])) or {}
+            # Controls without BASINAREA are pinned to exact cell centers.
+            # Legacy controls/gauge catalogs get one deterministic D8/FAM
+            # snap on this actual Q lattice, then that cell is pinned.
+            if declared and "basinarea" not in declared:
+                lat, lon = float(declared["lat"]), float(declared["lon"])
+                rc = _cell(qtr, lat, lon)
+                snap_source = "control_pinned_cell"
+            else:
+                lat = float(declared.get("lat", g.get("snap_lat", g.get("lat"))))
+                lon = float(declared.get("lon", g.get("snap_lon", g.get("lon"))))
+                drain = float(declared["basinarea"]) if "basinarea" in declared else g.get("area")
+                rc = neighbors._snap(np.where(fdir != 0, acc, np.nan), qtr, lat, lon, drain)
+                if rc is None:
+                    continue
+                snap_source = "actual_q_lattice_d8_area_snap"
+            qr, qc = rc
             if not (0 <= qr < qshape[0] and 0 <= qc < qshape[1]):
                 policy["excluded_gauges"].append({"gauge_id": g["id"], "reason": "outside_q_grid"})
                 continue
+            if not _reaches(fdir, rc, outlet_rc):
+                policy["excluded_gauges"].append({"gauge_id": g["id"], "reason": "not_connected_to_actual_outlet"})
+                continue
+            lon, lat = qtr * (qc + .5, qr + .5)
             # A qualifying cut must actually lie inside this worker basin.
             with rasterio.open(domain_path) as ds:
                 dr, dc = ds.index(lon, lat)
@@ -264,7 +367,9 @@ def prepare(gauge, output_dir, domain, start, end, *, dem_res="1",
                     "reason": "incomplete_observations_keep_full_branch",
                     "note": "includes uncovered future hours; no extrapolation"})
                 continue
-            candidates.append(({**g, "_observed": observed, "_qrc": (qr, qc)}, rc))
+            candidates.append(({**g, "snap_lat": lat, "snap_lon": lon,
+                                "_observed": observed, "_qrc": (qr, qc),
+                                "_snap_source": snap_source}, rc))
     except Exception as exc:
         log(f"boundary observation/network lookup unavailable ({type(exc).__name__}: {exc}); runoff-only")
         policy["lookup_error"] = f"{type(exc).__name__}: {exc}"
@@ -292,6 +397,7 @@ def prepare(gauge, output_dir, domain, start, end, *, dem_res="1",
             source, diagnostics = select_source(simulated, g["_observed"], min_ratio)
             values = g["_observed"] if source == "usgs" else simulated
             inlet = {"gauge_id": g["id"], "source": source,
+                     "snap_source": g["_snap_source"],
                      "lat": g["snap_lat"], "lon": g["snap_lon"],
                      "source_row": qr, "source_col": qc,
                      "times": [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in times],

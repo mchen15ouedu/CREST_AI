@@ -100,6 +100,9 @@ def fake_data(tmp_path, monkeypatch, incomplete=False):
                            crs="EPSG:4326", transform=transform, nodata=nodata) as ds:
             ds.write(data, 1)
     write(basic_dir / "fdir_clip.tif", network(), tr)
+    accum = np.asarray([[bf.upstream_mask(network(), (r, c)).sum() for c in range(7)]
+                        for r in range(9)], dtype="float32")
+    write(basic_dir / "facc_clip.tif", accum, tr)
     for i in range(3):
         when = T0 + dt.timedelta(hours=i)
         write(out_dir / f"q.{when:%Y%m%d_%H%M}.crest.tif",
@@ -113,12 +116,19 @@ def fake_data(tmp_path, monkeypatch, incomplete=False):
     upstream = []
     for gid, rc in [("upper", (1, 3)), ("lower", (4, 3)), ("outlet", (8, 3))]:
         lat, lon = point(rc)
-        upstream.append({"id": gid, "snap_lat": lat, "snap_lon": lon})
+        upstream.append({"id": gid, "snap_lat": lat, "snap_lon": lon, "lat": lat, "lon": lon, "area": 1})
+    control = (f'[Basic]\nDEM={basic_dir / "dem_clip.tif"}\nDDM={basic_dir / "fdir_clip.tif"}\n'
+               f'FAM={basic_dir / "facc_clip.tif"}\nESRIDDM=true\n')
+    for g in upstream:
+        control += f"\n[Gauge {g['id']}]\nLAT={g['lat']}\nLON={g['lon']}\n"
+    (tmp_path / "control.txt").write_text(control)
     basic = types.SimpleNamespace(store_dir=lambda bounds: str(basic_dir))
     extent = types.SimpleNamespace(ef5_extent=lambda gauge: ext,
         cell_of=lambda transform, lat, lon: (int(np.floor((~transform * (lon, lat))[1])),
                                               int(np.floor((~transform * (lon, lat))[0]))))
-    neighbors = types.SimpleNamespace(upstream_gauges=lambda *a, **kw: upstream, _D8=bf._D8)
+    neighbors = types.SimpleNamespace(upstream_gauges=lambda *a, **kw: upstream, _D8=bf._D8,
+        _cell_area_km2=lambda lat, cell: cell * cell * 111.32 ** 2 * np.cos(np.radians(lat)),
+        _snap=lambda acc, transform, lat, lon, area: bf._cell(transform, lat, lon))
     def series(*args):
         return [(T0 + dt.timedelta(hours=i), 100) for i in range(2 if incomplete else 3)]
     obs = types.SimpleNamespace(get_series=series)
@@ -159,6 +169,29 @@ def test_prepare_incomplete_future_keeps_full_basin_runoff_only(tmp_path, monkey
                for g in policy["excluded_gauges"])
     with rasterio.open(out / "domain_huc.tif") as ds:
         assert (ds.read(1) == 0).all()
+
+
+def test_generated_control_paths_and_legacy_neighbor_interface(tmp_path, monkeypatch):
+    gauge, out = fake_data(tmp_path, monkeypatch)
+    control_path = tmp_path / "control.txt"
+    text = control_path.read_text().replace("[Gauge lower]\n", "[Gauge lower]\nBASINAREA=1\n")
+    control_path.write_text(text)
+    basic, controls = bf.control_context(control_path)
+    assert basic["ddm"] == str(tmp_path / "basic" / "fdir_clip.tif")
+    assert controls["lower"]["basinarea"] == "1"
+    neighbors = sys.modules["hf_data.neighbors"]
+    legacy_rows = [{k: v for k, v in row.items() if k not in ("snap_lat", "snap_lon")}
+                   for row in neighbors.upstream_gauges(None)]
+    monkeypatch.setattr(neighbors, "upstream_gauges", lambda *a, **kw: legacy_rows)
+    # A modern/legacy cache-key mismatch must never change the run's terrain.
+    monkeypatch.setattr(sys.modules["hf_data.basic"], "store_dir",
+                        lambda *args: pytest.fail("must use actual control path"))
+    policy, _ = bf.prepare(gauge, str(out), {}, T0, T0 + dt.timedelta(hours=2),
+                           model="crest", log=lambda s: None)
+    assert policy["mode"] == "gauged-incremental"
+    assert policy["inlets"][0]["snap_source"] == "actual_q_lattice_d8_area_snap"
+    assert policy["inlets"][0]["source_row"] == 4
+    assert policy["implementation"] == bf.DEPLOYMENT_TAG
 
 
 def test_non_30m_request_rejected():
@@ -206,6 +239,7 @@ def test_outlet_disagreement_still_queues_and_preserves_prior_results(tmp_path, 
         return True
     set_module("eventqueue", types.SimpleNamespace(mode=lambda: "on", enqueue=enqueue))
     policy = {"version": 1, "policy": bf.POLICY, "mode": "runoff-only", "fingerprint": "topology",
+              "implementation": bf.DEPLOYMENT_TAG,
               "domain_mask_sha256": "mask", "content_sha256": "content",
               "subsurface_routing": {"mode": "kw"},
               "inlets": [], "excluded_gauges": []}

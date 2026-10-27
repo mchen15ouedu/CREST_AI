@@ -538,6 +538,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
             model=wb_model, log=log)
         trigger = {**(trigger or {}), "boundary_policy": {
             "version": coupling["version"], "mode": coupling["mode"],
+            "implementation": coupling["implementation"],
             "fingerprint": coupling["fingerprint"],
             "sources": [{k: i[k] for k in ("gauge_id", "source", "reason")}
                         for i in coupling["inlets"]],
@@ -594,7 +595,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                     "worker_protocol": 2,
                     "required_engine_prefix": "jetstream2:",
                     "coupling": {k: coupling[k] for k in
-                                 ("version", "policy", "mode", "fingerprint",
+                                 ("version", "policy", "mode", "fingerprint", "implementation",
                                   "domain_mask_sha256", "subsurface_routing")},
                     "boundary_content_sha256": coupling["content_sha256"],
                     "forcing_fingerprint": coupling["fingerprint"],
