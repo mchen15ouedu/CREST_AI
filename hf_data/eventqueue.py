@@ -64,6 +64,19 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
     api = eventstore._api()
     if api is None:
         return False
+    if int(spec.get("worker_protocol", 1)) >= 2:
+        # A protocol-2 spec without its exact sidecar must never become an
+        # apparently runnable legacy forcing bundle.
+        try:
+            with open(os.path.join(ef5_dir, "boundary_forcing.json"), encoding="utf-8") as fp:
+                boundary = json.load(fp)
+            if (str(spec.get("dem_res")) != "1" or boundary.get("version") != 1
+                    or boundary.get("fingerprint") != spec.get("forcing_fingerprint")
+                    or boundary.get("content_sha256") != spec.get("boundary_content_sha256")):
+                raise ValueError("boundary protocol/resolution/fingerprint differs from job spec")
+        except Exception as exc:
+            log(f"queue: boundary contract invalid ({type(exc).__name__}: {exc}) — not enqueued")
+            return False
     tifs = sorted(f for f in os.listdir(ef5_dir) if f.endswith(".tif"))
     if not tifs:
         log("queue: no EF5 grids to bundle — not enqueued")
@@ -73,6 +86,12 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
         with tarfile.open(tar_path, "w:gz") as tf:
             for f in tifs:
                 tf.add(os.path.join(ef5_dir, f), arcname=f)
+            # Closed, explicitly named protocol sidecars. Never bundle an
+            # arbitrary work directory or credentials alongside forcing.
+            for f in ("domain.geojson", "boundary_forcing.json"):
+                path = os.path.join(ef5_dir, f)
+                if os.path.isfile(path):
+                    tf.add(path, arcname=f)
         ops = [CommitOperationAdd(f"{QPREFIX}/{event_id}.json",
                                   io.BytesIO(json.dumps(spec).encode())),
                CommitOperationAdd(f"{QPREFIX}/{event_id}.forcing.tar.gz",

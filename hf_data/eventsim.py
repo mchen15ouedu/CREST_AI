@@ -1,6 +1,6 @@
 """V25: nowcast-triggered 2-D inundation events (CREST-iMAP v2 coupling).
 
-Chain: nowcast risk tiers (tier 3 = next-6-h AI peak >= Q5) -> hotspot
+Chain: AI nowcasting tiers (tier 3 = next-6-h AI peak >= Q5) -> hotspot
 clusters pick trigger gauges -> EF5 nowcast-mode run over the basin with
 output_grids=streamflow|runoff|subrunoff -> crestimap well-balanced solver
 (3DEP DEM on demand) -> compact depth frames -> eventstore (one commit).
@@ -130,13 +130,9 @@ def status(full: bool = False) -> dict:
 
 OBS_GATE_FRAC = float(os.environ.get("EVENT_OBS_GATE", "0.3"))   # of Q2
 OBS_WINDOW_H = int(os.environ.get("EVENT_OBS_WINDOW_H", "6"))
-# CREST-miss guard (user 2026-09-23): the event list is decided by the nowcast
-# trigger + the USGS observation, but the 2-D solver only has the water EF5
-# delivers (routed flow is a boundary condition, runoff routes inside). When
-# EF5's peak at the trigger gauge over the anchored window is below this
-# fraction of the observed peak, the map would be a dry basin beside a
-# flooding gauge — publish nothing, record the miss. No runoff scaling: a
-# bias-corrected forcing is not a simulation. 0 disables the guard.
+# Outlet-discharge disagreement is advisory: it does not measure the water
+# delivered by distributed surface/interflow grids. The same severe ratio
+# selects USGS fallback at a connected upstream cut gauge (not the outlet).
 MIN_SIM_FRAC = float(os.environ.get("EVENT_MIN_SIM_FRAC", "0.3"))
 
 
@@ -170,7 +166,7 @@ def _crest_missed(hydro: dict, trigger: dict | None, gid: str,
                   t_from: datetime.datetime, log=print) -> dict | None:
     """EF5 peak at the trigger gauge from t_from on vs the observed peak
     (hydro obs rows, else the trigger's observation, else NWIS now). A dict
-    describing the miss when sim < MIN_SIM_FRAC x obs, else None."""
+    describing severe under/overprediction, used only as an advisory."""
     if MIN_SIM_FRAC <= 0:
         return None
     key = t_from.strftime("%Y-%m-%d %H:%M")
@@ -197,11 +193,12 @@ def _crest_missed(hydro: dict, trigger: dict | None, gid: str,
     frac = sim_pk / obs_pk
     log(f"CREST check: EF5 peak {sim_pk:.1f} m3/s vs observed peak "
         f"{obs_pk:.1f} m3/s ({src}) = {100 * frac:.0f}% "
-        f"(guard {100 * MIN_SIM_FRAC:.0f}%)")
-    if frac >= MIN_SIM_FRAC:
+        f"(advisory range {MIN_SIM_FRAC:.2f}..{1 / MIN_SIM_FRAC:.2f}x)")
+    if MIN_SIM_FRAC <= frac <= 1 / MIN_SIM_FRAC:
         return None
     return {"sim_peak_m3s": round(sim_pk, 2), "obs_peak_m3s": round(obs_pk, 2),
-            "frac": round(frac, 3), "obs_source": src}
+            "frac": round(frac, 3), "obs_source": src,
+            "reason": "severe_underprediction" if frac < MIN_SIM_FRAC else "severe_overprediction"}
 
 
 def _age_days_started(s: dict) -> float | None:
@@ -381,15 +378,12 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     published folder is replaced with the fresh window).
     defer: enqueue for a worker WITHOUT the CPU fallback (manual refills —
     the runner stays free and the worker publishes whenever it gets there).
-    force_cpu: solve locally even in queue mode "on" — the tick passes this
-    when an event has sat unclaimed/unpublished past EVENT_CPU_FALLBACK_H
-    (V30: the CPU rung is demoted to that last resort; a fresh enqueue no
-    longer burns hours of runner CPU on a solve a worker replaces anyway).
+    force_cpu: retained for older callers; boundary protocol 2 always waits
+    for a compatible Jetstream2 worker, because CPU images retain old code.
     cold: do NOT carry the episode's previous depth frame into the bundle as
     a warm start — the workers re-solve the whole anchored span from the
     channel pre-wet, and publish replaces every frame (a full re-run, e.g.
     after the engine/domain changed; the box-era frames must not survive)."""
-    from crestimap import EventConfig, run_event   # needs the v2 package
     from . import eventqueue, eventstore, nowcaststore, pipeline
 
     g = pipeline.gauge_info(gid)
@@ -487,45 +481,16 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         model = (meta.get("model") or "crest").lower()
         wb_model = "crest" if model in ("crest", "hp") else "crestphys"
 
-        # CREST-miss guard: no map when EF5 missed the flood the gauge saw
+        # Outlet Q is evaluation/advisory data, never an injected boundary.
+        # User policy 2026-10-27: use observed Q only at safe upstream cuts;
+        # otherwise let the runoff-driven 2-D solve assess the water supplied.
         miss = _crest_missed(hydro, trigger, gid, sim_anchor, log)
         if miss:
-            reopened = bool(episode_id and (trigger or {}).get("reopened"))
-            rec = {"event": ev_id, "gauge": gid, "t0": t0.strftime("%Y-%m-%dT%H:%MZ"),
-                   "episode": bool(episode_id), "reopened": reopened,
-                   "at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   **miss}
-            log(f"CREST MISSED IT: EF5 peak {miss['sim_peak_m3s']} m3/s is "
-                f"{100 * miss['frac']:.0f}% of the observed {miss['obs_peak_m3s']} "
-                f"m3/s — no inundation map published for {ev_id}")
-            if reopened:
-                # a reopened episode was already finalized: its listed record
-                # predates this re-run and is never dropped or purged for it —
-                # the miss is only noted (advisory, as the deployed runner
-                # treats outlet-Q misses since 2026-10-27)
-                log("reopened episode: listed map kept, miss noted only")
-            elif episode_id:
-                # the listed map came from the same EF5 water — just as
-                # wrong; take it down rather than leave a dry basin listed
-                # (pinned demo events are never dropped: drop_events refuses)
-                try:
-                    dropped = eventstore.drop_events([episode_id], purge=True,
-                                                     why="CREST missed it")
-                    log("listed map disowned: dropped from the list" if dropped
-                        else "listed map kept (pinned demo event or nothing to drop)")
-                except Exception as e:
-                    log(f"drop failed ({type(e).__name__})")
-            with _lock:
-                _running.setdefault("missed", []).append(rec)
-                del _running["missed"][:-50]
-            try:
-                eventstore.note_missed(rec)
-            except Exception as e:
-                log(f"missed.json not updated ({type(e).__name__})")
-            _running["last"] = {"event": ev_id, "ok": True,
-                                "skipped": "crest_missed", **miss}
-            return {"event_id": ev_id, "published": False,
-                    "skipped": "crest_missed", **miss}
+            trigger = {**(trigger or {}), "outlet_q_advisory": {
+                **miss, "action": "continue_runoff_driven_2d",
+                "note": "Outlet Q mismatch is not a distributed-runoff volume check"}}
+            log(f"outlet Q advisory: EF5 peak is {100 * miss['frac']:.0f}% of "
+                "observed; continuing 2-D preparation with explicit boundary policy")
 
         # diagnostics: what did EF5 actually write, and what did we ask for?
         ctl = os.path.join(work, "control.txt")
@@ -566,6 +531,18 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         sim_start_local = max(sim_anchor,
                               t0 - datetime.timedelta(hours=SIM_BACKSET_H))
 
+        from . import boundary_fallback
+        coupling, dom = boundary_fallback.prepare(
+            g, out_dir, dom, sim_start, t_end, dem_res=DEM_RES,
+            min_ratio=(MIN_SIM_FRAC if 0 < MIN_SIM_FRAC < 1 else 0.3),
+            model=wb_model, log=log)
+        trigger = {**(trigger or {}), "boundary_policy": {
+            "version": coupling["version"], "mode": coupling["mode"],
+            "fingerprint": coupling["fingerprint"],
+            "sources": [{k: i[k] for k in ("gauge_id", "source", "reason")}
+                        for i in coupling["inlets"]],
+            "excluded_gauges": coupling["excluded_gauges"]}}
+
         # warm continuation (user directive 2026-08-14): the hourly update
         # inherits the previous run's water state. The episode's latest
         # published depth frame at/just before this run's fresh-slice start
@@ -575,9 +552,17 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         if episode_id and cold:
             log("cold re-run: no warm-start frame — the whole anchored span "
                 "is re-solved and every published frame replaced")
+        elif episode_id and coupling["subsurface_routing"]["mode"] == "kw":
+            log("KW interflow requires its full water/IR checkpoint; no depth-only "
+                "warm start is copied (worker resumes its complete local session or reconstructs from anchor)")
         elif episode_id:
             try:
                 pm = eventstore._prior_manifest(ev_id) or {}
+                prior_fingerprint = ((pm.get("coupling") or {}).get("fingerprint")
+                                     or pm.get("forcing_fingerprint")
+                                     or ((pm.get("trigger") or {}).get("boundary_policy") or {}).get("fingerprint"))
+                if prior_fingerprint != coupling["fingerprint"]:
+                    raise ValueError("boundary policy/domain changed; prior depth cannot initialize this solve")
                 js = sim_start_local.strftime("%Y-%m-%dT%H:%MZ")
                 cand = [f for f in pm.get("frames", [])
                         if f.get("t", "") <= js and f.get("file")]
@@ -601,13 +586,19 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
             except Exception as e:
                 log(f"no warm-start IC ({type(e).__name__}) — cold pre-wet")
 
-        # V27 P1: offer the solve to a GPU worker — full basin at native
-        # resolution, everything it needs in one bundle. The worker pool is
-        # a ladder (HPC GPU -> ZeroGPU Space -> nobody); the local CPU
-        # window below remains the unconditional fallback.
+        # Offer the native-resolution basin and its versioned forcing
+        # contract to the compatible Jetstream2 worker.
         queued = False
         if eventqueue.mode() != "off":
             spec = {"event_id": ev_id, "episode": bool(episode_id),
+                    "worker_protocol": 2,
+                    "required_engine_prefix": "jetstream2:",
+                    "coupling": {k: coupling[k] for k in
+                                 ("version", "policy", "mode", "fingerprint",
+                                  "domain_mask_sha256", "subsurface_routing")},
+                    "boundary_content_sha256": coupling["content_sha256"],
+                    "forcing_fingerprint": coupling["fingerprint"],
+                    "interflow": "kw",
                     "gauge": {"id": gid, "lat": g["lat"], "lon": g["lon"],
                               "area_km2": g.get("area")},
                     "bbox_basin": list(dom_extent),
@@ -659,100 +650,24 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                     # the bundle queued; the tick re-checks and only falls
                     # back to a local solve after EVENT_CPU_FALLBACK_H with
                     # no claim and no publish progress
-                    log(f"no worker claim — bundle stays queued (CPU "
-                        f"fallback only after {CPU_FALLBACK_H:g} h "
-                        f"without progress)")
+                    log("no worker claim — bundle stays queued for a compatible "
+                        "Jetstream2 worker (CPU fallback disabled for boundary protocol 2)")
                     _running["last"] = {"event": ev_id, "ok": True,
                                         "queued": True}
                     return {"event_id": ev_id, "published": False,
                             "queued": True}
 
-        with _lock:
-            _running["status"] = "solver"
-        # wall-clock budget for the demoted CPU rung (see CPU_MAX_H): the
-        # solver calls progress once per output frame, so raising from the
-        # callback aborts mid-integration instead of holding the tick for
-        # days. Only armed when a worker can pick the bundle up instead.
-        solve_log = log
-        if queued and CPU_MAX_H > 0:
-            deadline = time.monotonic() + CPU_MAX_H * 3600.0
+        # CPU images retain the previous solver pin. Only the compatible
+        # Jetstream2 worker may consume this versioned forcing contract.
+        if queued:
+            log("boundary protocol 2: waiting for a compatible Jetstream2 worker; "
+                "CPU fallback is disabled for this policy")
+            _running["last"] = {"event": ev_id, "ok": True, "queued": True,
+                                "worker_protocol": 2}
+            return {"event_id": ev_id, "published": False, "queued": True,
+                    "worker_protocol": 2}
+        raise RuntimeError("boundary protocol 2 requires a successfully queued compatible worker job")
 
-            def solve_log(s):                       # noqa: F811
-                log(s)
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"local CPU solve exceeded EVENT_CPU_MAX_H="
-                        f"{CPU_MAX_H:g} h ({s})")
-
-        # CPU rung domain: the HUC12 units nearest the gauge that fit the CPU
-        # cell budget at native resolution — hydrologic units, never a
-        # window. Written to its own dir so the full-basin domain already
-        # bundled for the workers is untouched.
-        cpu_dom_dir = os.path.join(work, "cpu_domain")
-        cpu_dom = hucdomain.build_domain(g, out_dir, dem_res=DEM_RES,
-                                         out_dir=cpu_dom_dir,
-                                         max_cells=MAX_CELLS, log=log)
-        cfg = EventConfig(
-            event_id=ev_id, bbox=tuple(cpu_dom["bbox"]),
-            t0=t0, t_end=t_end, ef5_output_dir=out_dir,
-            out_dir=os.path.join(work, "event_out"), model=wb_model,
-            sim_start=sim_start_local,
-            dem_res=DEM_RES, dem_cache=DEM_CACHE, max_cells=MAX_CELLS,
-            domain_path=os.path.join(cpu_dom_dir, "domain_huc.tif"),
-            trigger={**(trigger or {}), "gauge": gid}, progress=solve_log)
-        try:
-            manifest = run_event(cfg)
-        except TimeoutError as e:
-            # not a failure — the designed give-up. The bundle is already in
-            # the queue, so the work is not lost; only this runner is freed.
-            with _lock:
-                _cpu_timeout[ev_id] = datetime.datetime.utcnow()
-            log(f"{e} — aborted, bundle stays queued for a worker "
-                f"(no CPU retry for {CPU_COOLDOWN_H:g} h)")
-            _running["last"] = {"event": ev_id, "ok": True,
-                                "cpu_timeout": True, "queued": True}
-            return {"event_id": ev_id, "published": False,
-                    "cpu_timeout": True, "queued": True}
-        manifest["gauge"] = gid
-        manifest["hydro"] = [hydro[k] for k in sorted(hydro)]
-        manifest["status"] = "active"
-        manifest["basin"] = basin_ring     # HUC12 union outline (whole basin)
-        manifest["huc12s"] = [h["huc12"] for h in dom["hucs"]]
-        # domain summary = builder facts (units, area) + solver facts (cells)
-        manifest["domain"] = {**{k: v for k, v in dom.items()
-                                 if k not in ("basin", "hucs")},
-                              **(manifest.get("domain") or {})}
-        if cpu_dom.get("trimmed"):
-            manifest["cpu_trimmed"] = {"n_hucs": cpu_dom["n_hucs"],
-                                       "area_km2": cpu_dom["area_km2"],
-                                       "of_n_hucs": dom.get("of_n_hucs") or dom["n_hucs"]}
-
-        with _lock:
-            _running["status"] = "archive"
-        try:
-            _update_archive(cfg.out_dir, manifest, log)
-        except Exception as e:
-            log(f"archive update failed ({type(e).__name__}: {e}) — "
-                f"continuing without it")
-        if not manifest.get("archive_frames"):
-            # bone-dry simulation: nothing to show, nothing to re-run — end
-            # the episode so the hourly tick stops burning compute on it
-            manifest["status"] = "ended"
-            manifest["dry"] = True
-            log("simulated dry (no wet cells in any frame) — episode ended")
-
-        with _lock:
-            _running["status"] = "render"
-        _make_pngs(cfg.out_dir, manifest)
-        log(f"rendered {len(manifest['frames'])} PNG overlays")
-
-        with _lock:
-            _running["status"] = "publish"
-        ok = eventstore.publish_event(cfg.out_dir, manifest)
-        log("published" if ok else "publish FAILED (kept locally)")
-        manifest["published"] = ok
-        _running["last"] = {"event": ev_id, "ok": True, "published": ok}
-        return manifest
     except Exception as e:
         import traceback
         tb = traceback.format_exc().strip().splitlines()
