@@ -126,7 +126,7 @@ def _clip_one_param(src_path: str, fname: str, bbox, out_dir: str, key: str,
                        nodata=-9999.0, crs="EPSG:4326", interleave="pixel")
         profile.pop("compress", None)   # EF5 TifGrid-safe: plain 1-row strips
     path = os.path.join(out_dir, fname)
-    tmp = path + ".tmp"                 # atomic: parallel runs share this store
+    tmp = f"{path}.{os.getpid()}.tmp"   # atomic + per-process: parallel runs share this store
     with rasterio.open(tmp, "w", **profile) as dst:
         dst.write(data, 1)
     os.replace(tmp, path)

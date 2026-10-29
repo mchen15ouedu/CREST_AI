@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import multiprocessing
 import os
 import shutil
 import sys
@@ -393,7 +394,11 @@ def main():
     t0 = datetime.fromisoformat(args.start)
     t1 = datetime.fromisoformat(args.end)
     ok = fail = 0
-    with ProcessPoolExecutor(max_workers=args.workers) as pool, \
+    # spawn, not fork: the parent's hf-xet transfer runtime (its threads and
+    # locks, started by the COG prefetch) must not be copied into workers - a
+    # forked worker deadlocked on it (futex) on the Jetstream2 VM, 2026-10-27
+    with ProcessPoolExecutor(max_workers=args.workers,
+                             mp_context=multiprocessing.get_context("spawn")) as pool, \
             open(PROGRESS, "a") as prog:
         futs = {pool.submit(run_one_gauge, g, t0, t1, args.chunk_days): g
                 for g in todo}
