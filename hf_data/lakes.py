@@ -12,12 +12,15 @@ EF5 (the pinned EF5 put such a lake on the basin outlet).
 EF5 facts this module relies on (fork, lake-state-fix):
   * lakes.csv th_volume is in MILLION m3 (BasinConfigSection::ReadLakesFromCSV,
     not the km3 of the README), area km2, klake hours;
+  * a lake sits on its lat/lon cell only with the `exact` column (else
+    LakeMap moves it to the largest FAM within 50 cells, ~4.5 km);
   * lake states are lake_storage_<YYYYMMDD_HHMM>.tif (m3) and lake_outflow_
     (m3/s) on the run raster, read at the lake's own cell; a cold start
     without them begins FULL (storage = th_volume);
   * the pinned 5a26a86 saves one file per lake and the last writer wins, so
-    every other lake reloads 0: lakes need EF5 with LakeModelImpl::
-    SaveStatesAll. CREST_LAKES stays "off" on a host until its EF5 has it.
+    every other lake reloads 0. Lakes need the fork's lake-state-fix branch
+    (SaveStatesAll + the exact column); CREST_LAKES stays "off" on a host
+    until its EF5 has it.
 
 Which run gets lakes: CREST_LAKES = off (default) | west (outlets west of
 pipeline.WEST_LON, the CREST region) | all.
@@ -110,13 +113,15 @@ def for_run(nodes: np.ndarray, tr, mult: tuple[float, float] = (1.0, 1.0)):
 
 
 def write_csv(path: str, lakes) -> str:
-    """EF5 lakes.csv. th_volume in MILLION m3 (the active reader's unit)."""
+    """EF5 lakes.csv. th_volume in MILLION m3 (the active reader's unit);
+    exact=1 keeps each lake on its snapped cell (EF5 would otherwise move it
+    to the largest FAM within 50 cells - onto a bigger stream)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write("name,lat,lon,th_volume,area,klake\n")
+        fh.write("name,lat,lon,th_volume,area,klake,exact\n")
         for x in lakes.itertuples():
             fh.write(f"{x.id},{x.snap_lat:.7f},{x.snap_lon:.7f},{x.th_volume_mm3:.6g},"
-                     f"{x.area_km2:.6g},{x.klake_h:.6g}\n")
+                     f"{x.area_km2:.6g},{x.klake_h:.6g},1\n")
     return os.path.abspath(path)
 
 

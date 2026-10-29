@@ -67,9 +67,11 @@ def test_csv_volume_in_million_m3(table, tmp_path):
     got = table.for_run(_nodes(), _tr())
     p = table.write_csv(str(tmp_path / "lakes.csv"), got)
     lines = open(p).read().splitlines()
-    assert lines[0] == "name,lat,lon,th_volume,area,klake"
-    name, lat, lon, vol, area, k = lines[1].split(",")
+    assert lines[0] == "name,lat,lon,th_volume,area,klake,exact"
+    name, lat, lon, vol, area, k, exact = lines[1].split(",")
     assert name == "NID0" and float(vol) == pytest.approx(4.0) and float(k) == 1000.0
+    assert exact == "1"                          # EF5 keeps the lake on this cell
+    assert (float(lat), float(lon)) == pytest.approx(_centre(1, 2))
 
 
 def test_multipliers():
