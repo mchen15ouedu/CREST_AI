@@ -398,6 +398,7 @@ def run_pass(t0):
             futs[pool.submit(run_one, p["id"], t0_iso, force)] = p["id"]
         last_pub = 0
         last_hw_saved = 0
+        last_note = time.time()
         for i, fu in enumerate(as_completed(futs), 1):
             try:
                 r = fu.result()
@@ -418,9 +419,15 @@ def run_pass(t0):
                     new_headwater += 1
             else:
                 fail += 1
-            if i % 200 == 0:
+            # the first completion, every 25th, and at least every 15 min while
+            # points complete: a cold pass (every point warms up from scratch
+            # after a restart) runs for hours, and a slow pass must not look
+            # like a hung one
+            if i == 1 or i % 25 == 0 or time.time() - last_note > 900:
+                last_note = time.time()
                 _log(f"  {i}/{len(pts)} done ({ok} ok, {fail} fail, {up} up, "
-                     f"{len(rows)} routed, {new_headwater} new headwater)")
+                     f"{len(rows)} routed, {new_headwater} new headwater, "
+                     f"{(time.time() - t_start) / 60:.0f} min)")
             if (len(rows) - last_pub >= PUBLISH_EVERY
                     or sum(len(f["blob"]) for f in _pending_fleet) > 150e6):
                 _publish()
@@ -433,10 +440,6 @@ def run_pass(t0):
     if rows and len(rows) != last_pub:
         _publish()                                  # final publish for this pass
     up += _flush_fleet()
-    if new_headwater:
-        _save_ineligible()
-        _log(f"  {new_headwater} new headwater points -> no-upstream list "
-             f"({len(_ineligible)} total, skipped next pass)")
     if new_headwater:
         _save_ineligible()
         _log(f"  {new_headwater} new headwater points -> no-upstream list "
