@@ -307,3 +307,20 @@ def test_empty_warm_up_leaves_lakes_at_the_normal_pool(table, tmp_path):
     write_grid(os.path.join(sd, "lake_storage_20261020_1600.tif"), s, WEST, NORTH)
     assert table.ensure_states(sd, T0, got, _dem(tmp_path)) is None
     assert _read(os.path.join(sd, "lake_storage_20261020_1600.tif"))[1, 2] == pytest.approx(1.0e6)
+
+
+def test_dam_on_a_natural_lake_follows_the_natural_rule():
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "scripts"))
+    from build_lakes import NATURAL_EQ_FRAC as f, ef5_param_b, retention_h
+    L = pd.DataFrame({"kind": ["dam", "dam", "natural"], "v_km3": [0.9, 0.9, 0.9],
+                      "q_mean_m3s": [10.0, 10.0, 10.0], "flood": [False, False, False],
+                      "s0_frac": [0.9, f, f], "lake_ctl": [False, True, False]})
+    k = retention_h(L)
+    full = 0.9e9 / 10.0 / 3600.0
+    b = float(ef5_param_b(np.array([0.9]))[0])
+    # a reservoir passes its mean inflow when full; a lake (or a dam on one)
+    # at its equilibrium f x V
+    assert k[0] == pytest.approx(full)
+    assert k[1] == pytest.approx(f ** (1.0 + b) * full) == pytest.approx(k[2])

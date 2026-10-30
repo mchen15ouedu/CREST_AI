@@ -40,6 +40,12 @@ V/K; above V the excess spills at once.
     so the lake at f x V passes exactly its mean inflow (b = EF5's
     LakeInfo::CalculateParamB of V, replicated in ef5_param_b);
   * dams: K = V / mean inflow (a full reservoir passes its mean inflow);
+  * a dam on a natural lake (HydroLAKES Lake_type 1 lake or 3 lake control:
+    Tahoe, Klamath, Bear Lake) regulates a band on top of a natural lake that
+    is NOT drawn down like a reservoir: it takes the natural-lake rule (S0 =
+    f x V, K = f^(1+b) x V / mean inflow) on its NID V (PI 2026-10-30;
+    starting it at its normal pool started Tahoe full and it spilled every
+    storm - peak 1,026 vs 10.6 m3/s observed, 39 with this rule);
   * mean inflow (dams and lakes) = the cell's drainage area x the
     observation-based mean annual runoff (GAGES-II RUNAVE7100) of a gauge
     basin containing it of about the same size, else HydroLAKES Dis_avg,
@@ -98,6 +104,7 @@ AREA_MATCH = 2.0             # gauge basin vs lake drainage area, for its runoff
 POND_MAX_KM3 = 0.001         # ponds are small (1 Mm3, ~810 acre-ft)
 NATURAL_DEPTH_M = 1.0        # active storage above a natural lake's outlet
 NATURAL_EQ_FRAC = 0.5        # natural lakes: equilibrium (and starting) storage / V (PI 2026-10-30)
+NATURAL_LAKE_TYPES = (1, 3)  # HydroLAKES lake / lake control: a dam there follows the natural rule
 POND_K_H = 1.0e7             # "no release" for outlet-less ponds (~1,100 years)
 MIN_K_H = 3.0
 AF_M3 = 1233.48
@@ -262,7 +269,8 @@ def merge_duplicates(L: pd.DataFrame) -> pd.DataFrame:
         if len(hl):
             if keep.hylak_id <= 0:                          # NID row + a HydroLAKES twin
                 b = hl[np.argmax(L.area_km2.values[hl].astype("float64"))]
-                keep["hylak_id"], keep["grand_id"] = L.at[b, "hylak_id"], L.at[b, "grand_id"]
+                for col in ("hylak_id", "grand_id", "lake_type"):
+                    keep[col] = L.at[b, col]
             dis = L.dis_avg.values[hl].astype("float64")
             if np.isfinite(dis).any():
                 keep["dis_avg"] = np.nanmax(dis)            # the downstream pour point's
@@ -380,13 +388,17 @@ def mean_runoff(L: pd.DataFrame, ro_m, ro_r, a_q):
 
 
 def retention_h(L: pd.DataFrame) -> np.ndarray:
-    """K (hours) per row. Ponds: POND_K_H. Natural lakes: f^(1+b) x V /
-    mean inflow, so the lake at its equilibrium storage f x V passes its mean
-    inflow (Q = fV/K x f^b; PI 2026-10-30). Dams: V / mean inflow, capped at
+    """K (hours) per row. Ponds: POND_K_H. Natural lakes and dams on one
+    (lake_ctl): f^(1+b) x V / mean inflow, so the lake at its equilibrium
+    storage f x V passes its mean inflow (Q = fV/K x f^b; PI 2026-10-30).
+    Dams: V / mean inflow, capped at
     FLOOD_K_H only for a normally-dry flood pool (flood purpose, S0 = 0) - a
     flood-control dam WITH a normal pool is a reservoir like any other."""
     k = L.v_km3.values * 1e9 / L.q_mean_m3s.values / 3600.0
-    k = np.where((L.kind == "natural").values,
+    nat = (L.kind == "natural").values
+    if "lake_ctl" in L:
+        nat = nat | L.lake_ctl.astype(bool).values
+    k = np.where(nat,
                  NATURAL_EQ_FRAC ** (1.0 + ef5_param_b(L.v_km3.values)) * k, k)
     dry = (L.flood.astype(bool) & (L.s0_frac <= 0)).values
     return np.where((L.kind == "pond").values, POND_K_H,
@@ -429,14 +441,14 @@ def main() -> int:
                          "area_km2": np.nanmax([n.area_km2, r.Lake_area]),
                          "dis_avg": r.Dis_avg, "purpose": n.purpose, "gate": n.gate,
                          "hylak_id": int(r.Hylak_id), "grand_id": int(r.Grand_id), "nid_id": n.nid_id,
-                         "flood": bool(n.flood), "country": r.Country})
+                         "lake_type": int(r.Lake_type), "flood": bool(n.flood), "country": r.Country})
         else:
             rows.append({"id": f"HL{int(r.Hylak_id)}", "name": r.Lake_name or "", "kind": "natural",
                          "source": "hydrolakes", "lat": r.lat, "lon": r.lon, "ref_km2": r.Wshd_area,
                          "v_km3": r.Lake_area * NATURAL_DEPTH_M * 1e-3, "s0_frac": NATURAL_EQ_FRAC,
                          "area_km2": r.Lake_area, "dis_avg": r.Dis_avg, "purpose": "", "gate": "",
                          "hylak_id": int(r.Hylak_id), "grand_id": int(r.Grand_id), "nid_id": "",
-                         "flood": False, "country": r.Country})
+                         "lake_type": int(r.Lake_type), "flood": False, "country": r.Country})
     for j, n in d.iterrows():                        # NID dams HydroLAKES lacks
         if j in matched_nid:
             continue
@@ -444,8 +456,8 @@ def main() -> int:
                      "source": "nid", "lat": n.lat, "lon": n.lon, "ref_km2": n.da_km2,
                      "v_km3": n.v_af * AF_M3 / 1e9, "s0_frac": n.s0_frac, "area_km2": n.area_km2,
                      "dis_avg": np.nan, "purpose": n.purpose, "gate": n.gate,
-                     "hylak_id": 0, "grand_id": 0, "nid_id": n.nid_id, "flood": bool(n.flood),
-                     "country": US})
+                     "hylak_id": 0, "grand_id": 0, "nid_id": n.nid_id, "lake_type": 0,
+                     "flood": bool(n.flood), "country": US})
     L = pd.DataFrame(rows)
     # NID ids repeat for multi-structure dams: one water body each
     L = L.sort_values("v_km3", ascending=False).drop_duplicates("id").reset_index(drop=True)
@@ -482,6 +494,11 @@ def main() -> int:
     # is not normally dry, whatever NID lists as its normal pool
     perm = L.flood.astype(bool) & (L.s0_frac <= 0) & (L.hylak_id > 0)
     L.loc[perm, "s0_frac"] = PERMANENT_FLOOD_S0_FRAC
+    # a dam on a natural lake (Lake Tahoe Dam): its V is the regulated band
+    # on top of the lake, which sits at an equilibrium like any natural lake -
+    # the natural-lake S0 and K (retention_h), not its normal pool
+    L["lake_ctl"] = (L.kind == "dam") & L.lake_type.isin(NATURAL_LAKE_TYPES)
+    L.loc[L.lake_ctl, "s0_frac"] = NATURAL_EQ_FRAC
     # a normally-dry flood pool has (almost) no lake surface: re-estimating
     # its area from V would rain onto desert the land cells already route
     dry = L.flood & (L.s0_frac <= 0)
@@ -500,7 +517,7 @@ def main() -> int:
     keep = ["id", "name", "kind", "source", "lat", "lon", "snap_lat", "snap_lon", "snap_row",
             "snap_col", "fam_km2", "ref_km2", "snap_rule", "v_km3", "s0_km3", "area_km2",
             "q_mean_m3s", "q_source", "runoff_mm", "k_h", "flood", "purpose", "gate", "hylak_id",
-            "grand_id", "nid_id", "country", "merged_ids"]
+            "grand_id", "lake_type", "lake_ctl", "nid_id", "country", "merged_ids"]
     L = L[keep].sort_values(["snap_row", "snap_col"]).reset_index(drop=True)
     # one lake per cell: the module keys a lake by its cell; keep the largest
     L = L.sort_values("v_km3", ascending=False).drop_duplicates(["snap_row", "snap_col"])
@@ -514,6 +531,7 @@ def main() -> int:
             "builder_sha": _git_sha(), "west_lon": args.west_lon,
             "natural_depth_m": NATURAL_DEPTH_M, "natural_eq_frac": NATURAL_EQ_FRAC,
             "natural_law": "S0 = f V; K = f^(1+b) V / Q_mean, b = EF5 CalculateParamB(V km3)",
+            "lake_ctl_rule": f"dams on HydroLAKES Lake_type {list(NATURAL_LAKE_TYPES)}: natural_law",
             "pond_k_h": POND_K_H, "min_k_h": MIN_K_H,
             "flood_k_h": FLOOD_K_H, "flood_k_rule": "dry flood pools only (flood & S0 = 0)",
             "max_normal_ratio": MAX_NORMAL_RATIO, "match_km": MATCH_KM, "da_tol": DA_TOL,
