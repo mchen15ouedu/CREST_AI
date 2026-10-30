@@ -155,15 +155,24 @@ def commit(run_dir: str, shared_dir: str, clobber: bool = True) -> int:
     """Move the states EF5 wrote in run_dir to the shared folder (files staged
     from there are skipped). clobber=False keeps an existing shared file of
     the same name (nowcast/event runs must not replace the hindcast chain's
-    states). Returns how many files moved."""
+    states). A lake_set_<stamp>.json moves only with its lake_storage_<stamp>
+    grid: beside a shared grid it did not replace it would vouch for another
+    run's lake storage. Returns how many files moved."""
     n = 0
     if not os.path.isdir(run_dir):
         return 0
     os.makedirs(shared_dir, exist_ok=True)
-    for f in sorted(os.listdir(run_dir)):
+    names = sorted(os.listdir(run_dir))
+    moved = set()
+    # sidecars last: they follow their grid
+    for f in ([x for x in names if not x.startswith("lake_set_")]
+              + [x for x in names if x.startswith("lake_set_")]):
         src = os.path.join(run_dir, f)
         dst = os.path.join(shared_dir, f)
         if not os.path.isfile(src) or f.endswith(".tmp"):
+            continue
+        if f.startswith("lake_set_") and f.endswith(".json") and \
+                f"lake_storage_{f[len('lake_set_'):-len('.json')]}.tif" not in moved:
             continue
         if os.path.exists(dst):
             try:
@@ -174,6 +183,7 @@ def commit(run_dir: str, shared_dir: str, clobber: bool = True) -> int:
             if not clobber:
                 continue
         if _replace(src, dst):
+            moved.add(f)
             n += 1
     return n
 

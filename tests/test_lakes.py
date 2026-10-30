@@ -157,3 +157,153 @@ def test_control_switches_the_module_on(tmp_path):
     spec.lakes_csv = None
     build_control(spec)
     assert "LAKE" not in open(spec.control_path).read()
+
+
+def test_bad_saved_storage_starts_at_the_normal_pool(table, tmp_path):
+    sd = str(tmp_path / "states")
+    os.makedirs(sd)
+    got = table.for_run(_nodes(), _tr())
+    for bad in (-9999.0, np.nan, -1.0):
+        s = np.zeros((5, 5))
+        s[1, 2] = bad                            # EF5's nodata / a NaN / a negative volume
+        write_grid(os.path.join(sd, "lake_storage_20261020_1600.tif"), s, WEST, NORTH,
+                   nodata=None)
+        write_grid(os.path.join(sd, "lake_outflow_20261020_1600.tif"), np.zeros((5, 5)),
+                   WEST, NORTH)
+        table.tag_states(sd, got)
+        assert table.prepare_states(sd, T0, got, _dem(tmp_path)) == {"kept": 0, "initial": 1}
+        assert _read(os.path.join(sd, "lake_storage_20261020_1600.tif"))[1, 2] == pytest.approx(3.0e6)
+
+
+def test_lake_set_sidecar_never_written_through_a_hard_link(table, tmp_path):
+    sh, rd = tmp_path / "shared", tmp_path / "run"
+    sh.mkdir()
+    rd.mkdir()
+    shared = sh / "lake_set_20261020_1600.json"
+    shared.write_text(json.dumps({"table": "other", "mult": [1.0, 1.0], "ids": ["X"]}))
+    os.link(shared, rd / "lake_set_20261020_1600.json")      # as runstates.stage links it
+    got = table.for_run(_nodes(), _tr())
+    table.prepare_states(str(rd), T0, got, _dem(tmp_path))
+    assert json.loads(shared.read_text())["ids"] == ["X"]     # the shared file is untouched
+    assert json.loads((rd / "lake_set_20261020_1600.json").read_text())["ids"] == ["NID0"]
+    os.link(shared, rd / "lake_set_20261020_1700.json")
+    write_grid(str(rd / "lake_storage_20261020_1700.tif"), np.zeros((5, 5)), WEST, NORTH)
+    table.tag_states(str(rd), got)
+    assert json.loads(shared.read_text())["ids"] == ["X"]
+    assert not [f for f in os.listdir(rd) if f.endswith(".tmp")]
+
+
+def test_commit_moves_a_lake_set_only_with_its_grid(tmp_path):
+    from hf_data import runstates
+    sh, rd = tmp_path / "shared", tmp_path / "run"
+    sh.mkdir()
+    rd.mkdir()
+    # 16:00: the grid is a staged hard link (skipped) - its sidecar must stay
+    write_grid(str(sh / "lake_storage_20261020_1600.tif"), np.zeros((5, 5)), WEST, NORTH)
+    os.link(sh / "lake_storage_20261020_1600.tif", rd / "lake_storage_20261020_1600.tif")
+    (sh / "lake_set_20261020_1600.json").write_text("old")
+    (rd / "lake_set_20261020_1600.json").write_text("new")
+    # 17:00: new grid + sidecar move together; 18:00: a sidecar without a grid stays
+    write_grid(str(rd / "lake_storage_20261020_1700.tif"), np.ones((5, 5)), WEST, NORTH)
+    (rd / "lake_set_20261020_1700.json").write_text("new17")
+    (rd / "lake_set_20261020_1800.json").write_text("orphan")
+    # 19:00: no clobber keeps the shared grid - and so its sidecar
+    write_grid(str(sh / "lake_storage_20261020_1900.tif"), np.zeros((5, 5)), WEST, NORTH)
+    (sh / "lake_set_20261020_1900.json").write_text("old19")
+    write_grid(str(rd / "lake_storage_20261020_1900.tif"), np.ones((5, 5)), WEST, NORTH)
+    (rd / "lake_set_20261020_1900.json").write_text("new19")
+    assert runstates.commit(str(rd), str(sh), clobber=False) == 2
+    assert (sh / "lake_set_20261020_1600.json").read_text() == "old"
+    assert (sh / "lake_set_20261020_1700.json").read_text() == "new17"
+    assert not (sh / "lake_set_20261020_1800.json").exists()
+    assert (sh / "lake_set_20261020_1900.json").read_text() == "old19"
+
+
+def test_bundle_keeps_lake_storage_and_its_sidecar(tmp_path):
+    import rasterio
+    from hf_data import statebundle
+    sd, out = tmp_path / "s", tmp_path / "u"
+    sd.mkdir()
+    s = np.zeros((5, 5))
+    s[1, 2] = 1.234567e10                        # m3: float16 tops out at 65504
+    write_grid(str(sd / "lake_storage_20261020_1600.tif"), s, WEST, NORTH)
+    write_grid(str(sd / "lake_outflow_20261020_1600.tif"), np.full((5, 5), 0.3), WEST, NORTH)
+    write_grid(str(sd / "crest_SM_20261020_1600.tif"), np.full((5, 5), 0.3), WEST, NORTH)
+    (sd / "lake_set_20261020_1600.json").write_text('{"ids": ["NID0"]}')
+    statebundle.unpack(statebundle.pack_dir(str(sd)), str(out))
+    with rasterio.open(out / "lake_storage_20261020_1600.tif") as ds:
+        assert ds.read(1)[1, 2] == np.float32(1.234567e10)
+    with rasterio.open(out / "lake_outflow_20261020_1600.tif") as ds:
+        assert ds.read(1)[0, 0] == np.float32(0.3)              # lossless
+    with rasterio.open(out / "crest_SM_20261020_1600.tif") as ds:
+        assert ds.read(1)[0, 0] == np.float32(np.float16(0.3))  # the others stay float16
+    assert (out / "lake_set_20261020_1600.json").read_text() == '{"ids": ["NID0"]}'
+    # a local lake grid wins - and the bundle's sidecar must not vouch for it
+    out2 = tmp_path / "u2"
+    out2.mkdir()
+    write_grid(str(out2 / "lake_storage_20261020_1600.tif"), np.zeros((5, 5)), WEST, NORTH)
+    statebundle.unpack(statebundle.pack_dir(str(sd)), str(out2))
+    assert not (out2 / "lake_set_20261020_1600.json").exists()
+
+
+def test_mosaic_never_pastes_lake_grids(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+    from hf_data import conusstate, statebundle
+    sd = tmp_path / "s"
+    sd.mkdir()
+    write_grid(str(sd / "crest_SM_20261020_1600.tif"), np.full((5, 5), 0.5), WEST, NORTH)
+    write_grid(str(sd / "kwr_IR_20261020_1600.tif"), np.full((5, 5), 0.1), WEST, NORTH)
+    write_grid(str(sd / "lake_storage_20261020_1600.tif"), np.full((5, 5), 7.0), WEST, NORTH)
+    (sd / "lake_set_20261020_1600.json").write_text("{}")
+    bpath = str(tmp_path / "b.pqf")
+    statebundle.pack_dir(str(sd), out_path=bpath)
+
+    def _open(key):
+        pf = pq.ParquetFile(bpath)
+        md = pf.schema_arrow.metadata
+        return pf, {"nrows": int(md[b"nrows"]), "ncols": int(md[b"ncols"]),
+                    "xll": float(md[b"xllcorner"]), "yll": float(md[b"yllcorner"]),
+                    "cell": float(md[b"cellsize"]), "nodata": float(md[b"nodata"])}
+
+    monkeypatch.setattr(conusstate, "_open", _open)
+    monkeypatch.setattr(conusstate, "CELL", RES)
+    dst = {"xll": WEST, "yll": NORTH - 5 * RES, "nrows": 5, "ncols": 5}
+    res = conusstate.stitch(dst, ["09337500_crest"], T0, workers=1)
+    assert sorted(res["grids"]) == ["crest_SM", "kwr_IR"]
+    res["grids"]["lake_storage"] = np.full((5, 5), 7.0, dtype="float32")    # even if handed one
+    out = tmp_path / "o"
+    conusstate.write_states(res, dst, str(out))
+    assert sorted(os.listdir(out)) == ["crest_SM_20261020_1600.tif", "kwr_IR_20261020_1600.tif"]
+
+
+def test_cache_key_separates_lake_runs(table):
+    from hf_data import pipeline
+    none = table.for_run(np.zeros((5, 5), dtype=bool), _tr())
+    some = table.for_run(_nodes(), _tr())
+    assert table.cache_sig(None, (1.0, 1.0)) is None and table.cache_sig(none, (1.0, 1.0)) is None
+    # a basin without lakes keeps the plain (fleet) key
+    assert pipeline.config_tag(None, None, "auto", lake=table.cache_sig(none, (1.0, 1.0))) == ""
+    on = pipeline.config_tag(None, None, "auto", lake=table.cache_sig(some, (1.0, 1.0)))
+    assert on and on != ""
+    # other multipliers or another table version: another key
+    assert pipeline.config_tag(None, None, "auto", lake=table.cache_sig(some, (2.0, 1.0))) != on
+    table._tbl = (table._tbl[0], {"table_version": "tv2"})
+    assert pipeline.config_tag(None, None, "auto", lake=table.cache_sig(some, (1.0, 1.0))) != on
+    # with other parts too
+    ov = {"wm": 2.0}
+    assert pipeline.config_tag(None, ov, "auto", lake=table.cache_sig(some, (1.0, 1.0))) \
+        != pipeline.config_tag(None, ov, "auto")
+
+
+def test_empty_warm_up_leaves_lakes_at_the_normal_pool(table, tmp_path):
+    sd = str(tmp_path / "states")
+    got = table.for_run(_nodes(), _tr())
+    # the warm-up saved nothing at the Simu start: S0 states are written
+    assert table.ensure_states(sd, T0, got, _dem(tmp_path)) == {"kept": 0, "initial": 1}
+    assert _read(os.path.join(sd, "lake_storage_20261020_1600.tif"))[1, 2] == pytest.approx(3.0e6)
+    # the warm-up's own lake state is never replaced
+    s = np.zeros((5, 5))
+    s[1, 2] = 1.0e6
+    write_grid(os.path.join(sd, "lake_storage_20261020_1600.tif"), s, WEST, NORTH)
+    assert table.ensure_states(sd, T0, got, _dem(tmp_path)) is None
+    assert _read(os.path.join(sd, "lake_storage_20261020_1600.tif"))[1, 2] == pytest.approx(1.0e6)

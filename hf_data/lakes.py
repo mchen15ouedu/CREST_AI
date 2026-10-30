@@ -129,6 +129,16 @@ def _stamp(t) -> str:
     return t.strftime("%Y%m%d_%H%M")
 
 
+def _write_sig(path: str, sig: dict) -> None:
+    """lake_set sidecar via a temp file + os.replace: the run folder's copy
+    may be a staged hard link of the shared one, which must never be written
+    through."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(sig, fh)
+    os.replace(tmp, path)
+
+
 def _sig(lakes, mult) -> dict:
     return {"table": table_version(), "mult": [float(mult[0]), float(mult[1])],
             "ids": sorted(str(i) for i in lakes.id)}
@@ -139,8 +149,9 @@ def prepare_states(state_dir: str, t, lakes, dem_path: str,
     """Make the lake states EF5 loads at time t hold the right storage for
     THIS lake set: a lake simulated by the run that saved them (same table and
     multipliers, recorded in lake_set_<stamp>.json) keeps its saved storage;
-    every other lake starts at its S0 (EF5 would start it full). Returns
-    {"kept": n, "initial": n}."""
+    every other lake starts at its S0 (EF5 would start it full), as does a
+    lake whose saved storage is not a finite, non-negative volume (EF5's
+    -9999, a NaN). Returns {"kept": n, "initial": n}."""
     import rasterio
     stamp = _stamp(t)
     sp = os.path.join(state_dir, f"lake_storage_{stamp}.tif")
@@ -169,9 +180,12 @@ def prepare_states(state_dir: str, t, lakes, dem_path: str,
     st = np.zeros(shape, dtype="float32")
     of = np.zeros(shape, dtype="float32")
     kept = 0
+    have = saved_s is not None and saved_o is not None
     for x in lakes.itertuples():
-        if saved_s is not None and saved_o is not None and str(x.id) in known:
-            st[x.r, x.c], of[x.r, x.c] = saved_s[x.r, x.c], saved_o[x.r, x.c]
+        s = float(saved_s[x.r, x.c]) if have and str(x.id) in known else float("nan")
+        if np.isfinite(s) and s >= 0:
+            o = float(saved_o[x.r, x.c])
+            st[x.r, x.c], of[x.r, x.c] = s, (o if np.isfinite(o) and o >= 0 else 0.0)
             kept += 1
         else:
             st[x.r, x.c] = x.s0_m3
@@ -183,9 +197,18 @@ def prepare_states(state_dir: str, t, lakes, dem_path: str,
         with rasterio.open(tmp, "w", **prof) as dst:
             dst.write(arr, 1)
         os.replace(tmp, path)        # a staged hard link is replaced, not written into
-    with open(os.path.join(state_dir, f"lake_set_{stamp}.json"), "w") as fh:
-        json.dump(_sig(lakes, mult), fh)
+    _write_sig(os.path.join(state_dir, f"lake_set_{stamp}.json"), _sig(lakes, mult))
     return {"kept": kept, "initial": len(lakes) - kept}
+
+
+def ensure_states(state_dir: str, t, lakes, dem_path: str,
+                  mult: tuple[float, float] = (1.0, 1.0)) -> dict | None:
+    """After a warm-up: when it left no lake state at t (it saved no states,
+    or was killed), write the S0 states so EF5 does not start every lake
+    full. None when the warm-up's own lake state is there."""
+    if os.path.exists(os.path.join(state_dir, f"lake_storage_{_stamp(t)}.tif")):
+        return None
+    return prepare_states(state_dir, t, lakes, dem_path, mult)
 
 
 def tag_states(state_dir: str, lakes, mult: tuple[float, float] = (1.0, 1.0)) -> int:
@@ -196,10 +219,18 @@ def tag_states(state_dir: str, lakes, mult: tuple[float, float] = (1.0, 1.0)) ->
     sig = _sig(lakes, mult)
     for p in glob.glob(os.path.join(state_dir, "lake_storage_*.tif")):
         stamp = os.path.basename(p)[len("lake_storage_"):-len(".tif")]
-        with open(os.path.join(state_dir, f"lake_set_{stamp}.json"), "w") as fh:
-            json.dump(sig, fh)
+        _write_sig(os.path.join(state_dir, f"lake_set_{stamp}.json"), sig)
         n += 1
     return n
+
+
+def cache_sig(lakes, mult) -> dict | None:
+    """The run's lake part of the rows/frames cache key (PI 2026-10-30: lake
+    runs never merge with lake-off rows): table version + multipliers when the
+    run simulates any lake; None without lakes (the plain key)."""
+    if lakes is None or not len(lakes):
+        return None
+    return {"table": table_version(), "mult": [float(mult[0]), float(mult[1])]}
 
 
 def provenance(lakes, mult) -> dict:

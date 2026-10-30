@@ -49,6 +49,10 @@ TTL_S = float(os.environ.get("CREST_MOSAIC_TTL_S", "21600"))
 WB_VARS = {"crestphys": ("crestphys_SM", "crestphys_GW"), "crest": ("crest_SM",)}
 KW_VARS = ("kwr_pCQ", "kwr_pOQ", "kwr_IR")
 SNOW_VARS = ("snow17_ati", "snow17_wq", "snow17_wi", "snow17_deficit")
+# never mosaicked: lake grids (lake_storage_/lake_outflow_) hold one run's
+# lake set, valid only with its lake_set_<stamp>.json (hf_data/lakes.py) -
+# another basin's lakes pasted in would be trusted as this basin's storage
+NO_MOSAIC = ("lake_",)
 T_FMT = "%Y%m%d_%H%M"
 
 _lock = threading.Lock()
@@ -426,7 +430,8 @@ def stitch(dst: dict, keys: list[str], t: datetime, snow: bool = True,
         bm = base_model(k.split("_", 1)[1])
         names = set(pf.schema_arrow.names)
         cols = [f"{v}_{ts}" for v in WB_VARS[bm][1:] + KW_VARS
-                + (SNOW_VARS if snow else ()) if f"{v}_{ts}" in names]
+                + (SNOW_VARS if snow else ()) if f"{v}_{ts}" in names
+                and not v.startswith(NO_MOSAIC)]
         for attempt in range(2):
             try:
                 return k, {WB_VARS[bm][0]: a, **(grid(pf, g, w, cols) if cols else {})}
@@ -460,7 +465,7 @@ def write_states(res: dict, dst: dict, state_dir: str, overwrite: bool = False) 
     ts = res["time"].strftime(T_FMT)
     n = 0
     for var, a in res["grids"].items():
-        if not (a != NODATA).any():
+        if var.startswith(NO_MOSAIC) or not (a != NODATA).any():
             continue
         p = os.path.join(state_dir, f"{var}_{ts}.tif")
         if os.path.exists(p) and not overwrite:

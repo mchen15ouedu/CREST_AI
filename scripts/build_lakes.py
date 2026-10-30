@@ -9,9 +9,24 @@ klake). Inputs (local copies, E:/hydrosheds):
     max / normal storage, surface area, drainage area and purpose;
   * HydroLAKES v1.0 pour points (hydrolakes/...points_v10.shp): lakes and
     reservoirs >= 10 ha with area, Dis_avg and the watershed area at the
-    pour point (HydroSHEDS, the family of our terrain).
-A HydroLAKES reservoir within MATCH_KM of a NID dam of similar storage is one
-water body (NID volumes, HydroLAKES pour point and area).
+    pour point (HydroSHEDS, the family of our terrain). US rows in the
+    conterminous states; every other country (Canada, Mexico) up to
+    HL_MAX_LAT, the HydroSHEDS NA terrain: border basins (Columbia,
+    Kootenay, Okanogan, Milk, Rio Grande) keep their upstream foreign lakes
+    and reservoirs.
+A HydroLAKES reservoir or lake control (Lake_type 2/3, or in GRanD) within
+MATCH_KM of a NID dam is one water body (NID volumes, HydroLAKES pour point,
+the larger of the two surface areas) when the dam's NID drainage area is
+within DA_TOL of the pour point's - no storage test: Vol_total counts dead
+storage and, behind a lake control, the whole natural lake (Tahoe: 140 km3
+vs 0.9 km3 regulated). A dam whose NID drainage area is missing or
+disagrees needs its storage within MATCH_RATIO of Vol_total instead (NID
+gives Folsom Dam 896 of the American River's 1,875 sq mi; distance alone
+matched GRanD reservoirs to stock ponds and cooling ponds - Folsom Lake to
+the 200 acre-ft Hinkle dam).
+After snapping, rows whose outlet cells lie within DUP_CELLS of each other
+with drainage areas within DUP_TOL are one water body listed twice: one row
+is kept (merge_duplicates).
 
 Volume V (th_volume) and retention K (klake), PI-approved scheme 2026-10-27.
 EF5's law: below V the lake releases Q = S/K*(S/V)^b, so a full lake releases
@@ -19,19 +34,26 @@ V/K; above V the excess spills at once.
   * dams: V = NID Max Storage (else NID Storage); runs start at Normal
     Storage (S0), written as a lake state by the run (EF5 cold-starts full);
   * natural lakes: V = area x NATURAL_DEPTH_M of active storage above the
-    outlet - not Vol_total, whose water below the outlet never leaves; S0 = V;
-  * K = V / mean inflow; mean inflow = the cell's drainage area x the
+    outlet - not Vol_total, whose water below the outlet never leaves. PI
+    2026-10-30: a natural lake sits at an equilibrium storage S0 = f x V
+    (f = NATURAL_EQ_FRAC) and starts there; K = f^(1+b) x V / mean inflow,
+    so the lake at f x V passes exactly its mean inflow (b = EF5's
+    LakeInfo::CalculateParamB of V, replicated in ef5_param_b);
+  * dams: K = V / mean inflow (a full reservoir passes its mean inflow);
+  * mean inflow (dams and lakes) = the cell's drainage area x the
     observation-based mean annual runoff (GAGES-II RUNAVE7100) of a gauge
     basin containing it of about the same size, else HydroLAKES Dis_avg,
-    else the runoff of the smallest gauge basin around it. A full lake then
-    passes its mean inflow;
+    else the runoff of the smallest gauge basin around it. Outside the US
+    (no GAGES-II runoff) Dis_avg comes first;
   * small stock, fire and fish ponds without outlet works: K = POND_K_H (no
     release - they spill when full and lose water to evaporation).
 NID data guards: a max pool > MAX_NORMAL_RATIO x the normal pool outside
 flood control is a data error (V = normal pool); flood-control and debris
-dams start empty when no normal pool is listed and release within FLOOD_K_H
-(K = V / mean inflow would hold a desert flood pool for decades); a surface
-area implying a mean depth > MAX_DEPTH_M is re-estimated at FILL_DEPTH_M.
+dams start empty when no normal pool is listed and then release within
+FLOOD_K_H (K = V / mean inflow would hold a desert flood pool for decades);
+a flood-purpose dam WITH a normal pool keeps K = V / mean inflow like any
+reservoir; a surface area implying a mean depth > MAX_DEPTH_M is
+re-estimated at FILL_DEPTH_M.
 A water body whose K is under MIN_K_H is dropped: its storage is negligible
 next to its flow, and K below a few time steps breaks the module's mass
 balance (outflow x dt can exceed storage).
@@ -63,13 +85,19 @@ ACC_COG = "E:/hydrosheds/cog/na_acc_3s.tif"
 RUNOFF_TXT = "D:/gageII_char/spreadsheets-in-csv-format/conterm_hydro.txt"
 
 WEST_LON = -104.0            # lakes for western gauges (outlets < -105) + 1 deg margin
+HL_MAX_LAT = 60.0            # HydroSHEDS NA terrain (na_acc_3s) ends here
+US = "United States of America"     # HydroLAKES Country of US rows (NID rows are all US)
 MATCH_KM = 3.0               # HydroLAKES reservoir <-> NID dam
-MATCH_RATIO = 5.0            # ... storages within this factor
+DA_TOL = 0.30                # ... drainage areas within +-30% (when NID lists one)
+MATCH_RATIO = 5.0            # ... else storages within this factor
+DUP_CELLS = 5                # one water body listed twice: outlets this close (Chebyshev)
+DUP_TOL = 0.30               # ... with cell drainage areas within 30%
 SNAP_KM = 2.0                # outlet snap radius
 SNAP_TOL = 0.30              # cell drainage area vs the inventory's, +-30%
 AREA_MATCH = 2.0             # gauge basin vs lake drainage area, for its runoff
 POND_MAX_KM3 = 0.001         # ponds are small (1 Mm3, ~810 acre-ft)
 NATURAL_DEPTH_M = 1.0        # active storage above a natural lake's outlet
+NATURAL_EQ_FRAC = 0.5        # natural lakes: equilibrium (and starting) storage / V (PI 2026-10-30)
 POND_K_H = 1.0e7             # "no release" for outlet-less ponds (~1,100 years)
 MIN_K_H = 3.0
 AF_M3 = 1233.48
@@ -130,8 +158,12 @@ def load_hydrolakes(path: str, west_lon: float) -> pd.DataFrame:
     h = pyogrio.read_dataframe(path, read_geometry=False, columns=[
         "Hylak_id", "Lake_name", "Country", "Lake_type", "Grand_id", "Lake_area",
         "Vol_total", "Dis_avg", "Wshd_area", "Pour_long", "Pour_lat"])
-    h = h[(h.Country == "United States of America") & h.Pour_lat.between(24, 50)
-          & h.Pour_long.between(-125, west_lon)]
+    # US rows: the conterminous states (as NID). Every other country up to
+    # HL_MAX_LAT, where the NA terrain ends: a US basin's upstream reservoirs
+    # in Canada (Columbia, Kootenay) or Mexico (Conchos) are as real as its own
+    us = h.Country == US
+    h = h[(us & h.Pour_lat.between(24, 50) & h.Pour_long.between(-125, west_lon))
+          | (~us & h.Pour_lat.between(24, HL_MAX_LAT) & (h.Pour_long < west_lon))]
     return h.rename(columns={"Pour_lat": "lat", "Pour_long": "lon"}).reset_index(drop=True)
 
 
@@ -140,29 +172,105 @@ def _km(lat1, lon1, lat2, lon2):
                     (lon2 - lon1) * 111.32 * np.cos(np.radians(lat1)))
 
 
+def ef5_param_b(v_km3):
+    """EF5's LakeInfo::CalculateParamB (LakeModel.h), elementwise: the
+    exponent b of Q = S/K x (S/V)^b for threshold volume V in km3."""
+    v = np.asarray(v_km3, dtype="float64")
+    return np.select([v > 1.5, v > 1.0, v < 0.05, v < 0.1], [2.0, 1.8, 1.0, 1.2], 1.5)
+
+
+def _close(a, b, tol: float):
+    """a and b within tol of the larger (symmetric)."""
+    return np.abs(a - b) <= tol * np.maximum(a, b)
+
+
 def match(h: pd.DataFrame, d: pd.DataFrame) -> dict:
-    """HydroLAKES row index -> NID row index for reservoirs / lake-controls
-    that are the same water body: the largest-storage dam within MATCH_KM of
-    the pour point whose storage is within MATCH_RATIO of Vol_total."""
+    """HydroLAKES row index -> NID row index for reservoirs / lake controls
+    (Lake_type 2/3, or in GRanD) that are the same water body: the largest-
+    storage dam within MATCH_KM of the pour point whose NID drainage area is
+    within DA_TOL of the pour point's (Wshd_area: the FAM of our terrain) -
+    no storage test, Vol_total counts dead storage and, behind a lake
+    control, the whole natural lake - or, when NID lists no drainage area or
+    another one, whose storage is within MATCH_RATIO of Vol_total. Distance
+    alone never matches."""
     from scipy.spatial import cKDTree
     xy = lambda la, lo: np.c_[lo * 111.32 * np.cos(np.radians(40.0)), la * 110.574]
     tree = cKDTree(xy(d.lat.values, d.lon.values))
     out, used = {}, set()
-    cand = h[(h.Lake_type != 1) | (h.Grand_id > 0)]
+    cand = h[h.Lake_type.isin((2, 3)) | (h.Grand_id > 0)]
     for i, r in cand.sort_values("Vol_total", ascending=False).iterrows():
         idx = tree.query_ball_point(xy(np.array([r.lat]), np.array([r.lon]))[0], MATCH_KM * 1.3)
         best = None
         for j in idx:
             if j in used or _km(r.lat, r.lon, d.lat[j], d.lon[j]) > MATCH_KM:
                 continue
-            v_mcm = d.v_af[j] * AF_M3 / 1e6
-            ratio = v_mcm / max(float(r.Vol_total), 1e-6)
-            if 1.0 / MATCH_RATIO <= ratio <= MATCH_RATIO and (best is None or d.v_af[j] > d.v_af[best]):
+            da = d.da_km2[j]
+            if not (da > 0 and r.Wshd_area > 0 and _close(float(r.Wshd_area), float(da), DA_TOL)):
+                ratio = d.v_af[j] * AF_M3 / 1e6 / max(float(r.Vol_total), 1e-6)
+                if not 1.0 / MATCH_RATIO <= ratio <= MATCH_RATIO:
+                    continue                         # another stream's (or a stock pond's) dam
+            if best is None or d.v_af[j] > d.v_af[best]:
                 best = j
         if best is not None:
             out[i] = best
             used.add(best)
     return out
+
+
+def merge_duplicates(L: pd.DataFrame) -> pd.DataFrame:
+    """One water body listed twice (NID 'Lake Tahoe Dam' + HydroLAKES 'Tahoe'
+    two cells apart): rows whose snapped outlets lie within DUP_CELLS
+    (Chebyshev) of a row with a larger drainage area, and whose fam_km2 is
+    within DUP_TOL of it, merge into one. The kept row takes the downstream
+    (largest-FAM) cell; V, S0, purpose and the identity of the NID-based row
+    (the largest such) when there is one, else of the largest-V row; the
+    LARGER surface area (never the sum - one lake surface); the other ids in
+    merged_ids. Greedy from the downstream end, so a chain of small dams down
+    a creek never collapses into one."""
+    from scipy.spatial import cKDTree
+    L = L.reset_index(drop=True).copy()
+    L["merged_ids"] = ""
+    if len(L) < 2:
+        return L
+    rc = np.c_[L.snap_row.values, L.snap_col.values].astype("float64")
+    tree = cKDTree(rc)
+    fam = L.fam_km2.values.astype("float64")
+    nid_based = L.source.isin(("nid", "both")).values
+    head = np.full(len(L), -1)
+    for i in np.argsort(-fam, kind="stable"):          # downstream (largest FAM) first
+        if head[i] >= 0:
+            continue
+        head[i] = i
+        for j in tree.query_ball_point(rc[i], DUP_CELLS, p=np.inf):
+            if head[j] < 0 and _close(fam[j], fam[i], DUP_TOL):
+                head[j] = i
+    drop = []
+    for h_, grp in pd.Series(np.arange(len(L))).groupby(head):
+        g = grp.values
+        if len(g) < 2:
+            continue
+        pool = g[nid_based[g]] if nid_based[g].any() else g
+        a = pool[np.argmax(L.v_km3.values[pool])]          # attribute row
+        keep = L.loc[a].copy()
+        for col in ("lat", "lon", "snap_lat", "snap_lon", "snap_row", "snap_col",
+                    "fam_km2", "ref_km2", "snap_rule"):
+            keep[col] = L.at[h_, col]                       # the downstream cell
+        area = L.area_km2.values[g].astype("float64")
+        keep["area_km2"] = np.nanmax(area) if np.isfinite(area).any() else np.nan
+        hl = g[L.hylak_id.values[g] > 0]
+        if len(hl):
+            if keep.hylak_id <= 0:                          # NID row + a HydroLAKES twin
+                b = hl[np.argmax(L.area_km2.values[hl].astype("float64"))]
+                keep["hylak_id"], keep["grand_id"] = L.at[b, "hylak_id"], L.at[b, "grand_id"]
+            dis = L.dis_avg.values[hl].astype("float64")
+            if np.isfinite(dis).any():
+                keep["dis_avg"] = np.nanmax(dis)            # the downstream pour point's
+            if nid_based[a]:
+                keep["source"] = "both"
+        keep["merged_ids"] = ",".join(sorted(str(x) for x in L.id.values[g] if x != keep.id))
+        L.loc[a] = keep
+        drop += [x for x in g if x != a]
+    return L.drop(index=drop).reset_index(drop=True)
 
 
 class Snapper:
@@ -253,6 +361,32 @@ def runoff_lookup(sites_path: str, runoff_txt: str):
     return f
 
 
+def mean_runoff(L: pd.DataFrame, ro_m, ro_r, a_q):
+    """(q_source, runoff mm/yr) per row: the matched gauge basin's runoff,
+    else HydroLAKES Dis_avg (m3/s; a_q = m3/s per mm/yr of the cell), else the
+    regional runoff. Outside the US (GAGES-II measures no Canadian or Mexican
+    runoff) Dis_avg comes first."""
+    dis = L.dis_avg.astype("float64").fillna(0.0).values
+    ro_m = np.where((L.country != US).values & (dis > 0), np.nan, ro_m)
+    src = np.where(ro_m > 0, "runave7100_basin",
+                   np.where(dis > 0, "dis_avg", "runave7100_regional"))
+    return src, np.where(ro_m > 0, ro_m, np.where(dis > 0, dis / a_q, ro_r))
+
+
+def retention_h(L: pd.DataFrame) -> np.ndarray:
+    """K (hours) per row. Ponds: POND_K_H. Natural lakes: f^(1+b) x V /
+    mean inflow, so the lake at its equilibrium storage f x V passes its mean
+    inflow (Q = fV/K x f^b; PI 2026-10-30). Dams: V / mean inflow, capped at
+    FLOOD_K_H only for a normally-dry flood pool (flood purpose, S0 = 0) - a
+    flood-control dam WITH a normal pool is a reservoir like any other."""
+    k = L.v_km3.values * 1e9 / L.q_mean_m3s.values / 3600.0
+    k = np.where((L.kind == "natural").values,
+                 NATURAL_EQ_FRAC ** (1.0 + ef5_param_b(L.v_km3.values)) * k, k)
+    dry = (L.flood.astype(bool) & (L.s0_frac <= 0)).values
+    return np.where((L.kind == "pond").values, POND_K_H,
+                    np.where(dry, np.minimum(k, FLOOD_K_H), k))
+
+
 def _git_sha() -> str:
     if os.environ.get("BUILDER_SHA"):
         return os.environ["BUILDER_SHA"]
@@ -285,17 +419,18 @@ def main() -> int:
             rows.append({"id": f"NID{n.nid_id}", "name": n["name"], "kind": "pond" if n.pond else "dam",
                          "source": "both", "lat": r.lat, "lon": r.lon, "ref_km2": r.Wshd_area,
                          "v_km3": n.v_af * AF_M3 / 1e9, "s0_frac": n.s0_frac,
-                         "area_km2": n.area_km2 if n.area_km2 > 0 else r.Lake_area,
+                         # one lake surface: the larger of the two listings, never the sum
+                         "area_km2": np.nanmax([n.area_km2, r.Lake_area]),
                          "dis_avg": r.Dis_avg, "purpose": n.purpose, "gate": n.gate,
                          "hylak_id": int(r.Hylak_id), "grand_id": int(r.Grand_id), "nid_id": n.nid_id,
-                         "flood": bool(n.flood)})
+                         "flood": bool(n.flood), "country": r.Country})
         else:
             rows.append({"id": f"HL{int(r.Hylak_id)}", "name": r.Lake_name or "", "kind": "natural",
                          "source": "hydrolakes", "lat": r.lat, "lon": r.lon, "ref_km2": r.Wshd_area,
-                         "v_km3": r.Lake_area * NATURAL_DEPTH_M * 1e-3, "s0_frac": 1.0,
+                         "v_km3": r.Lake_area * NATURAL_DEPTH_M * 1e-3, "s0_frac": NATURAL_EQ_FRAC,
                          "area_km2": r.Lake_area, "dis_avg": r.Dis_avg, "purpose": "", "gate": "",
                          "hylak_id": int(r.Hylak_id), "grand_id": int(r.Grand_id), "nid_id": "",
-                         "flood": False})
+                         "flood": False, "country": r.Country})
     for j, n in d.iterrows():                        # NID dams HydroLAKES lacks
         if j in matched_nid:
             continue
@@ -303,7 +438,8 @@ def main() -> int:
                      "source": "nid", "lat": n.lat, "lon": n.lon, "ref_km2": n.da_km2,
                      "v_km3": n.v_af * AF_M3 / 1e9, "s0_frac": n.s0_frac, "area_km2": n.area_km2,
                      "dis_avg": np.nan, "purpose": n.purpose, "gate": n.gate,
-                     "hylak_id": 0, "grand_id": 0, "nid_id": n.nid_id, "flood": bool(n.flood)})
+                     "hylak_id": 0, "grand_id": 0, "nid_id": n.nid_id, "flood": bool(n.flood),
+                     "country": US})
     L = pd.DataFrame(rows)
     # NID ids repeat for multi-structure dams: one water body each
     L = L.sort_values("v_km3", ascending=False).drop_duplicates("id").reset_index(drop=True)
@@ -318,17 +454,20 @@ def main() -> int:
     L["snap_lon"] = [tr.c + (g[1] + 0.5) * tr.a if g else np.nan for g in got]
     print(f"snapped {int(L.snapped.sum())}/{len(L)} ({time.time() - t0:.0f}s)", flush=True)
     L = L[L.snapped].copy()
+    n0 = len(L)
+    L = merge_duplicates(L)
+    L["flood"] = L.flood.astype(bool)
+    print(f"merged {n0 - len(L)} duplicate listing(s) into {int((L.merged_ids != '').sum())} "
+          f"water bodies", flush=True)
 
     # mean inflow: drainage area at the outlet cell x the observed runoff of a
     # gauge basin of about that size; else HydroLAKES Dis_avg; else the
-    # regional runoff around the (small) water body
+    # regional runoff around the (small) water body. Outside the US (GAGES-II
+    # measures no Canadian or Mexican runoff) Dis_avg comes first
     ro_m, ro_r = runoff_lookup(args.sites, RUNOFF_TXT)(
         L.snap_lat.values, L.snap_lon.values, L.fam_km2.values)
     a_q = L.fam_km2.values * 1e6 / 1000.0 / (365.25 * 86400.0)     # m3/s per mm/yr
-    dis = L.dis_avg.fillna(0.0).values
-    L["q_source"] = np.where(ro_m > 0, "runave7100_basin",
-                             np.where(dis > 0, "dis_avg", "runave7100_regional"))
-    L["runoff_mm"] = np.where(ro_m > 0, ro_m, np.where(dis > 0, dis / a_q, ro_r))
+    L["q_source"], L["runoff_mm"] = mean_runoff(L, ro_m, ro_r, a_q)
     L["q_mean_m3s"] = L.runoff_mm * a_q
     # natural lakes and reservoirs without a surface area: area from V at the
     # median depth of the dams that have both
@@ -341,9 +480,7 @@ def main() -> int:
     L.loc[deep, "area_km2"] = L.v_km3[deep] * 1e3 / FILL_DEPTH_M
     L.loc[dry, "area_km2"] = L.area_km2[dry].where(
         L.area_km2[dry] < L.v_km3[dry] * 1e3 / MAX_DEPTH_M, DRY_AREA_KM2)
-    k = L.v_km3 * 1e9 / L.q_mean_m3s / 3600.0
-    L["k_h"] = np.where(L.kind == "pond", POND_K_H,
-                        np.where(L.flood, np.minimum(k, FLOOD_K_H), k))
+    L["k_h"] = retention_h(L)
     drop = ~(L.k_h >= MIN_K_H) | ~(L.v_km3 > 0)
     print(f"dropped {int(drop.sum())} with K < {MIN_K_H} h or no volume", flush=True)
     L = L[~drop].copy()
@@ -353,7 +490,7 @@ def main() -> int:
     keep = ["id", "name", "kind", "source", "lat", "lon", "snap_lat", "snap_lon", "snap_row",
             "snap_col", "fam_km2", "ref_km2", "snap_rule", "v_km3", "s0_km3", "area_km2",
             "q_mean_m3s", "q_source", "runoff_mm", "k_h", "flood", "purpose", "gate", "hylak_id",
-            "grand_id", "nid_id"]
+            "grand_id", "nid_id", "country", "merged_ids"]
     L = L[keep].sort_values(["snap_row", "snap_col"]).reset_index(drop=True)
     # one lake per cell: the module keys a lake by its cell; keep the largest
     L = L.sort_values("v_km3", ascending=False).drop_duplicates(["snap_row", "snap_col"])
@@ -365,8 +502,13 @@ def main() -> int:
     body = L.to_csv(index=False).encode()
     meta = {"table_version": f"{built}-{hashlib.sha1(body).hexdigest()[:10]}", "built": built,
             "builder_sha": _git_sha(), "west_lon": args.west_lon,
-            "natural_depth_m": NATURAL_DEPTH_M, "pond_k_h": POND_K_H, "min_k_h": MIN_K_H,
-            "flood_k_h": FLOOD_K_H, "max_normal_ratio": MAX_NORMAL_RATIO,
+            "natural_depth_m": NATURAL_DEPTH_M, "natural_eq_frac": NATURAL_EQ_FRAC,
+            "natural_law": "S0 = f V; K = f^(1+b) V / Q_mean, b = EF5 CalculateParamB(V km3)",
+            "pond_k_h": POND_K_H, "min_k_h": MIN_K_H,
+            "flood_k_h": FLOOD_K_H, "flood_k_rule": "dry flood pools only (flood & S0 = 0)",
+            "max_normal_ratio": MAX_NORMAL_RATIO, "match_km": MATCH_KM, "da_tol": DA_TOL,
+            "match_ratio": MATCH_RATIO,
+            "dup_cells": DUP_CELLS, "dup_tol": DUP_TOL, "hl_max_lat": HL_MAX_LAT,
             "snap_tol": SNAP_TOL, "snap_km": SNAP_KM, "lattice": [tr.c, tr.f, tr.a],
             "inputs": [os.path.basename(p) for p in (NID_CSV, HL_SHP, ACC_COG, RUNOFF_TXT)]}
     tbl = pa.Table.from_pandas(L, preserve_index=False)

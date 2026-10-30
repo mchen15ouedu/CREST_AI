@@ -272,13 +272,16 @@ def apriori_params(g: dict, model: str, wb_model: str) -> dict | None:
 
 
 def config_tag(stored: dict | None, overrides: dict | None, snow: str,
-               base: dict | None = None) -> str:
+               base: dict | None = None, lake: dict | None = None) -> str:
     """Fingerprint of everything besides (gauge, model, scheme) that changes
     the rows a run produces: stored parameter VALUES that differ from the
-    a-priori set (`base`), the advanced-panel overrides, and a non-default
-    snow choice. Empty for a run on the a-priori set — that is the key the
-    fleet precomputed under. Rows and frames cache under model+tag; EF5 state
-    grids stay under the base key.
+    a-priori set (`base`), the advanced-panel overrides, a non-default snow
+    choice, and the run's lake set (`lake` = lakes.cache_sig: table version +
+    multipliers; PI 2026-10-30 - lake-on rows never merge with lake-off rows;
+    None for a basin without lakes, which keeps the plain key). Empty for a
+    run on the a-priori set — that is the key the fleet precomputed under.
+    Rows and frames cache under model+tag; EF5 state grids stay under the
+    base key.
     Value-based on purpose (2026-09-29): every completed run saves a stored
     record, usually one that just restates the a-priori values — keyed by the
     record's timestamp, the first run of a gauge moved every later run off
@@ -300,6 +303,8 @@ def config_tag(stored: dict | None, overrides: dict | None, snow: str,
         parts["o"] = {k: overrides[k] for k in sorted(overrides)}
     if snow and snow != "auto":
         parts["s"] = snow
+    if lake:
+        parts["l"] = lake
     if not parts:
         return ""
     return hashlib.sha1(_json.dumps(parts, sort_keys=True, default=str)
@@ -599,8 +604,16 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     # by a run with panel overrides or a forced snow choice, so a custom run
     # cannot poison the shared state grids)
     stored = paramstore.get(g["id"], ef5_model)       # best-known set for this basin
+    # lake module (PI 2026-10-27, west first): the lakes, reservoirs and ponds
+    # whose outlet cell is one of this run's EF5 nodes (hf_data/lakes.py) -
+    # known before the cache key, which separates lake runs (PI 2026-10-30)
+    lake_set, lake_mult = None, (1.0, 1.0)
+    if not use_mock and lakes.enabled(g["lon"]):
+        lake_mult = lakes.multipliers(overrides, (stored or {}).get("lake"))
+        lake_set = lakes.for_run(nodes, nodes_tr, lake_mult)
     tag = config_tag(stored, overrides, snow,
-                     base=apriori_params(g, model, wb_model))
+                     base=apriori_params(g, model, wb_model),
+                     lake=lakes.cache_sig(lake_set, lake_mult))
     custom = bool(overrides) or (snow not in (None, "", "auto"))
     state_model = ef5_model + ("-spd" if speed else "")
     cache_model = state_model + (f"-{tag}" if tag else "")
@@ -744,12 +757,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     if overrides:                                     # advanced-panel overrides
         wb = {**wb, **{k: v for k, v in overrides.items() if k in wb}}
         kw = {**kw, **{k: v for k, v in overrides.items() if k in kw}}
-    # lake module (PI 2026-10-27, west first): the lakes, reservoirs and ponds
-    # whose outlet cell is one of this run's EF5 nodes (hf_data/lakes.py)
-    lake_set, lake_mult = None, (1.0, 1.0)
-    if not use_mock and lakes.enabled(g["lon"]):
-        lake_mult = lakes.multipliers(overrides, (stored or {}).get("lake"))
-        lake_set = lakes.for_run(nodes, nodes_tr, lake_mult)
+    if not use_mock and lakes.enabled(g["lon"]):     # (lake set: read above, with the tag)
         if lake_set is None:
             yield ("status", "⚠️ lake table unavailable — simulating without lakes/reservoirs")
         elif len(lake_set):
@@ -1058,6 +1066,11 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                              f"@ {run_start:%Y-%m-%d %H:%M}")
         else:
             yield ("status", "⚠️ warm-up produced no state files — Simu will cold-start")
+        if spec.lakes_csv:
+            # no lake state at the Simu start (no warm-up states): EF5 would
+            # start every lake FULL - start them at S0 like any cold start
+            lakes.ensure_states(rdir, run_start, lake_set,
+                                os.path.join(grid_dir, "dem_clip.tif"), lake_mult)
 
     yield ("status", "running CREST — streaming…")
     if use_mock:

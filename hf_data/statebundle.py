@@ -9,7 +9,11 @@ whole fleet under the 1 TB private quota (~0.05% rounding, harmless next to
 forcing/parameter uncertainty — user-approved 2026-07-16).
 
 Small companion .txt files EF5 writes next to the grids (gauge_relationships)
-ride along in the parquet schema metadata so a warm start is complete.
+and the lake_set_<stamp>.json sidecars (hf_data/lakes.py) ride along in the
+parquet schema metadata so a warm start is complete.
+
+Lake grids (lake_storage_ in m3, up to ~1e10; lake_outflow_) are never
+float16 (max 65504): they are stored losslessly as float32 columns.
 """
 from __future__ import annotations
 
@@ -28,8 +32,14 @@ _GEO_KEYS = (b"nrows", b"ncols", b"xllcorner", b"yllcorner", b"cellsize", b"noda
 PACK_BLOCK_BYTES = int(float(os.environ.get("CREST_BUNDLE_BLOCK_MB", "512")) * 1e6)
 
 
+def _lossless(name: str) -> bool:
+    """Grids packed as float32: lake storage (m3) overflows float16."""
+    return name.startswith("lake_")
+
+
 def pack_dir(state_dir: str, out_path: str | None = None) -> bytes | str | None:
-    """All *.tif (+ *.txt) in a state dir -> one f16 parquet bundle; None if empty.
+    """All *.tif (+ *.txt, lake_set_*.json) in a state dir -> one f16 parquet
+    bundle (lake grids f32); None if empty.
 
     Streams: grid headers first, then one row block of every grid at a time
     (PACK_BLOCK_BYTES), one parquet row group per block. Same columns, values
@@ -78,7 +88,8 @@ def pack_dir(state_dir: str, out_path: str | None = None) -> bytes | str | None:
             b"yllcorner": repr(yll).encode(),
             b"cellsize": repr(cell).encode(),
             b"nodata": repr(nodata).encode()}
-    for p in sorted(glob.glob(os.path.join(state_dir, "*.txt"))):
+    for p in sorted(glob.glob(os.path.join(state_dir, "*.txt"))
+                    + glob.glob(os.path.join(state_dir, "lake_set_*.json"))):
         try:
             with open(p, "rb") as fh:
                 meta[b"txt:" + os.path.basename(p).encode()] = fh.read()
@@ -87,9 +98,11 @@ def pack_dir(state_dir: str, out_path: str | None = None) -> bytes | str | None:
     if skipped:
         meta[b"skipped"] = ",".join(skipped).encode()
     names = [os.path.splitext(os.path.basename(p))[0] for p in keep]
-    schema = pa.schema([pa.field(k, pa.float16()) for k in names]).with_metadata(meta)
+    schema = pa.schema([pa.field(k, pa.float32() if _lossless(k) else pa.float16())
+                        for k in names]).with_metadata(meta)
     nr, nc = shape
-    rows = max(1, PACK_BLOCK_BYTES // (2 * nc * len(keep)))
+    width = sum(4 if _lossless(k) else 2 for k in names)      # bytes per cell, all grids
+    rows = max(1, PACK_BLOCK_BYTES // (nc * width))
     sink = out_path if out_path else io.BytesIO()
     with pq.ParquetWriter(sink, schema, compression="zstd", use_dictionary=False) as w:
         for r0 in range(0, nr, rows):
@@ -97,14 +110,17 @@ def pack_dir(state_dir: str, out_path: str | None = None) -> bytes | str | None:
             cols = {}
             for p, k in zip(keep, names):
                 with rasterio.open(p) as ds:
-                    cols[k] = ds.read(1, window=win).astype("float32").reshape(-1).astype(np.float16)
+                    a = ds.read(1, window=win).astype("float32").reshape(-1)
+                    cols[k] = a if _lossless(k) else a.astype(np.float16)
             w.write_table(pa.table(cols, schema=schema))
     return out_path if out_path else sink.getvalue()
 
 
 def unpack(data: bytes | str, state_dir: str, overwrite: bool = False) -> int:
     """Bundle -> loose EF5-safe GeoTIFFs (+ txt) in state_dir; returns files written.
-    Existing files are kept unless overwrite (local, possibly newer, states win)."""
+    Existing files are kept unless overwrite (local, possibly newer, states win);
+    a lake_set_<stamp>.json only comes with its lake_storage_<stamp> grid (it
+    would otherwise vouch for a local grid of unknown lake set)."""
     import pyarrow.parquet as pq
     import rasterio
     from rasterio.transform import from_origin
@@ -119,19 +135,14 @@ def unpack(data: bytes | str, state_dir: str, overwrite: bool = False) -> int:
     nod16 = np.float32(np.float16(nodata))         # what nodata became in f16
     os.makedirs(state_dir, exist_ok=True)
     n = 0
-    for k, v in md.items():
-        if k.startswith(b"txt:"):
-            p = os.path.join(state_dir, k[4:].decode())
-            if overwrite or not os.path.exists(p):
-                with open(p, "wb") as fh:
-                    fh.write(v)
-                n += 1
+    written = set()
     for name in pf.schema_arrow.names:
         p = os.path.join(state_dir, name + ".tif")
         if not overwrite and os.path.exists(p):
             continue
         a = pf.read(columns=[name]).column(0).to_numpy().astype("float32").reshape(nr, nc)
-        a[a == nod16] = nodata                     # restore exact nodata value
+        if not _lossless(name):
+            a[a == nod16] = nodata                 # restore exact nodata value
         tmp = p + ".tmp"
         # untiled/uncompressed/stripped: the EF5 reader is picky (persist.py profile)
         with rasterio.open(tmp, "w", driver="GTiff", height=nr, width=nc, count=1,
@@ -140,5 +151,17 @@ def unpack(data: bytes | str, state_dir: str, overwrite: bool = False) -> int:
                            nodata=nodata, tiled=False, blockysize=1) as ds:
             ds.write(a, 1)
         os.replace(tmp, p)
+        written.add(name)
         n += 1
+    for k, v in md.items():
+        if k.startswith(b"txt:"):
+            f = k[4:].decode()
+            grid = "lake_storage_" + f[len("lake_set_"):-len(".json")]
+            if f.startswith("lake_set_") and grid not in written:
+                continue
+            p = os.path.join(state_dir, f)
+            if overwrite or not os.path.exists(p):
+                with open(p, "wb") as fh:
+                    fh.write(v)
+                n += 1
     return n
