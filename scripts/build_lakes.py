@@ -106,6 +106,7 @@ SQMI_KM2 = 2.58999
 POND_PURPOSES = ("Fire Protection, Stock, Or Small Fish Pond", "Fish and Wildlife Pond")
 FLOOD_PURPOSES = ("Flood Risk Reduction", "Debris Control")
 FLOOD_K_H = 14 * 24.0        # flood pools are evacuated within weeks, not years
+PERMANENT_FLOOD_S0_FRAC = 0.5  # flood dam with a permanent lake and no listed normal pool
 MAX_NORMAL_RATIO = 5.0
 MAX_DEPTH_M = 100.0          # V / area above this: the area is wrong
 FILL_DEPTH_M = 10.0          # ... and is re-estimated at this mean depth
@@ -267,6 +268,11 @@ def merge_duplicates(L: pd.DataFrame) -> pd.DataFrame:
                 keep["dis_avg"] = np.nanmax(dis)            # the downstream pour point's
             if nid_based[a]:
                 keep["source"] = "both"
+            # a flood dam that holds a permanent HydroLAKES lake (Del Valle,
+            # Chesbro) is not a normally-dry pool: it starts half full and keeps
+            # K = V / mean inflow instead of draining within FLOOD_K_H
+            if bool(keep.get("flood")) and keep.s0_frac <= 0:
+                keep["s0_frac"] = PERMANENT_FLOOD_S0_FRAC
         keep["merged_ids"] = ",".join(sorted(str(x) for x in L.id.values[g] if x != keep.id))
         L.loc[a] = keep
         drop += [x for x in g if x != a]
@@ -472,6 +478,10 @@ def main() -> int:
     # natural lakes and reservoirs without a surface area: area from V at the
     # median depth of the dams that have both
     dep = (L.v_km3 * 1e9 / (L.area_km2 * 1e6)).where((L.area_km2 > 0) & (L.kind != "natural"))
+    # a flood dam whose pool is a permanent HydroLAKES lake (matched or merged)
+    # is not normally dry, whatever NID lists as its normal pool
+    perm = L.flood.astype(bool) & (L.s0_frac <= 0) & (L.hylak_id > 0)
+    L.loc[perm, "s0_frac"] = PERMANENT_FLOOD_S0_FRAC
     # a normally-dry flood pool has (almost) no lake surface: re-estimating
     # its area from V would rain onto desert the land cells already route
     dry = L.flood & (L.s0_frac <= 0)
