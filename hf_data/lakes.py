@@ -17,10 +17,10 @@ EF5 facts this module relies on (fork, lake-state-fix):
   * lake states are lake_storage_<YYYYMMDD_HHMM>.tif (m3) and lake_outflow_
     (m3/s) on the run raster, read at the lake's own cell; a cold start
     without them begins FULL (storage = th_volume);
-  * the pinned 5a26a86 saves one file per lake and the last writer wins, so
-    every other lake reloads 0. Lakes need the fork's lake-state-fix branch
-    (SaveStatesAll + the exact column); CREST_LAKES stays "off" on a host
-    until its EF5 has it.
+  * fork 5a26a86 saved one file per lake and the last writer won, so every
+    other lake reloaded 0. Lakes need fork >= 1011809 (SaveStatesAll, the
+    exact column, the continuous outlet law); CREST_LAKES stays "off" on a
+    host until its EF5 has it.
 
 Which run gets lakes: CREST_LAKES = off (default) | west (outlets west of
 pipeline.WEST_LON, the CREST region) | all.

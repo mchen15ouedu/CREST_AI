@@ -15,6 +15,7 @@ from conftest import ROOT
 
 sys.path.insert(0, os.path.join(ROOT, "autocal"))
 import autocal_run as ar                                      # noqa: E402
+import hf_data.pipeline  # noqa: E402,F401  (is_west reads WEST_LON; loaded before a test hides hf_data.lakes)
 
 NOW = dt.datetime(2026, 10, 27, 12, 0, 0)
 TS = ar.TS

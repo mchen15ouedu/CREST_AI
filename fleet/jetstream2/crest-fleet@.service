@@ -20,7 +20,7 @@ Group=crest-fleet
 EnvironmentFile=/etc/crest-fleet/fleet.env
 Environment=PYTHONUNBUFFERED=1
 Environment=FLEET_HOME=/opt/crest-fleet
-# EF5 (fork 5a26a86) is built with OpenMP and would start one thread per vCPU
+# EF5 (fork) is built with OpenMP and would start one thread per vCPU
 # in every worker process; fleet.env may override
 Environment=OMP_NUM_THREADS=2
 LoadCredential=hf_token:/etc/crest-fleet/hf_token
