@@ -10,10 +10,10 @@ Priority (PI 2026-10-27: "The auto-calibration, we should prioritize the
 western part of the USA, since those areas have more issues"): every
 candidate list sorts western gauges (lon < pipeline.WEST_LON) first. An
 eligible event beats the backlog. In the WEST an over-prediction beats a
-whole-event miss (the western problem is EF5 running far too high); in the
-east a miss beats an over-prediction (the original trigger keeps its place).
-Then each kind's own keys (miss: more checks, bigger obs peak; oversim:
-bigger ratio, bigger obs peak).
+whole-event miss (the western problem is EF5 running far too high); the east
+keeps its previous behaviour: misses only, no over-prediction trigger. Then
+each kind's own keys (miss: more checks, bigger obs peak; oversim: bigger
+ratio, bigger obs peak).
 
 Reservoir hold (PI 2026-10-27): a WESTERN reservoir-affected gauge (lon <
 WEST_LON and GAGES-II STOR_NOR_2009 >= 10 mm,
@@ -21,7 +21,10 @@ hf_data/data/gagesii_reservoir_stor.json) is not calibrated from ANY trigger
 until AUTOCAL_LAKES_ON=1 — the lake/reservoir module is being switched on
 for the west (CREST_LAKES=west), and calibrating before it simulates the
 reservoirs would bake them into the parameters (e.g. 10171000 Jordan River,
-267 mm; 09337500 Escalante, 11 mm). Eastern gauges are not held: their lakes
+267 mm; 09337500 Escalante, 11 mm). The flag lifts the hold only while the
+lake module is really live here: hf_data.lakes importable, lakes.region()
+covering the west and a non-empty lakes.table_version() — otherwise the hold
+stays and the phase line says why. Eastern gauges are not held: their lakes
 are not simulated any time soon, so a hold would block them indefinitely.
 Held events are filtered out of eligibility without a Hub write; they are
 listed in the state file (held_reservoir) and the phase line.
@@ -32,9 +35,11 @@ Triggers:
     checks that ALL missed (a check that passes publishes a map, so the event
     would be in events/index.json — such streaks are skipped), the last check
     at least AUTOCAL_QUIET_H old (the trigger stopped re-checking: the flood
-    is over).
-  * OVER-PREDICTION (kind "oversim") — a published event (events/index.json)
-    whose manifest hydro rows, paired sim_q/obs_q up to t0, peak at
+    is over) and newer than the gauge's last calibration (an older streak was
+    simulated with the replaced parameters).
+  * OVER-PREDICTION (kind "oversim", WESTERN gauges only) — a published event
+    (events/index.json) whose manifest hydro rows, paired sim_q/obs_q up to t0,
+    peak at
     max(sim)/max(obs) >= AUTOCAL_OVERSIM_RATIO with an obs peak >=
     AUTOCAL_OVERSIM_MIN_OBS m3/s, and whose t_end is at least AUTOCAL_QUIET_H
     old. The guard only rejects UNDER-prediction (sim < 0.3 x obs), so before
@@ -50,16 +55,31 @@ Triggers:
     next gauge of hf_data/data/autocal_west_backlog.json
     (scripts/build_autocal_backlog.py: tier 1 event-prone, 2 dam-free with a
     suspect parameter set, 3 other dam-free, 4 reservoir-affected; smaller
-    basins first). Tier 4 is held back unless AUTOCAL_LAKES_ON=1: calibrated
-    before the lake module simulates their reservoirs, the parameters would
-    absorb them. Calibrate once: a gauge with any ran=True record is never
-    picked again. A backlog gauge that cannot run (obs coverage, calibration
-    error) is NOT committed one by one (events/autocal.json is a Hub commit
-    per record): it goes on a local skip list in AUTOCAL_STATE (kept across
-    loop restarts in this container, retried after AUTOCAL_SKIP_TTL_D days)
-    and reaches the Hub only in one "backlog_skips" summary record at most
-    every AUTOCAL_SKIP_SUMMARY_H, which also re-seeds the list after a Space
-    restart.
+    basins first). Tier 4 is held back like the event triggers (reservoir
+    hold above): calibrated before the lake module simulates their
+    reservoirs, the parameters would absorb them. Calibrate once: a gauge
+    with any ran=True record is never picked again — read from the permanent
+    ledger events/autocal_done.json (eventstore.note_autocal keeps it with
+    every ran=True record; autocal.json keeps only its last 500 rows) united
+    with the autocal.json rows. A backlog gauge that cannot run (obs
+    coverage, calibration error) is NOT committed one by one
+    (events/autocal.json is a Hub commit per record): it goes on a local skip
+    list in AUTOCAL_STATE (kept across loop restarts in this container,
+    retried after AUTOCAL_SKIP_TTL_D days for too little obs, after
+    AUTOCAL_SKIP_ERR_TTL_H hours for any other reason) and reaches the Hub
+    only in one "backlog_skips" summary record at most every
+    AUTOCAL_SKIP_SUMMARY_H, which also re-seeds the list after a Space
+    restart. After AUTOCAL_MAX_SKIP_RUN skips in a row the walk pauses until
+    the next poll (an outage the checks below miss must not skip the list).
+Outages: an obs fetch that failed for a reason that is not the gauge's
+(network, timeout, NWIS 5xx/429) or a network/Hub/memory exception records
+nothing — no event record, no backlog skip — and backs off AUTOCAL_POLL_S;
+only a backlog gauge that hits AUTOCAL_OUTAGE_STRIKES of them in a row is
+skipped (short TTL), so a fault only it triggers cannot pin the list.
+History: an unreadable autocal.json or ledger is never "no history" — the
+loop waits (phase "history unreadable"). A record whose commit failed stays
+pending in AUTOCAL_STATE, counts for the daily cap, handled pairs and
+calibrate-once, and is retried every poll until it is on the Hub.
 Gates for every kind: fewer than AUTOCAL_MAX_PER_DAY calibrations (ran=True,
 any kind) started in the last 24 h, the idle gate (busy_reason), and USGS
 observations covering >= AUTOCAL_OBS_MIN_FRAC of the window.
@@ -71,7 +91,8 @@ Method: hf_data.calibrate.run_calibration (LLM-proposed multiplier updates
 within hydrologic bounds, judged by real EF5 runs), saving the winner only if
 it beats the CURRENT parameters on this window (save_vs_baseline) and pushing
 it to CREST_state params/ where paramstore.get on every other Space picks it
-up. Without an LLM key it waits (AUTOCAL_REQUIRE_LLM=1): heuristic-only
+up. A calibration in which no EF5 run produced an NSE is ran=False. Without
+an LLM key it waits (AUTOCAL_REQUIRE_LLM=1): heuristic-only
 search is not the "AI calibration" this Space exists for.
 """
 from __future__ import annotations
@@ -79,6 +100,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -107,7 +129,12 @@ BACKLOG_PATH = os.environ.get("AUTOCAL_BACKLOG", os.path.join(
 RESERVOIR_PATH = os.environ.get("AUTOCAL_RESERVOIRS", os.path.join(
     os.path.dirname(HERE), "hf_data", "data", "gagesii_reservoir_stor.json"))
 SKIP_TTL_D = float(os.environ.get("AUTOCAL_SKIP_TTL_D", "30"))
+# any skip reason but too little obs (calibration error, no NSE, repeated
+# outage) may clear on its own: retried much sooner
+SKIP_ERR_TTL_H = float(os.environ.get("AUTOCAL_SKIP_ERR_TTL_H", "24"))
 SKIP_SUMMARY_H = float(os.environ.get("AUTOCAL_SKIP_SUMMARY_H", "24"))
+MAX_SKIP_RUN = int(os.environ.get("AUTOCAL_MAX_SKIP_RUN", "5"))
+OUTAGE_STRIKES = int(os.environ.get("AUTOCAL_OUTAGE_STRIKES", "4"))
 # Idle gate (user 2026-10-12: "auto_cal has the lowest priority — only when
 # there is enough computation"): start, and keep going between rounds, only
 # while the dashboard's /api/health shows no user-initiated work, no 2-D
@@ -120,7 +147,8 @@ IDLE_FOR_S = float(os.environ.get("AUTOCAL_IDLE_FOR_S", "1800"))
 
 TS = "%Y-%m-%dT%H:%M:%SZ"
 state = {"phase": "booting", "current": None, "last": None, "runs": 0, "skips": 0,
-         "backlog_skips": {}, "skips_summarized": None, "held_reservoir": []}
+         "backlog_skips": {}, "skips_summarized": None, "held_reservoir": [],
+         "pending": [], "outage": {}}
 
 
 def log(s: str):
@@ -137,6 +165,34 @@ def _dump_state():
 
 class Preempted(Exception):
     """Higher-priority work appeared mid-calibration: drop it, retry later."""
+
+
+class Outage(Exception):
+    """Trouble that is not the gauge's (obs fetch, network, Hub): record
+    nothing, back off, retry later."""
+
+
+def is_outage(e: BaseException) -> bool:
+    """True when an exception says nothing about the gauge: network, Hub,
+    auth or memory trouble that would fail every gauge alike. An HTTP answer
+    of 4xx (no such file / site) is the gauge's own, except 401/403/429."""
+    if isinstance(e, (ConnectionError, TimeoutError, MemoryError)):
+        return True
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    if isinstance(code, int):
+        return code >= 500 or code in (401, 403, 429)
+    roots = {c.__module__.split(".")[0] for c in type(e).__mro__}
+    return bool(roots & {"requests", "urllib3", "httpx", "huggingface_hub", "urllib"})
+
+
+def fetch_outage(err: str | None) -> bool:
+    """True when obs.get_series' fetch_error is an outage (connection,
+    timeout, NWIS 5xx/429) rather than NWIS answering 4xx for this site —
+    requests' HTTPError text starts "<code> Client|Server Error"."""
+    if not err:
+        return False
+    m = re.match(r"(\d{3}) (Client|Server) Error", str(err))
+    return m is None or m.group(2) == "Server" or m.group(1) == "429"
 
 
 def busy_reason() -> str | None:
@@ -280,19 +336,44 @@ def reservoir_stor(gid: str) -> float | None:
     return _resv.get(str(gid).zfill(8))
 
 
+def lake_hold() -> str | None:
+    """None when the western reservoir hold is lifted, else why it stays (read
+    after "held "). AUTOCAL_LAKES_ON=1 lifts it only while the lake module is
+    live here: a flag without hf_data.lakes, without CREST_LAKES covering the
+    west or without a lake table would calibrate the reservoirs into the
+    parameters just the same."""
+    if not LAKES_ON:
+        return "until AUTOCAL_LAKES_ON=1"
+    try:
+        from hf_data import lakes
+        reg, ver = lakes.region(), lakes.table_version()
+    except Exception as e:
+        return f"although AUTOCAL_LAKES_ON=1: hf_data.lakes unavailable ({type(e).__name__})"
+    if reg not in ("west", "all"):
+        return f"although AUTOCAL_LAKES_ON=1: lakes.region() is {reg!r}, not the west"
+    if not ver:
+        return "although AUTOCAL_LAKES_ON=1: lakes.table_version() is empty (no lake table)"
+    return None
+
+
 def held_stor(gid: str) -> float | None:
     """Reservoir storage (mm) when this gauge is held back from calibration
-    (western, reservoir-affected and AUTOCAL_LAKES_ON off), else None. The
-    lake module is switched on for the west only (CREST_LAKES=west)."""
-    if LAKES_ON or not is_west(gid):
+    (western, reservoir-affected and the hold not lifted, lake_hold), else
+    None. The lake module is switched on for the west only (CREST_LAKES=west)."""
+    if not is_west(gid) or lake_hold() is None:
         return None
     return reservoir_stor(gid)
 
 
-def _history(done: list, now: dt.datetime):
+def _history(done: list, now: dt.datetime, ledger: dict | None = None):
     """(last ran=True time per gauge, handled (gauge, event) pairs, ran=True
-    records started in the last 24 h) from events/autocal.json rows."""
+    records started in the last 24 h) from events/autocal.json rows (plus
+    pending ones), the last time also from the calibrate-once ledger."""
     last_run = {}
+    for g, e in (ledger or {}).items():
+        t = _parse(e.get("last")) if isinstance(e, dict) else None
+        if t:
+            last_run[str(g).zfill(8)] = t
     for d in done:
         if d.get("ran"):
             t = _parse(d.get("at"))
@@ -316,10 +397,10 @@ def _hold(c: dict, held: list | None) -> bool:
 
 
 def miss_candidates(missed: list, index: dict, done: list, now: dt.datetime,
-                    held: list | None = None) -> list[dict]:
+                    held: list | None = None, ledger: dict | None = None) -> list[dict]:
     """Whole-event miss streaks that are eligible now (kind "miss").
     Reservoir gauges held until AUTOCAL_LAKES_ON=1 go to `held` instead."""
-    last_run, handled, _ = _history(done, now)
+    last_run, handled, _ = _history(done, now, ledger)
     cands = []
     for st in streaks(missed, index):
         gid = st["gauge"]
@@ -330,8 +411,8 @@ def miss_candidates(missed: list, index: dict, done: list, now: dt.datetime,
         if now - st["last_at"] < dt.timedelta(hours=QUIET_H):
             continue                             # gauge still being re-checked hourly
         lr = last_run.get(gid)
-        if lr and now - lr < dt.timedelta(days=COOLDOWN_D):
-            continue
+        if lr and (now - lr < dt.timedelta(days=COOLDOWN_D) or st["last_at"] <= lr):
+            continue                             # cooldown / streak predates the new params
         c = {**st, "kind": "miss", "west": is_west(gid)}
         if not _hold(c, held):
             cands.append(c)
@@ -385,12 +466,14 @@ def _event_stats(ev: str, summary: dict, manifest=None) -> dict | None:
 
 
 def oversim_candidates(index: dict, done: list, now: dt.datetime,
-                       manifest=None, held: list | None = None) -> list[dict]:
-    """Published events whose EF5 peak was >= OVERSIM_RATIO x the observed
-    peak (kind "oversim"). The cheap index-only rules run first, so only
-    events that could still qualify ever have their manifest read. Reservoir
-    gauges held until AUTOCAL_LAKES_ON=1 go to `held` instead."""
-    last_run, handled, _ = _history(done, now)
+                       manifest=None, held: list | None = None,
+                       ledger: dict | None = None) -> list[dict]:
+    """Published events at WESTERN gauges whose EF5 peak was >= OVERSIM_RATIO
+    x the observed peak (kind "oversim"); eastern gauges keep their previous
+    behaviour (miss trigger only). The cheap index-only rules run first, so
+    only events that could still qualify ever have their manifest read.
+    Reservoir gauges held until AUTOCAL_LAKES_ON=1 go to `held` instead."""
+    last_run, handled, _ = _history(done, now, ledger)
     for key in [k for k in _verdicts if k[0] not in (index or {})]:
         del _verdicts[key]                       # rolled off the list
     cands = []
@@ -400,7 +483,7 @@ def oversim_candidates(index: dict, done: list, now: dt.datetime,
         if not raw:
             continue
         gid = str(raw).zfill(8)
-        if (gid, ev) in handled:
+        if (gid, ev) in handled or not is_west(gid):
             continue
         end = _parse(s.get("t_end"))
         if end is None or now - end < dt.timedelta(hours=QUIET_H):
@@ -413,19 +496,18 @@ def oversim_candidates(index: dict, done: list, now: dt.datetime,
                 or st["ratio"] < OVERSIM_RATIO):
             continue
         c = {**st, "kind": "oversim", "gauge": gid, "event": ev, "events": [ev],
-             "west": is_west(gid), "t0": s.get("t0"), "t_end": s.get("t_end"), "_end": end}
+             "west": True, "t0": s.get("t0"), "t_end": s.get("t_end"), "_end": end}
         if not _hold(c, held):
             cands.append(c)
     return cands
 
 
 def _event_key(c: dict):
-    """West first; in the west an over-prediction before a miss, in the east a
-    miss before an over-prediction; then the kind's own keys."""
-    first = "oversim" if c["west"] else "miss"
+    """West first; in the west an over-prediction before a miss (the east has
+    misses only: no over-prediction trigger there); then the kind's own keys."""
     own = ((-c["n_checks"], -c["obs_peak_m3s"]) if c["kind"] == "miss"
            else (-c["ratio"], -c["obs_peak_m3s"]))
-    return (not c["west"], c["kind"] != first) + own
+    return (not c["west"], c["kind"] != "oversim") + own
 
 
 def load_backlog(path: str | None = None) -> list:
@@ -437,29 +519,42 @@ def load_backlog(path: str | None = None) -> list:
         return []
 
 
+def skip_ttl(reason: str | None) -> dt.timedelta:
+    """How long a backlog skip stands: SKIP_TTL_D for too little observed
+    flow (does not change within days), SKIP_ERR_TTL_H for any other reason
+    (calibration error, no NSE, repeated outage) — those may clear soon."""
+    if str(reason or "").startswith("obs cover"):
+        return dt.timedelta(days=SKIP_TTL_D)
+    return dt.timedelta(hours=SKIP_ERR_TTL_H)
+
+
 def backlog_skips(done: list, local: dict, now: dt.datetime) -> dict:
     """{gauge: {at, reason}} of backlog gauges skipped without a run within
-    SKIP_TTL_D: this container's local list merged with the Hub summaries
+    their skip_ttl: this container's local list merged with the Hub summaries
     ("backlog_skips" records), so a Space restart does not re-probe them."""
-    cut = now - dt.timedelta(days=SKIP_TTL_D)
     rows = [r for d in done if d.get("kind") == "backlog_skips"
             for r in (d.get("skipped") or [])]
     rows += [{"gauge": g, **v} for g, v in (local or {}).items()]
     out = {}
     for r in rows:
         g, t = r.get("gauge"), _parse(r.get("at"))
-        if g and t and t > cut and (g not in out or t > _parse(out[g]["at"])):
+        if (g and t and t > now - skip_ttl(r.get("reason"))
+                and (g not in out or t > _parse(out[g]["at"]))):
             out[g] = {"at": r["at"], "reason": r.get("reason")}
     return out
 
 
 def backlog_candidate(backlog: list, done: list, skips: dict,
-                      lakes_on: bool | None = None) -> tuple[dict | None, str]:
+                      lakes_on: bool | None = None,
+                      ledger: dict | None = None) -> tuple[dict | None, str]:
     """The next western backlog gauge (kind "backlog") or None, and why.
     Tier, then smaller area. Calibrate once: any ran=True record (any kind,
-    any age) retires the gauge. Tier 4 (reservoirs) waits for the lakes."""
-    lakes_on = LAKES_ON if lakes_on is None else lakes_on
-    ran = {str(d.get("gauge")) for d in done if d.get("ran")}
+    any age: autocal.json rows, pending ones, the autocal_done.json ledger)
+    retires the gauge. Tier 4 (reservoirs) waits for the lakes (lake_hold)."""
+    hold = (lake_hold() if lakes_on is None
+            else None if lakes_on else "until AUTOCAL_LAKES_ON=1")
+    ran = ({str(d.get("gauge")).zfill(8) for d in done if d.get("ran") and d.get("gauge")}
+           | {str(g).zfill(8) for g in (ledger or {})})
     held = n_ran = n_skip = 0
     for e in sorted(backlog, key=lambda e: (int(e.get("tier") or 9),
                                             float(e.get("area_km2") or 0),
@@ -467,7 +562,7 @@ def backlog_candidate(backlog: list, done: list, skips: dict,
         gid = str(e.get("gauge") or "").zfill(8)
         if not e.get("gauge"):
             continue
-        if int(e.get("tier") or 9) >= 4 and not lakes_on:
+        if int(e.get("tier") or 9) >= 4 and hold:
             held += 1
             continue
         if gid in ran:
@@ -480,24 +575,28 @@ def backlog_candidate(backlog: list, done: list, skips: dict,
                  **{k: e.get(k) for k in ("tier", "area_km2", "stor_mm", "donor", "reasons")}},
                 f"backlog tier {e.get('tier')}, {n_ran} done, {n_skip} skipped ahead of it")
     return None, (f"western backlog exhausted ({len(backlog)} gauges: {n_ran} done, "
-                  f"{n_skip} skipped, {held} reservoir gauges held until AUTOCAL_LAKES_ON=1)")
+                  f"{n_skip} skipped, {held} reservoir gauges held"
+                  + (f" {hold})" if hold else ")"))
 
 
 def pick_candidate(missed: list, index: dict, done: list, now: dt.datetime,
                    backlog: list | None = None, skips: dict | None = None,
-                   manifest=None, held: list | None = None):
+                   manifest=None, held: list | None = None,
+                   ledger: dict | None = None):
     """The one candidate to work on next (or None) and a reason string: the
-    first eligible event (miss streak or over-prediction, western gauges
-    first), else the next western backlog gauge. Event candidates on held
-    (western reservoir) gauges are appended to `held` (when given), never
-    picked."""
+    first eligible event (miss streak or western over-prediction, western
+    gauges first), else the next western backlog gauge. Event candidates on
+    held (western reservoir) gauges are appended to `held` (when given), never
+    picked. `ledger`: the calibrate-once ledger (eventstore.load_autocal_done)."""
     # candidates first (cheap: verdicts are memoised) so the held list stays
     # current on the status page even while the daily cap is reached
     held = [] if held is None else held
-    cands = (miss_candidates(missed, index, done, now, held=held)
-             + oversim_candidates(index, done, now, manifest=manifest, held=held))
-    hold = (f"; {len(held)} western reservoir-gauge event(s) held until AUTOCAL_LAKES_ON=1"
-            if held else "")
+    cands = (miss_candidates(missed, index, done, now, held=held, ledger=ledger)
+             + oversim_candidates(index, done, now, manifest=manifest, held=held,
+                                  ledger=ledger))
+    why_hold = lake_hold()
+    hold = (f"; {len(held)} western reservoir-gauge event(s) held {why_hold}" if held
+            else f"; reservoir hold kept {why_hold}" if LAKES_ON and why_hold else "")
     _, _, today = _history(done, now)
     if today >= MAX_PER_DAY:
         return None, f"daily cap reached ({today}/{MAX_PER_DAY} in 24 h){hold}"
@@ -505,7 +604,7 @@ def pick_candidate(missed: list, index: dict, done: list, now: dt.datetime,
         cands.sort(key=_event_key)
         n_west = sum(1 for c in cands if c["west"])
         return cands[0], f"{len(cands)} eligible event(s), {n_west} western{hold}"
-    rec, why = backlog_candidate(backlog or [], done, skips or {})
+    rec, why = backlog_candidate(backlog or [], done, skips or {}, ledger=ledger)
     return rec, f"no eligible event{hold}; {why}"
 
 
@@ -584,6 +683,9 @@ def calibrate_one(rec: dict, now: dt.datetime) -> dict:
     frac = min(1.0, len({t.replace(minute=0, second=0, microsecond=0)
                          for t, _ in series}) / hours)
     if frac < OBS_MIN_FRAC:
+        if fetch_outage(info.get("fetch_error")):    # NWIS unreachable, not the gauge
+            raise Outage(f"obs fetch for {gid} failed ({str(info['fetch_error'])[:160]}), "
+                         f"cover {100 * frac:.0f}%")
         return {**base, "ran": False,
                 "reason": f"obs cover {100 * frac:.0f}% of the window (< {100 * OBS_MIN_FRAC:.0f}%)"
                           + (f"; fetch: {info.get('fetch_error')}" if info.get("fetch_error") else "")}
@@ -611,6 +713,11 @@ def calibrate_one(rec: dict, now: dt.datetime) -> dict:
             done = payload
     if not done or done.get("error"):
         return {**base, "ran": False, "reason": f"calibration error: {(done or {}).get('error', 'no result')}"}
+    if done.get("baseline_nse") is None and done.get("best_nse") is None:
+        # every EF5 run failed (or none ran): nothing was judged, nothing to
+        # retire the gauge or start the cooldown with
+        return {**base, "ran": False, "n_runs": n_runs,
+                "reason": "no EF5 run produced an NSE"}
     bp = done.get("best_params") or {}
     return {**base, "ran": True, "n_runs": n_runs,
             "baseline_nse": done.get("baseline_nse"), "best_nse": done.get("best_nse"),
@@ -630,16 +737,72 @@ def _load_local_state():
         state["backlog_skips"] = {str(g): v for g, v in (old.get("backlog_skips") or {}).items()
                                   if isinstance(v, dict)}
         state["skips_summarized"] = old.get("skips_summarized")
+        state["pending"] = [p for p in (old.get("pending") or []) if isinstance(p, dict)]
     except (OSError, ValueError, AttributeError, TypeError):
         pass
+
+
+def run_candidate(rec: dict, now: dt.datetime) -> dict:
+    """calibrate_one, raising Outage for an exception that is not the gauge's
+    (is_outage). A backlog gauge's own exception becomes a ran=False record (a
+    gauge that always throws must not pin the head of the list); an event's
+    propagates (shown as the phase, retried next poll)."""
+    try:
+        return calibrate_one(rec, now)
+    except (Preempted, Outage):
+        raise
+    except Exception as e:
+        if is_outage(e):
+            raise Outage(f"{type(e).__name__}: {str(e)[:200]}") from e
+        if rec["kind"] != "backlog":
+            raise
+        log(traceback.format_exc())
+        return {"gauge": rec["gauge"], "kind": "backlog", "ran": False,
+                "at": now.strftime(TS), "reason": f"error: {type(e).__name__}: {e}"}
+
+
+def _outage(rec: dict, now: dt.datetime, o: Outage) -> dict | None:
+    """Nothing is recorded for an outage (None: the loop backs off POLL_S) —
+    except that a backlog gauge hitting OUTAGE_STRIKES of them in a row gets a
+    short-TTL skip record, so a fault only it triggers cannot pin the head of
+    the list. An event record would be permanent: events are always retried."""
+    key = f"{rec['gauge']}|{rec.get('event')}"
+    last = state.get("outage") or {}
+    n = int(last.get("n") or 0) + 1 if last.get("key") == key else 1
+    state["outage"] = {"key": key, "n": n, "reason": str(o)}
+    if rec["kind"] == "backlog" and n >= OUTAGE_STRIKES:
+        state["outage"] = {}
+        return {"gauge": rec["gauge"], "kind": "backlog", "ran": False,
+                "at": now.strftime(TS), "reason": f"outage {n}x in a row: {o}"}
+    return None
+
+
+def _rec_key(r: dict) -> tuple:
+    return (r.get("gauge"), r.get("event"), r.get("kind"), r.get("at"))
+
+
+def _flush_pending(done: list) -> list:
+    """Records whose commit failed (state "pending"): drop those now on the
+    Hub, retry the rest oldest first (stopping at the first failure), and
+    return `done` plus every record not in it — committed just now or still
+    pending — so the daily cap, handled pairs and calibrate-once count them."""
+    from hf_data import eventstore
+    on_hub = {_rec_key(d) for d in done}
+    out = [p for p in state["pending"] if _rec_key(p) not in on_hub]
+    left = list(out)
+    while left and eventstore.note_autocal(left[0]):
+        log(f"pending record committed: {left[0].get('gauge')} ({left[0].get('kind')}, "
+            f"{left[0].get('at')})")
+        left.pop(0)
+    state["pending"] = left
+    return list(done) + out
 
 
 def _summarize_skips(done: list, now: dt.datetime):
     """Prune expired local skips; commit a summary record when one is due."""
     from hf_data import eventstore
-    cut = now - dt.timedelta(days=SKIP_TTL_D)
     state["backlog_skips"] = {g: v for g, v in state["backlog_skips"].items()
-                              if (_parse(v.get("at")) or now) > cut}
+                              if (_parse(v.get("at")) or now) > now - skip_ttl(v.get("reason"))}
     rec = skip_summary(done, state["backlog_skips"], now, state.get("skips_summarized"))
     if rec and eventstore.note_autocal(rec):
         state["skips_summarized"] = rec["at"]
@@ -652,8 +815,8 @@ def _note_held(held: list):
     write, they are simply not eligible."""
     key = sorted((h["gauge"], h["event"]) for h in held)
     if key != sorted((h["gauge"], h["event"]) for h in state["held_reservoir"]):
-        log(f"holding {len(held)} western reservoir-gauge event candidate(s) until "
-            f"AUTOCAL_LAKES_ON=1: " + (", ".join(
+        log(f"holding {len(held)} western reservoir-gauge event candidate(s) "
+            f"{lake_hold() or 'no longer'}: " + (", ".join(
                 f"{h['gauge']} ({h['kind']}, {h['stor_mm']:.0f} mm)" for h in held)
                 or "none"))
     state["held_reservoir"] = held
@@ -669,6 +832,7 @@ def main():
         while True:
             time.sleep(3600)
     idle_since = None
+    skip_run = 0                       # backlog skips in a row since the last poll
     while True:
         now = dt.datetime.utcnow()
         try:
@@ -694,17 +858,32 @@ def main():
             missed = eventstore.load_missed()
             index = eventstore.load_index()
             done = eventstore.load_autocal()
+            ledger = eventstore.load_autocal_done()
+            if done is None or ledger is None:
+                # an outage is not "no history": picking now could re-calibrate
+                # a calibrated gauge or blow through the daily cap
+                state["phase"] = (f"history unreadable — events/autocal.json or "
+                                  f"autocal_done.json could not be read; retry in "
+                                  f"{POLL_S / 60:.0f} min")
+                _dump_state()
+                log(state["phase"])
+                skip_run = 0
+                time.sleep(POLL_S)
+                continue
+            done = _flush_pending(done)
             skips = backlog_skips(done, state["backlog_skips"], now)
             held = []
             rec, why = pick_candidate(missed, index, done, now, backlog=load_backlog(),
-                                      skips=skips, held=held)
+                                      skips=skips, held=held, ledger=ledger)
             _note_held(held)
             if rec is None:
                 _summarize_skips(done, now)
+                pend = f", {len(state['pending'])} pending" if state["pending"] else ""
                 state["phase"] = (f"idle — {why} ({len(missed)} miss rows, "
-                                  f"{len(index)} events, {len(done)} records)")
+                                  f"{len(index)} events, {len(done)} records{pend})")
                 _dump_state()
                 log(state["phase"])
+                skip_run = 0
                 time.sleep(POLL_S)
                 continue
             state["phase"] = f"calibrating {rec['gauge']} ({rec['kind']}; {why})"
@@ -712,30 +891,48 @@ def main():
                                 "kind": rec["kind"], "west": rec["west"],
                                 "started": now.strftime(TS)}
             _dump_state()
-            if rec["kind"] == "backlog":
-                try:
-                    result = calibrate_one(rec, now)
-                except Preempted:
-                    raise
-                except Exception as e:     # a backlog gauge that always throws must
-                    log(traceback.format_exc())    # not pin the head of the list
-                    result = {"gauge": rec["gauge"], "kind": "backlog", "ran": False,
-                              "at": now.strftime(TS),
-                              "reason": f"error: {type(e).__name__}: {e}"}
-            else:
-                result = calibrate_one(rec, now)
+            try:
+                result = run_candidate(rec, now)
+            except Outage as o:
+                result = _outage(rec, now, o)
+                if result is None:         # nothing recorded: back off, retry
+                    state["phase"] = (f"outage — {o}; nothing recorded, retry in "
+                                      f"{POLL_S / 60:.0f} min "
+                                      f"({state['outage']['n']}/{OUTAGE_STRIKES})")
+                    state["current"] = None
+                    _dump_state()
+                    log(state["phase"])
+                    skip_run = 0
+                    time.sleep(POLL_S)
+                    continue
+            state["outage"] = {}           # a result ends any outage streak
             if rec["kind"] == "backlog" and not result.get("ran"):
                 # no Hub commit per backlog skip (hundreds of them would each
                 # rewrite events/autocal.json): local list + a periodic summary
                 state["backlog_skips"][result["gauge"]] = {
                     "at": result["at"], "reason": str(result.get("reason") or "")[:200]}
                 _summarize_skips(done, now)
+                skip_run += 1
             else:
-                eventstore.note_autocal(result)
+                skip_run = 0
+                if not eventstore.note_autocal(result):
+                    # kept until it is on the Hub; counts for the cap, the
+                    # handled pairs and calibrate-once meanwhile (_flush_pending)
+                    state["pending"].append(result)
+                    log(f"commit failed — record kept pending ({len(state['pending'])})")
             state["runs" if result.get("ran") else "skips"] += 1
             state["last"] = result
             state["current"] = None
             log(f"record: {json.dumps(result)[:400]}")
+            if skip_run >= MAX_SKIP_RUN:
+                # an outage the checks missed must not walk the whole backlog
+                state["phase"] = (f"paused — {skip_run} backlog gauges skipped in a row; "
+                                  f"next poll in {POLL_S / 60:.0f} min")
+                _dump_state()
+                log(state["phase"])
+                skip_run = 0
+                time.sleep(POLL_S)
+                continue
         except Preempted as p:             # nothing recorded: retried when idle
             state["phase"] = f"preempted — {p}"
             state["current"] = None
@@ -745,6 +942,7 @@ def main():
             state["phase"] = f"error: {type(e).__name__}: {e}"
             state["current"] = None
             log(traceback.format_exc())
+            skip_run = 0
             time.sleep(POLL_S)
         _dump_state()
         time.sleep(30)

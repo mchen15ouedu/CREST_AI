@@ -242,41 +242,101 @@ def note_missed(rec: dict) -> bool:
 
 AUTOCAL_FILE = f"{PREFIX}/autocal.json"
 AUTOCAL_KEEP = 500
+# permanent calibrate-once ledger: autocal.json keeps only the last
+# AUTOCAL_KEEP rows, so a gauge calibrated long ago would roll off it and be
+# picked again. {gauge: {first, last, n}} of ran=True records, never truncated
+# (one small entry per calibrated gauge), committed with the record itself.
+AUTOCAL_DONE_FILE = f"{PREFIX}/autocal_done.json"
 
 
-def load_autocal() -> list:
+def _load_hub_json(path: str, kind: type):
+    """`path` from the dataset (fresh), or kind() when the file does not exist
+    yet, or None when it could not be read (network, auth, corrupt JSON,
+    wrong type). Only a real 404 counts as missing: an offline
+    LocalEntryNotFoundError (a subclass of EntryNotFoundError) is an outage."""
+    try:
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
+    except Exception:
+        return None
+    try:
+        p = hf_hub_download(REPO, path, repo_type="dataset",
+                            token=os.environ.get("HF_TOKEN"),
+                            force_download=True)
+        with open(p, encoding="utf-8") as fp:
+            data = json.load(fp)
+    except LocalEntryNotFoundError:
+        return None
+    except EntryNotFoundError:
+        return kind()
+    except Exception:
+        return None
+    return data if isinstance(data, kind) else None
+
+
+def load_autocal() -> list | None:
     """Auto-calibration records (newest last): one per (event, gauge) the
     CREST_autocal Space looked at — ran (with before/after NSE and whether
     the winner was saved) or skipped with a reason. `kind` is "miss",
     "oversim" or "backlog" (older rows: no kind = miss); western-backlog
     skips arrive only in periodic kind "backlog_skips" summaries (gauge None).
-    [] on any failure."""
-    try:
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, AUTOCAL_FILE, repo_type="dataset",
-                            token=os.environ.get("HF_TOKEN"),
-                            force_download=True)
-        with open(p, encoding="utf-8") as fp:
-            return json.load(fp)
-    except Exception:
-        return []
+    [] only when the file does not exist yet; None when it could not be read —
+    an outage must never look like "no history" (the autocal loop would
+    re-calibrate, note_autocal would overwrite the log with one row)."""
+    return _load_hub_json(AUTOCAL_FILE, list)
+
+
+def load_autocal_done() -> dict | None:
+    """The calibrate-once ledger {gauge: {first, last, n}} (ran=True records
+    only, never truncated). {} when it does not exist yet, None when it could
+    not be read."""
+    return _load_hub_json(AUTOCAL_DONE_FILE, dict)
+
+
+def _ledger_add(ledger: dict, rec: dict) -> None:
+    """Fold one ran=True record into the ledger (in place). `at` strings are
+    %Y-%m-%dT%H:%M:%SZ, so plain comparison orders them."""
+    g = rec.get("gauge")
+    if not rec.get("ran") or not g:
+        return
+    e = ledger.get(str(g)) or {}
+    ats = [str(t) for t in (e.get("first"), e.get("last"), rec.get("at")) if t]
+    ledger[str(g)] = {"first": min(ats, default=None), "last": max(ats, default=None),
+                      "n": int(e.get("n") or 0) + 1}
 
 
 def note_autocal(rec: dict) -> bool:
-    """Append one auto-calibration record and commit."""
+    """Append one auto-calibration record and commit — together with its
+    calibrate-once ledger entry (autocal_done.json) when it ran, in the same
+    commit. False, with nothing committed, when either file could not be read
+    (never [rec] over the whole log) or the commit failed: the caller keeps
+    the record and retries."""
     from huggingface_hub import CommitOperationAdd
     api = _api()
     if api is None:
         return False
     with _lock:
         rows = load_autocal()
+        if rows is None:
+            return False
+        ops = []
+        if rec.get("ran"):
+            ledger = load_autocal_done()
+            if ledger is None:
+                return False
+            if not ledger:                      # first write: seed from the log
+                for r in rows:
+                    _ledger_add(ledger, r)
+            _ledger_add(ledger, rec)
+            ops.append(CommitOperationAdd(
+                AUTOCAL_DONE_FILE, io.BytesIO(json.dumps(ledger).encode())))
         rows.append(rec)
         rows = rows[-AUTOCAL_KEEP:]
+        ops.insert(0, CommitOperationAdd(
+            AUTOCAL_FILE, io.BytesIO(json.dumps(rows).encode())))
         try:
             api.create_commit(
-                repo_id=REPO, repo_type="dataset",
-                operations=[CommitOperationAdd(
-                    AUTOCAL_FILE, io.BytesIO(json.dumps(rows).encode()))],
+                repo_id=REPO, repo_type="dataset", operations=ops,
                 commit_message=f"autocal {rec.get('gauge') or rec.get('kind')}: "
                                f"{'ran' if rec.get('ran') else 'skipped'} "
                                f"({rec.get('reason') or 'NSE %s -> %s' % (rec.get('baseline_nse'), rec.get('best_nse'))})")
