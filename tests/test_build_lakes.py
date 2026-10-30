@@ -50,20 +50,20 @@ def test_dis_avg_first_outside_the_us():
     assert list(mm) == pytest.approx([300.0, 500.0, 300.0, 100.0])
 
 
-def _lk(id_, source, r, c, fam, v, area, hylak=0, dis=np.nan, kind="dam"):
+def _lk(id_, source, r, c, fam, v, area, hylak=0, dis=np.nan, kind="dam", ltype=0):
     return {"id": id_, "name": id_, "kind": kind, "source": source, "lat": 39.0, "lon": -120.0,
             "snap_lat": 39.0, "snap_lon": -120.0, "snap_row": r, "snap_col": c,
             "fam_km2": fam, "ref_km2": fam, "snap_rule": "area", "v_km3": v, "s0_frac": 0.9,
             "area_km2": area, "dis_avg": dis, "purpose": "Irrigation" if source != "hydrolakes" else "",
             "gate": "", "hylak_id": hylak, "grand_id": 0, "nid_id": id_[3:] if source != "hydrolakes" else "",
-            "flood": False, "country": bl.US}
+            "lake_type": ltype, "flood": False, "country": bl.US}
 
 
 def test_one_water_body_listed_twice_is_merged():
     L = pd.DataFrame([
         _lk("NIDCA10162", "nid", 25005, 35827, 1295.46, 0.903, 485.6),          # Lake Tahoe Dam
         _lk("HL792", "hydrolakes", 25006, 35829, 1295.40, 0.4956, 495.6, hylak=792, dis=22.0,
-            kind="natural"),                                                     # 'Tahoe'
+            kind="natural", ltype=3),                                                     # 'Tahoe'
         _lk("NIDX1", "nid", 25007, 35828, 12.0, 0.001, 0.1),                    # side creek
         _lk("NIDX2", "nid", 25100, 35900, 1300.0, 0.002, 0.2),                  # far away
     ])
@@ -74,6 +74,7 @@ def test_one_water_body_listed_twice_is_merged():
     assert t.area_km2 == pytest.approx(495.6)                    # the larger surface, never the sum
     assert (t.snap_row, t.snap_col) == (25005, 35827)            # the downstream (larger FAM) cell
     assert t.source == "both" and t.hylak_id == 792 and t.dis_avg == pytest.approx(22.0)
+    assert t.lake_type == 3                       # a dam on a natural lake (lake control)
     assert t.merged_ids == "HL792"
     assert out.loc["NIDX1"].merged_ids == "" and out.loc["NIDX2"].merged_ids == ""
 
