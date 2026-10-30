@@ -45,6 +45,16 @@ def _site_lock(site: str) -> threading.Lock:
         return _locks.setdefault(site, threading.Lock())
 
 
+def _store_lock(site: str):
+    """Cross-process lock on one gauge's store (taken inside _site_lock): the
+    dashboard, fleet workers and calibration runs are separate processes, and
+    two that load-fetch-save the same store at once lose the rows the first
+    save added. OS-level lock - released if the holder dies."""
+    from filelock import FileLock
+    os.makedirs(_obs_dir(), exist_ok=True)
+    return FileLock(_store_path(site) + ".lock")
+
+
 def fetch_usgs_discharge(site: str, t_start: datetime, t_end: datetime) -> list[tuple[datetime, float]]:
     """Observed discharge (m³/s) time series, or [] if unavailable."""
     from datetime import timedelta
@@ -112,9 +122,9 @@ def _save_store(site: str, rows: dict[datetime, float], cov: list[list[datetime]
     schema = pa.schema([pa.field("time", pa.timestamp("s")),
                         pa.field("q", pa.float64())]).with_metadata(meta)
     tbl = pa.table({"time": times, "q": [rows[t] for t in times]}, schema=schema)
-    tmp = _store_path(site) + ".tmp"
-    pq.write_table(tbl, tmp, compression="zstd")
-    os.replace(tmp, _store_path(site))
+    from hf_data.atomicfile import atomic_path
+    with atomic_path(_store_path(site)) as tmp:     # unique per call; threads + processes
+        pq.write_table(tbl, tmp, compression="zstd")
 
 
 def _merge_cov(cov: list[list[datetime]]) -> list[list[datetime]]:
@@ -156,7 +166,7 @@ def get_series(site: str, t_start: datetime, t_end: datetime,
     {"cached": bool, "fetched_windows": n, "fetch_error": str?} for status text.
     """
     site = str(site).zfill(8)
-    with _site_lock(site):
+    with _site_lock(site), _store_lock(site):  # this process's threads, then other processes
         rows, cov = _load_store(site)
         gaps = _gaps(cov, t_start, t_end)
         fetched = 0

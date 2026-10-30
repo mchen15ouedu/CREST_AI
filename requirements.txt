@@ -21,6 +21,7 @@ plotly
 
 # --- HF data layer (our additions: COG clip + PQF forcing + catalogs) ---
 huggingface_hub
+filelock               # cross-process obs-store lock (already a huggingface_hub dependency)
 pyarrow
 truststore
 pysheds                # fallback: derive flow dir/acc from the clipped DEM

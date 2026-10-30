@@ -24,6 +24,8 @@ truststore.inject_into_ssl()  # local corporate-MITM fix; harmless on HF runners
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError
 
+from hf_data.atomicfile import atomic_path
+
 HF_REPO = "vincewin/CREST_data"
 
 # per-variable source layout + EF5 wiring
@@ -100,13 +102,12 @@ def _write_pqf(path: str, a: np.ndarray, xll: float, yll: float, cell: float, no
             b"xllcorner": repr(float(xll)).encode(), b"yllcorner": repr(float(yll)).encode(),
             b"cellsize": repr(float(cell)).encode(), b"nodata": repr(float(nodata)).encode()}
     schema = pa.schema([pa.field("v", pa.float32())]).with_metadata(meta)
-    # atomic and per-process: the shared store may have concurrent readers
-    # (EF5), and two workers may clip the same hour (nested basins share a
-    # store) - with one ".tmp" name, one renamed the other's file away
-    tmp = f"{path}.{os.getpid()}.tmp"
-    pq.write_table(pa.table({"v": a.reshape(-1).astype("float32")}, schema=schema),
-                   tmp, compression="zstd")
-    os.replace(tmp, path)
+    # atomic, temp name unique per call: the shared store may have concurrent
+    # readers (EF5), and two writers - fleet workers or dashboard threads - may
+    # clip the same hour (nested basins share a store)
+    with atomic_path(path) as tmp:
+        pq.write_table(pa.table({"v": a.reshape(-1).astype("float32")}, schema=schema),
+                       tmp, compression="zstd")
 
 
 def _clip(a, xll, yll, cell, nodata, bbox):

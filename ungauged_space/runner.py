@@ -34,6 +34,7 @@ Secret: HF_TOKEN (write access — uploads to CREST_data and CREST_fleet).
 """
 import http.server
 import json
+import multiprocessing
 import os
 import shutil
 import threading
@@ -382,7 +383,14 @@ def run_pass(t0):
         except Exception as e:
             _log(f"  PARQUET UPLOAD FAILED: {type(e).__name__}: {e}")
 
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    # spawn, not fork: by now this process has run hf-xet downloads (seeding,
+    # virtualpoints, nowcaststore) whose runtime threads + locks a forked worker
+    # inherits mid-state - the gauge fleet's workers deadlocked on exactly that.
+    # Spawned workers re-import this file (guarded __main__) and get os.environ,
+    # sys.path (incl. SRC) and the cwd from this process; run_one's args and
+    # return value are plain picklable data
+    with ProcessPoolExecutor(max_workers=workers,
+                             mp_context=multiprocessing.get_context("spawn")) as pool:
         futs = {}
         for p in pts:
             k_spd, k_base = _keys_for(p["id"], p["lon"])

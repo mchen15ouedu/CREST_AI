@@ -126,7 +126,8 @@ def _scan() -> dict[str, str]:
         if not os.path.isdir(root):
             continue
         for p in glob.glob(os.path.join(root, "**", "*"), recursive=True):
-            if os.path.isfile(p):
+            # .tmp = an atomic write in flight, .lock = obs store lock file
+            if os.path.isfile(p) and not p.endswith((".tmp", ".lock")):
                 out[os.path.relpath(p, _cache_dir()).replace(os.sep, "/")] = p
     return out
 
