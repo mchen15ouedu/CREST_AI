@@ -3018,15 +3018,26 @@ async function loadEvents() {
       `${a.saved ? " · saved" : " · not better"}</div>`;
   });
   // in-flight worker queue: events exist here before they publish — without
-  // this, GPU-solved events were invisible for hours ("no new events?")
+  // this, GPU-solved events were invisible for hours ("no new events?").
+  // (refresh) = already on the list, as a card or folded into one (merged.ids)
+  const knownIds = new Set(ids);
+  ids.forEach((id) => {
+    const mg = (d.events[id] || {}).merged;
+    if (mg && Array.isArray(mg.ids)) mg.ids.forEach((x) => knownIds.add(x));
+  });
   (d.queue || []).forEach((q) => {
-    const known = d.events && d.events[q.id];
+    const known = knownIds.has(q.id);
     html += `<div style="color:#9fc4e8;font-size:12px">` +
       `${q.worker ? "🛠" : "⏳"} <b>${q.gauge || q.id}</b> — ` +
       `${q.worker ? "solving on GPU worker" : "queued for GPU worker"}` +
       `${known ? " (refresh)" : " (new)"}</div>`;
   });
-  if (!ids.length) html += "<div style='opacity:.8'>No published events yet.</div>";
+  if (!ids.length) {
+    // every group rolled off: the store isn't empty, the window is
+    html += li.hidden_old > 0
+      ? `<div style='opacity:.8'>No events in the last ${li.max_age_d || 30} days.</div>`
+      : "<div style='opacity:.8'>No published events yet.</div>";
+  }
   // controls dock ABOVE the event list, so the slider/play buttons are
   // always visible without scrolling an 11-event panel
   html += '<div id="evt-ctl-slot"></div>';
@@ -3270,6 +3281,10 @@ function evtReleaseAnimBar() {
 // the dashboard (hf_data/evtpng.py: every wet cell survives, coloured like
 // the CDN png); at native zoom and past it, the CDN png itself.
 const EVT_POOL_MAX = 16;
+// the pooled overlays' colour version, in the URL (&s=): keep in step with
+// hf_data/evtpng.py STYLE, so a colour change is a URL no browser has pinned
+// (an immutable cache would keep the old colours for a year)
+const EVT_PNG_STYLE = 2;
 function evtPoolFactor(man) {
   const nx = (man.grid && man.grid.nx) || man._natW;
   if (!nx || !man.bounds) return 1;
@@ -3292,7 +3307,7 @@ function evtFrameSrc(man, file) {
   const ny = (man.grid && man.grid.ny) || man._natH;
   const cdn = { url: `${evtBase}/${man._id}/${file}`, bounds: man.bounds };
   if (f <= 1 || !ny || !/\.png$/.test(file || "")) return cdn;
-  const url = `/api/evt_png/${man._id}/${file.slice(0, -4)}.png?f=${f}` +
+  const url = `/api/evt_png/${man._id}/${file.slice(0, -4)}.png?f=${f}&s=${EVT_PNG_STYLE}` +
     (man.generated ? `&g=${encodeURIComponent(man.generated)}` : "");
   if (!evtPoolUsable(url)) return cdn;
   const b = L.latLngBounds(man.bounds);
@@ -3646,9 +3661,9 @@ async function openArchivedEvent(e) {
   if (!evtBase) evtBase = arData.base;          // controls once the panel is up
   const partial = e.frames_stored === 0 || e.frames_stored < e.n_frames_manifest;
   await selectEvent(e.id, { demoted: partial, final: null });
-  if (!e.listed) {
-    addMsg(`🗄 <b>${e.id}</b> is an archived result (off the public list): ` +
-      `max-depth footprint and file downloads only.`, "status");
+  if (!e.listed) {          // rolled off, or folded into another episode's card
+    addMsg(`🗄 <b>${e.id}</b> is an archived result (off the public list)` +
+      (partial ? `: max-depth footprint and file downloads only.` : "."), "status");
   }
 }
 
