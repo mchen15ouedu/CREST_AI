@@ -39,6 +39,13 @@ CONT_TIER = int(os.environ.get("EVENT_CONT_TIER", "1"))
 # gauges that stop reporting mid-episode.
 CONT_OBS_MULT = float(os.environ.get("EVENT_CONT_OBS_MULT", "5.0"))
 MAX_EPISODE_H = int(os.environ.get("EVENT_MAX_EPISODE_H", "96"))
+# ONE FLOOD, ONE EPISODE: a gauge flagged again within EVENT_REOPEN_H of its
+# last episode's end REOPENS that episode (same id, same episode_started
+# anchor) instead of opening a new event id. A gauge hovering at the
+# continuation bar was ended one hour and re-triggered the next, splitting
+# one flood into a dozen 2-h episodes (09353800, 08353000; 2026-10-27..31).
+# 0 disables reopening.
+REOPEN_H = float(os.environ.get("EVENT_REOPEN_H", "12"))
 MAX_PER_TICK = int(os.environ.get("EVENT_MAX_PER_TICK", "2"))
 # V30: the CPU rung is a LAST resort, not a parallel engine — in queue mode
 # "on" a local solve runs only when an event has gone this long with no
@@ -207,6 +214,45 @@ def _age_days_started(s: dict) -> float | None:
         return None
 
 
+def _reopen_candidate(idx: dict, gid: str, now: datetime.datetime,
+                      skip=()) -> str | None:
+    """The gauge's most recent episode if it ENDED within REOPEN_H hours —
+    measured from final.ended, else t_end, else the entry's generated time —
+    and is still inside MAX_EPISODE_H (an over-age episode would just end
+    again next tick; a new episode starts instead). None otherwise, and for
+    ids in `skip`: episodes ended in THIS tick, whose finalize thread is
+    running. A fragment absorbed into another episode (merged_into, from the
+    merge script) is never a candidate nor the gauge's most recent episode.
+    Pinned events are refused by eventstore.reopen_episodes."""
+    if REOPEN_H <= 0:
+        return None
+    mine = [e for e, s in idx.items() if not s.get("merged_into")
+            and str(((s.get("trigger") or {}).get("gauge")) or s.get("gauge") or "") == gid]
+    if not mine:
+        return None
+    eid = max(mine)                   # YYYYMMDDHH_<gauge>: the latest start
+    s = idx[eid]
+    if eid in skip or s.get("status") != "ended":
+        return None
+    end = None
+    for t in ((s.get("final") or {}).get("ended"), s.get("t_end"), s.get("generated")):
+        try:
+            end = datetime.datetime.strptime(str(t or "")[:16], "%Y-%m-%dT%H:%M")
+            break
+        except ValueError:
+            continue
+    try:
+        age_h = (now - datetime.datetime.strptime(
+            s.get("episode_started") or s.get("t0") or "", "%Y-%m-%dT%H:%MZ")
+        ).total_seconds() / 3600.0
+    except ValueError:
+        return None
+    if (end is None or (now - end).total_seconds() / 3600.0 > REOPEN_H
+            or age_h > MAX_EPISODE_H):
+        return None
+    return eid
+
+
 def detect(max_events: int = 1) -> list[dict]:
     """Trigger gauges: per hotspot cluster, the tier-3 member with the
     largest drainage area — GATED on real observations. The AI tier alone
@@ -370,8 +416,12 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     # slice and the publish-time frame merge keeps the record fixed-start.
     anchor = t0
     if episode_id:
-        st = (eventstore.load_index().get(episode_id) or {}).get(
-            "episode_started") or ""
+        entry = eventstore.load_index().get(episode_id) or {}
+        st = entry.get("episode_started") or ""
+        if entry.get("reopened"):
+            # reopened since its last publish: carry the mark in the trigger
+            # (spec + manifest) so later re-sims see it too
+            trigger = {**(trigger or {}), "reopened": True}
         try:
             anchor = datetime.datetime.strptime(st, "%Y-%m-%dT%H:%MZ")
         except ValueError:
@@ -440,14 +490,21 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         # CREST-miss guard: no map when EF5 missed the flood the gauge saw
         miss = _crest_missed(hydro, trigger, gid, sim_anchor, log)
         if miss:
+            reopened = bool(episode_id and (trigger or {}).get("reopened"))
             rec = {"event": ev_id, "gauge": gid, "t0": t0.strftime("%Y-%m-%dT%H:%MZ"),
-                   "episode": bool(episode_id),
+                   "episode": bool(episode_id), "reopened": reopened,
                    "at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                    **miss}
             log(f"CREST MISSED IT: EF5 peak {miss['sim_peak_m3s']} m3/s is "
                 f"{100 * miss['frac']:.0f}% of the observed {miss['obs_peak_m3s']} "
                 f"m3/s — no inundation map published for {ev_id}")
-            if episode_id:
+            if reopened:
+                # a reopened episode was already finalized: its listed record
+                # predates this re-run and is never dropped or purged for it —
+                # the miss is only noted (advisory, as the deployed runner
+                # treats outlet-Q misses since 2026-10-27)
+                log("reopened episode: listed map kept, miss noted only")
+            elif episode_id:
                 # the listed map came from the same EF5 water — just as
                 # wrong; take it down rather than leave a dry basin listed
                 # (pinned demo events are never dropped: drop_events refuses)
@@ -906,12 +963,14 @@ def run_detected(max_events: int = 1) -> list[dict]:
 def hourly_tick() -> dict:
     """Called by the updater after each hourly data refresh.
 
-    1. Every ACTIVE episode whose gauge is still at/above EVENT_CONT_TIER is
-       re-simulated at the fresh t0 (same event id; folder replaced).
+    1. Every ACTIVE episode whose gauge is still at/above EVENT_CONT_TIER, or
+       is flagged again by this hour's detection, is re-simulated at the
+       fresh t0 (same event id; folder replaced).
     2. Episodes whose gauge receded below the tier (flow back to normal) or
        older than EVENT_MAX_EPISODE_H are marked ended — precipitation going
        to zero does NOT end an episode while the hydrograph is still high.
-    3. Newly flagged tier-3 gauges start new episodes.
+    3. Newly flagged tier-3 gauges start new episodes — or reopen their
+       gauge's episode that ended within EVENT_REOPEN_H (same id + anchor).
     Runs at most EVENT_MAX_PER_TICK simulations, sequentially.
     """
     from . import eventstore, nowcaststore
@@ -928,6 +987,18 @@ def hourly_tick() -> dict:
     idx = eventstore.load_index()
     now = datetime.datetime.utcnow()
 
+    # detection runs BEFORE the end check: a gauge flagged again this hour is
+    # still flooding, so its episode is not ended in this tick (ending it and
+    # opening a new id for the same detection is what fragmented floods).
+    # The budget covers every active gauge plus EVENT_MAX_PER_TICK new ones.
+    try:
+        picks = detect(MAX_PER_TICK + sum(
+            1 for s in idx.values() if s.get("status", "active") == "active"))
+    except Exception as e:
+        print(f"event tick: detection failed ({type(e).__name__}: {e})")
+        picks = []
+    detected = {p["gauge"] for p in picks}
+
     jobs, ended = [], []
     for eid, s in idx.items():
         if s.get("status", "active") != "active":
@@ -942,8 +1013,9 @@ def hourly_tick() -> dict:
         tier = int(tiers.get(gid, 0))
         # observed flow decides the end: episode continues while the gauge's
         # recent USGS max is >= CONT_OBS_MULT x baseflow. AI tier only backs
-        # up a gauge that went silent (obs None).
-        obs = _recent_obs_max(gid) if gid else None
+        # up a gauge that went silent (obs None). A re-detected gauge goes on
+        # regardless (detect() just read its observations).
+        obs = _recent_obs_max(gid) if gid and gid not in detected else None
         qbase = None
         try:
             qbase = float((nowcaststore._thresholds().get(gid) or {}
@@ -954,15 +1026,20 @@ def hourly_tick() -> dict:
             still_high = obs >= max(CONT_OBS_MULT * qbase, 1.0)
         else:
             still_high = tier >= CONT_TIER
-        if gid and still_high and age_h <= MAX_EPISODE_H:
+        if gid and (still_high or gid in detected) and age_h <= MAX_EPISODE_H:
             # publish progress stale + nobody claiming -> this re-sim runs
-            # on the CPU rung (V30 demotion: last resort, not default)
-            try:
-                pub_age_h = (now - datetime.datetime.strptime(
-                    s.get("generated") or "", "%Y-%m-%dT%H:%M:%SZ")
-                ).total_seconds() / 3600.0
-            except ValueError:
-                pub_age_h = float("inf")
+            # on the CPU rung (V30 demotion: last resort, not default). A
+            # reopened episode's clock starts at the reopen: its last publish
+            # predates the end, and the CPU rung must not engage an hour later
+            pub = []
+            for k in ("generated", "reopened"):
+                try:
+                    pub.append(datetime.datetime.strptime(
+                        s.get(k) or "", "%Y-%m-%dT%H:%M:%SZ"))
+                except ValueError:
+                    pass
+            pub_age_h = ((now - max(pub)).total_seconds() / 3600.0
+                         if pub else float("inf"))
             jobs.append({"gauge": gid, "episode": eid,
                          "force_cpu": pub_age_h > CPU_FALLBACK_H,
                          "trigger": {**(s.get("trigger") or {}), "tier": tier}})
@@ -970,29 +1047,62 @@ def hourly_tick() -> dict:
             ended.append(eid)
     if ended:
         eventstore.mark_ended(ended)     # fast: stops re-sims immediately
-    # V30 episode final products: consolidate ended episodes (stats + the
-    # episode-scoped nowcast verification) in a background thread — scoring
-    # downloads ~1 archived nowcast per episode-hour and must not delay the
-    # tick. Also self-heals: recently-ended episodes still missing "final"
-    # (e.g. a worker publish raced the index commit) get another pass.
-    heal = [e for e, s in idx.items()
-            if s.get("status") == "ended" and not s.get("final")
-            and (_age_days_started(s) or 99.0) < 3.0]
-    to_final = ended + [e for e in heal if e not in ended]
-    if to_final:
-        threading.Thread(target=eventstore.finalize_episodes,
-                         args=(to_final, print), daemon=True).start()
 
     from . import eventqueue as _eq
     active_gauges = {j["gauge"] for j in jobs}
-    new_picks = []
-    for pick in detect(MAX_PER_TICK):
+    new_picks, fresh = [], []
+    for pick in picks:
+        if len(fresh) >= MAX_PER_TICK:
+            break
         if pick["gauge"] in active_gauges:
             continue
         if _eq.mode() == "on" and _eq.gauge_pending(pick["gauge"]):
             continue           # already in the worker queue (index lags it)
-        new_picks.append({"gauge": pick["gauge"], "episode": None,
-                          "trigger": pick})
+        # never an id ended in this tick: its finalize thread starts below
+        prev = _reopen_candidate(idx, pick["gauge"], now, skip=ended)
+        # a worker is mid-solve on it, or its spec waits in the queue
+        # unclaimed (a cold re-run: gauge_pending ignores those) — run_one
+        # would replace that spec; the queued job's publish reactivates it
+        if prev and _eq.mode() == "on" and (_eq.claim_fresh_for(prev)
+                                            or _eq._spec(prev)):
+            continue
+        fresh.append((pick, prev))
+    reopened, superseded = set(), set()
+    if any(prev for _, prev in fresh):
+        reopened = set(eventstore.reopen_episodes([p for _, p in fresh if p],
+                                                  superseded=superseded))
+    for pick, prev in fresh:
+        if prev in reopened:
+            print(f"event tick: {pick['gauge']} flagged again — episode {prev} "
+                  f"reopened (ended < {REOPEN_H:g} h ago)")
+            # "reopened" spares the finalized record from the CREST-miss purge
+            new_picks.append({"gauge": pick["gauge"], "episode": prev,
+                              "trigger": {**(idx[prev].get("trigger") or {}),
+                                          "tier": int(tiers.get(pick["gauge"], 0)),
+                                          "reopened": True}})
+        elif prev in superseded:
+            # the fresh index has a newer or active episode at this gauge (or
+            # merged prev into one) since this tick read it: that episode is
+            # the flood now. A new id would fragment it again, so nothing
+            # starts for the gauge this tick; the next tick's index decides.
+            print(f"event tick: {pick['gauge']} flagged again — episode {prev} "
+                  f"superseded in the index; nothing started this tick")
+        else:
+            new_picks.append({"gauge": pick["gauge"], "episode": None,
+                              "trigger": pick})
+    # V30 episode final products: consolidate ended episodes (stats + the
+    # episode-scoped nowcast verification) in a background thread — scoring
+    # downloads ~1 archived nowcast per episode-hour and must not delay the
+    # tick. Also self-heals: recently-ended episodes still missing "final"
+    # (e.g. a worker publish raced the index commit) get another pass —
+    # except the ones just reopened (dispatched after the reopen for that).
+    heal = [e for e, s in idx.items()
+            if s.get("status") == "ended" and not s.get("final")
+            and (_age_days_started(s) or 99.0) < 3.0 and e not in reopened]
+    to_final = ended + [e for e in heal if e not in ended]
+    if to_final:
+        threading.Thread(target=eventstore.finalize_episodes,
+                         args=(to_final, print), daemon=True).start()
     # V30 CPU-rung last resort: queued bundles that were never published
     # (not in the index) and sat unclaimed past CPU_FALLBACK_H get a local
     # solve — enqueue-only detections and deferred refills must not strand

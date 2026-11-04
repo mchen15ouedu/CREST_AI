@@ -2794,6 +2794,7 @@ let evtGroup = null;                 // L.layerGroup for the depth overlay
 let evtOverlay = null;               // current L.imageOverlay
 let evtManifest = null;              // selected event's manifest
 let evtBase = "";                    // HF resolve base URL
+let evtOverlayUrl = "";              // src the overlay was last pointed at
 let evtFrameIdx = -1;                // -1 => maxdepth
 let evtTimer = null;
 let evtPanel = null;
@@ -2972,6 +2973,14 @@ async function loadEvents() {
     "max-width:300px;max-height:60vh;overflow:auto;font-size:12.5px;line-height:1.45";
   const r = d.runner || {};
   let html = "<b>Inundation events</b><br>";
+  // the list is a rolling window: older results stay in the store, just
+  // unlisted (server list_info) — say so, so the list never looks lossy
+  const li = d.list_info || {};
+  if (li.hidden_old > 0) {
+    html += `<div style="color:#8fa3b8;font-size:11px">${li.hidden_old} result` +
+      `${li.hidden_old > 1 ? "s" : ""} older than ${li.max_age_d || 30} days ` +
+      `archived (not listed)</div>`;
+  }
   if (r.running) {
     html += `<div style="color:#ffd479">simulating <b>${r.running}</b> (${r.status})</div>`;
   } else if (r.last && r.last.ok === false) {
@@ -3030,6 +3039,16 @@ async function loadEvents() {
       "padding:6px 8px;cursor:pointer;font-size:12px";
     const gid = (s.trigger && s.trigger.gauge) || s.gauge || id;
     const f = s.final;
+    // hourly re-triggers of the same flood the server folded into this one
+    // card (summary.merged, hf_data/eventlist.py: n = episodes in the group,
+    // this one included); the tooltip gives the span and the merged ids
+    const mg = s.merged;
+    const mergedHtml = mg && mg.n > 1
+      ? `<span title="${escapeHtml(`${mg.n} episodes of one flood: ` +
+          `${mg.first_start || "?"} → ${mg.last_end || "?"}` +
+          (Array.isArray(mg.ids) && mg.ids.length ? ` (${mg.ids.join(", ")})` : ""))
+          .replace(/"/g, "&quot;")}">${mg.n} episodes merged</span>`
+      : "";
     if (s.status !== "active" && f) {
       // V30: a finished episode is shown as its FINAL PRODUCT — the hourly
       // events were fragments; this consolidated card replaces them
@@ -3040,6 +3059,7 @@ async function loadEvents() {
       if (f.peak_obs_m3s != null) parts.push(`peak ${num(f.peak_obs_m3s)} m³/s`);
       if (f.peak_depth_m != null) parts.push(`max depth ${num(f.peak_depth_m)} m`);
       if (f.inundated_km2 != null) parts.push(`${num(f.inundated_km2)} km² wet`);
+      if (mergedHtml) parts.push(mergedHtml);
       // skill numbers are EVENT scores — computed over this episode's
       // window only, never diluted by flat days (say so on the card)
       let skill = "";
@@ -3055,7 +3075,8 @@ async function loadEvents() {
         `${s.status === "active" ? ' · <span style="color:#7fd47f">active</span>' : ""}` +
         `<br><span style="opacity:.75">${s.n_frames || 0} frames` +
         `${s.archive_frames ? ` · ${s.archive_frames} archived` : ""}` +
-        `${s.demoted ? " (archived: max-depth only)" : ""}</span>`;
+        `${s.demoted ? " (archived: max-depth only)" : ""}` +
+        `${mergedHtml ? ` · ${mergedHtml}` : ""}</span>`;
     }
     b.onclick = () => selectEvent(id, s);
     evtPanel.appendChild(b);
@@ -3166,17 +3187,23 @@ async function selectEvent(id, summary) {
   try { man = await (await fetch(`${evtBase}/${id}/manifest.json`)).json(); }
   catch (_) { addMsg("⚠️ Couldn't load that event's manifest.", "status"); return; }
   evtManifest = { ...man, _id: id, _demoted: !!(summary && summary.demoted) };
+  evtFrameIdx = -1;
+  // fit FIRST: the overlay's pooling factor follows the zoom (evtFrameSrc),
+  // so one picked at the old zoom was a dashboard render thrown away a
+  // moment later. The fit's zoomend (evtRescale) already points a previous
+  // event's overlay at THIS event's max depth, so showEvtFrame(-1) below
+  // asks for nothing new. animate:false — the animated zoom can silently
+  // never complete (seen live), leaving the map at CONUS zoom where the
+  // overlay is a dot
+  try {
+    map.fitBounds(man.bounds, { padding: [40, 40], maxZoom: 13, animate: false });
+  } catch (_) {}
   const nF = (man.frames || []).length;
   const canAnim = nF > 0 && !evtManifest._demoted;
   renderEvtCtl();
   evtBindAnimBar(canAnim ? nF : 0);
   showEvtFrame(-1);
   drawEventSite(evtManifest);
-  // animate:false — the animated zoom can silently never complete (seen
-  // live), leaving the map at CONUS zoom where the overlay is a dot
-  try {
-    map.fitBounds(man.bounds, { padding: [40, 40], maxZoom: 13, animate: false });
-  } catch (_) {}
 
   // right panel: the trigger gauge's 1-D hydrograph — EF5 simulated flow
   // (split solid/dashed at t0) vs USGS observations, straight from the
@@ -3236,25 +3263,124 @@ function evtReleaseAnimBar() {
   } else bar.classList.add("hidden");
 }
 
+// Basin zoom fits the whole domain on screen, so a ~3,600-px depth grid is
+// drawn a few hundred px wide: nearest-neighbour sampling keeps ~1% of its
+// pixels and 1-3-cell channels vanish (2026102122_09401260 read as an empty
+// basin). Below native resolution the overlay is a MAX-pooled overview from
+// the dashboard (hf_data/evtpng.py: every wet cell survives, coloured like
+// the CDN png); at native zoom and past it, the CDN png itself.
+const EVT_POOL_MAX = 16;
+function evtPoolFactor(man) {
+  const nx = (man.grid && man.grid.nx) || man._natW;
+  if (!nx || !man.bounds) return 1;
+  const b = L.latLngBounds(man.bounds);
+  const w = Math.abs(map.latLngToLayerPoint(b.getNorthEast()).x -
+                     map.latLngToLayerPoint(b.getSouthWest()).x) *
+            (window.devicePixelRatio || 1);          // device px actually drawn
+  if (!(w > 0)) return 1;
+  let f = 1;
+  while (f < EVT_POOL_MAX && f * w < nx) f *= 2;   // smallest 2^k >= native/shown
+  return f;
+}
+
+// {url, bounds} of overlay png `file` at the current zoom. A pooled png is
+// ceil(n/f) px, padded dry past the grid's east/south edge, so its bounds
+// widen by the same padding (the grid is regular in lat/lon).
+function evtFrameSrc(man, file) {
+  const f = evtPoolFactor(man);
+  const nx = (man.grid && man.grid.nx) || man._natW;
+  const ny = (man.grid && man.grid.ny) || man._natH;
+  const cdn = { url: `${evtBase}/${man._id}/${file}`, bounds: man.bounds };
+  if (f <= 1 || !ny || !/\.png$/.test(file || "")) return cdn;
+  const url = `/api/evt_png/${man._id}/${file.slice(0, -4)}.png?f=${f}` +
+    (man.generated ? `&g=${encodeURIComponent(man.generated)}` : "");
+  if (!evtPoolUsable(url)) return cdn;
+  const b = L.latLngBounds(man.bounds);
+  const n = b.getNorth(), w = b.getWest();
+  const kx = Math.ceil(nx / f) * f / nx, ky = Math.ceil(ny / f) * f / ny;
+  return {
+    url,
+    bounds: [[n - (n - b.getSouth()) * ky, w], [n, w + (b.getEast() - w) * kx]],
+  };
+}
+
+// pooled URLs that failed. An <img> error doesn't say why, and a busy
+// dashboard answers 503 + Retry-After 2 s (hf_data/evtpng.py), so a failed
+// URL gets one more try after EVT_POOL_RETRY_MS; failing twice keeps it on
+// the CDN png. Per URL, never per event: other frames and factors pool on.
+const EVT_POOL_RETRY_MS = 3000;
+const evtPoolFailed = new Map();     // pooled url -> {n: failures, at: ms}
+function evtPoolUsable(url) {
+  const e = evtPoolFailed.get(url);
+  return !e || (e.n < 2 && Date.now() - e.at >= EVT_POOL_RETRY_MS);
+}
+
+// re-pick the overlay resolution for the current zoom; zoomend fires on
+// every wheel step, so setUrl only when the choice actually changes
+function evtRescale() {
+  const man = evtManifest;
+  if (!eventsMode || !man || !evtOverlay) return;
+  const fr = evtFrameIdx < 0 ? null : (man.frames || [])[evtFrameIdx];
+  const file = fr ? fr.png : man.maxdepth_png;
+  if (!file) return;
+  const src = evtFrameSrc(man, file);
+  if (src.url === evtOverlayUrl) return;
+  evtOverlayUrl = src.url;
+  evtOverlay.setUrl(src.url);
+  evtOverlay.setBounds(L.latLngBounds(src.bounds));
+}
+map.on("zoomend", evtRescale);
+
+// manifest without a grid: learn the native width from the CDN png itself
+function evtOverlayLoaded() {
+  const man = evtManifest, el = evtOverlay && evtOverlay.getElement();
+  if (!man || !el) return;
+  if (evtOverlayUrl.startsWith("/api/evt_png/")) {
+    evtPoolFailed.delete(el.getAttribute("src"));   // its retry came through
+    return;
+  }
+  if ((man.grid && man.grid.nx) || man._natW) return;
+  man._natW = el.naturalWidth;
+  man._natH = el.naturalHeight;
+  evtRescale();
+}
+
+// the pooled overview comes from the dashboard, not the CDN: if THIS url
+// fails, show the native png for it rather than nothing, and try the url
+// once more a little later (evtPoolFailed)
+function evtOverlayFailed() {
+  const el = evtOverlay && evtOverlay.getElement();
+  const url = (el && el.getAttribute("src")) || evtOverlayUrl;
+  if (!evtManifest || !url.startsWith("/api/evt_png/")) return;
+  const e = evtPoolFailed.get(url);
+  if (evtPoolFailed.size > 500) evtPoolFailed.clear();
+  evtPoolFailed.set(url, { n: e ? e.n + 1 : 1, at: Date.now() });
+  evtRescale();                                    // this frame: the CDN png
+  if (!e) setTimeout(evtRescale, EVT_POOL_RETRY_MS + 50);  // pooled again if still on it
+}
+
 function showEvtFrame(i) {
   if (!evtManifest) return;
   evtFrameIdx = i;
   const man = evtManifest;
   const file = i < 0 ? man.maxdepth_png : man.frames[i].png;
-  const url = `${evtBase}/${man._id}/${file}`;
+  const src = evtFrameSrc(man, file);
   if (evtOverlay) {
-    evtOverlay.setUrl(url);
+    if (src.url !== evtOverlayUrl) evtOverlay.setUrl(src.url);
     // bounds belong to the EVENT, not the overlay object — without this,
     // switching events kept drawing at the previous event's location
-    evtOverlay.setBounds(L.latLngBounds(man.bounds));
+    evtOverlay.setBounds(L.latLngBounds(src.bounds));
   } else {
-    evtOverlay = L.imageOverlay(url, man.bounds,
+    evtOverlay = L.imageOverlay(src.url, src.bounds,
       { opacity: 0.85, interactive: false }).addTo(evtGroup);
     // crisp model cells instead of a smeared blur when zoomed past the
     // simulation resolution — the blockiness is honest (it IS the grid)
     const el = evtOverlay.getElement();
     if (el) el.style.imageRendering = "pixelated";
+    evtOverlay.on("load", evtOverlayLoaded);
+    evtOverlay.on("error", evtOverlayFailed);
   }
+  evtOverlayUrl = src.url;
   const lab = document.getElementById("anim-time");
   if (lab && eventsMode) {
     lab.textContent = i < 0 ? "max depth" : man.frames[i].t.slice(5, 16).replace("T", " ");
@@ -3269,7 +3395,7 @@ function showEvtFrame(i) {
   if (i >= 0) {
     for (let k = 1; k <= 4; k++) {
       const nx = man.frames[i + k];
-      if (nx) new Image().src = `${evtBase}/${man._id}/${nx.png}`;
+      if (nx) new Image().src = evtFrameSrc(man, nx.png).url;
     }
   }
   // keep the hydrograph's time marker in step with the slider/play scrub

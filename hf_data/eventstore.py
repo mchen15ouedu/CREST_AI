@@ -581,6 +581,67 @@ def mark_ended(event_ids) -> bool:
             return False
 
 
+def reopen_episodes(event_ids, superseded: set | None = None) -> list:
+    """Flip ended episodes back to 'active' in the index (single small
+    commit): their gauge was flagged again soon after they ended, so the
+    flood continues under the original id and episode_started anchor instead
+    of a new event. The stale "final" product is dropped from the entry — the
+    tick's finalize/heal pass recomputes it when the episode ends again — and
+    the entry is stamped "reopened" (UTC), which restarts the tick's CPU
+    fallback clock and keeps the CREST-miss guard from purging the episode.
+    Pinned demo events are never reopened. Neither is an episode the FRESH
+    index shows superseded since the caller read it: absorbed into another
+    (merged_into), or its gauge now has a newer episode or an active one —
+    that one carries the flood. Those ids are added to `superseded` (when
+    given). Returns the ids that are active afterwards (reopened now or
+    already active); [] when nothing was done."""
+    from huggingface_hub import CommitOperationAdd
+    api = _api()
+    if api is None:
+        return []
+    pins = pinned_ids(force=True)
+    if pins is None:
+        return []                       # can't tell demo events apart
+    with _lock:
+        idx = load_index()
+
+        def gauge(s):
+            return str(((s.get("trigger") or {}).get("gauge")) or s.get("gauge") or "")
+
+        ids = []
+        for e in event_ids:
+            s = idx.get(e)
+            if s is None or e in pins:
+                continue
+            g = gauge(s)
+            if s.get("merged_into") or (g and any(
+                    o != e and not t.get("merged_into") and gauge(t) == g
+                    and (o > e or t.get("status", "active") == "active")
+                    for o, t in idx.items())):
+                if superseded is not None:
+                    superseded.add(e)
+                continue
+            ids.append(e)
+        changed = [e for e in ids if idx[e].get("status") != "active"]
+        if not changed:
+            return ids
+        stamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        for e in changed:
+            idx[e]["status"] = "active"
+            idx[e]["reopened"] = stamp
+            idx[e].pop("final", None)
+        try:
+            api.create_commit(
+                repo_id=REPO, repo_type="dataset",
+                operations=[CommitOperationAdd(
+                    f"{PREFIX}/index.json",
+                    io.BytesIO(json.dumps(idx).encode()))],
+                commit_message=f"episodes reopened: {', '.join(changed)}")
+            return ids
+        except Exception:
+            return []
+
+
 def _parse_hydro_t(t):
     """Hydro row time ("2026-09-29 13:00" or "2026-09-29T13:00Z") -> naive
     UTC datetime, or None if unparseable (row is then kept)."""
