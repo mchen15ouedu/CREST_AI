@@ -6,7 +6,8 @@ case list, remove from the list, but keep the data in the backend", and the
 list "has many duplications". Both fixes are view-only: nothing in the store
 is deleted or rewritten (eventstore's age retention, EVENT_MAX_AGE_D, stays
 OFF: it clears animation files). /api/admin/archive and every other reader
-keep using the full index.
+keep using the full index (the archive takes only its `listed` flag from
+this view: mark_listed).
   * absorbed: an entry carrying merged_into (folded into another episode by
     the store-side merge script) is never listed on its own, even when its
     target is gone; it counts toward the entry its merged_into chain ends at
@@ -290,3 +291,18 @@ def list_view(index: dict, now=None, pinned=frozenset(),
             "total": len(idx), "absorbed": sum(1 for s in idx.values() if _into(s)),
             "hidden_old": hidden, "merged_fragments": folded}
     return events, info
+
+
+def mark_listed(archive: dict, index: dict, now=None, pinned=frozenset()) -> dict:
+    """The admin archive (eventstore.archive_index) with each row's `listed`
+    = shown on the public list, a key of list_view(index, now, pinned): a
+    rolled-off or folded episode is off it although the index still holds
+    it (the snapshot's own flag only says "in the index"), and n_listed is
+    recounted. A new dict with new rows; `archive` is never modified. An
+    empty index (eventstore.load_index answers {} to any failure) leaves the
+    archive as it is: it can't tell what is shown."""
+    if not isinstance(index, dict) or not index:
+        return archive
+    shown = set(list_view(index, now, pinned)[0])
+    rows = [{**r, "listed": r.get("id") in shown} for r in archive.get("events") or []]
+    return {**archive, "events": rows, "n_listed": sum(1 for r in rows if r["listed"])}

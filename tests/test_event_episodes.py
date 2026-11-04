@@ -5,7 +5,9 @@ instead of opening a new event id. No network: detect, the observations,
 the nowcast store, the store's hub I/O, the queue and run_one are faked;
 mark_ended / reopen_episodes / publish_event run for real against an
 in-memory index. run_one's CREST-miss guard runs for real behind a faked
-EF5 (a reopened episode's miss is noted, never purged)."""
+EF5 (a reopened episode's miss is noted, never purged). finalize_episodes
+runs for real behind a faked scorer: a reopen or merge landing while it
+scores is never overwritten with its stale final."""
 from __future__ import annotations
 
 import datetime
@@ -14,12 +16,14 @@ import sys
 import tempfile
 import types
 
+import huggingface_hub
 import pytest
 
 import hf_data
-from hf_data import eventqueue, eventsim, eventstore, nowcaststore
+from hf_data import eventqueue, eventscore, eventsim, eventstore, nowcaststore
 
 G1, G2 = "09353800", "08353000"
+_FINALIZE = eventstore.finalize_episodes      # the tick fixture fakes it
 
 
 def _now():
@@ -61,7 +65,8 @@ def tick(monkeypatch):
     """A faked world around hourly_tick; returns its mutable state."""
     st = types.SimpleNamespace(idx={}, picks=[], obs={}, pins=frozenset(),
                                pending={}, claims={}, specs={}, runs=[],
-                               finalized=[], commits=[], detect_budget=[])
+                               finalized=[], commits=[], written=[], fail=False,
+                               detect_budget=[], stored={}, conflicts=0)
 
     def detect(max_events=1):
         st.detect_budget.append(max_events)
@@ -69,10 +74,21 @@ def tick(monkeypatch):
                  "obs_m3s": 60.0, "hotspot_score": 1.0} for g in st.picks][:max_events]
 
     class FakeApi:
+        def repo_info(self, *a, **k):
+            return types.SimpleNamespace(sha=f"rev{len(st.commits)}")
+
         def create_commit(self, repo_id=None, repo_type=None, operations=(),
-                          commit_message=""):
+                          commit_message="", parent_commit=None):
+            if st.fail:
+                raise OSError("hub unavailable")
+            if st.conflicts:                       # another writer committed first
+                st.conflicts -= 1
+                raise _hub_http(412)
             st.commits.append(commit_message)
+            st.written.append(sorted(op.path_in_repo for op in operations))
             for op in operations:
+                if hasattr(getattr(op, "path_or_fileobj", None), "getvalue"):
+                    st.stored[op.path_in_repo] = op.path_or_fileobj.getvalue()
                 if getattr(op, "path_in_repo", "") == f"{eventstore.PREFIX}/index.json":
                     st.idx = json.loads(op.path_or_fileobj.getvalue())
 
@@ -96,7 +112,7 @@ def tick(monkeypatch):
     # baseflow 10 m3/s: observed flow keeps an episode alive at >= 50 m3/s
     monkeypatch.setattr(nowcaststore, "_thresholds", lambda: {g: {"qbase": 10.0} for g in (G1, G2)})
     monkeypatch.setattr(eventstore, "_api", lambda: FakeApi())
-    monkeypatch.setattr(eventstore, "load_index", lambda: json.loads(json.dumps(st.idx)))
+    monkeypatch.setattr(eventstore, "load_index", lambda revision=None: json.loads(json.dumps(st.idx)))
     monkeypatch.setattr(eventstore, "pinned_ids", lambda force=False: st.pins)
     monkeypatch.setattr(eventstore, "finalize_episodes",
                         lambda ids, log=print: st.finalized.extend(ids))
@@ -313,6 +329,97 @@ def test_superseded_reopen_starts_nothing(tick, monkeypatch):
     assert [r["episode"] for r in tick.runs] == [c]
 
 
+def test_reopen_failure_is_told_apart_from_refusal(tick):
+    b, sb = _ev(G1, 10, status="ended", ended_h_ago=3)
+    o, so = _ev(G2, 1)
+    # FAILED -> None: the fresh index read came back empty (load_index gives
+    # {} on any error) or the commit raised; nothing changed on the store
+    tick.idx = {}
+    assert eventstore.reopen_episodes([b]) is None
+    tick.idx, tick.fail = {b: sb}, True
+    assert eventstore.reopen_episodes([b]) is None
+    assert tick.idx[b]["status"] == "ended" and tick.commits == []
+    # REFUSED -> []: pinned, pins unreadable, or gone from the index since
+    tick.fail = False
+    for pins, idx in ((frozenset({b}), {b: sb}), (None, {b: sb}),
+                      (frozenset(), {o: so})):
+        tick.pins, tick.idx = pins, idx
+        assert eventstore.reopen_episodes([b]) == []
+    assert tick.commits == []
+
+
+def test_failed_reopen_still_tells_refused_ids_apart(tick):
+    # the ids a reopen refuses (pinned, gone from the fresh index) land in
+    # `refused` even when it fails, so the caller never holds them back
+    b, sb = _ev(G1, 10, status="ended", ended_h_ago=3)
+    c, sc = _ev(G2, 10, status="ended", ended_h_ago=3)
+    tick.pins = frozenset({b})
+    # only pinned ids: refused before the index is read, never a failure
+    tick.idx, ref = {}, set()
+    assert eventstore.reopen_episodes([b], refused=ref) == [] and ref == {b}
+    # the index read fails: the pinned one is refused, the other failed
+    ref, sup = set(), set()
+    assert eventstore.reopen_episodes([b, c], superseded=sup, refused=ref) is None
+    assert ref == {b} and sup == set()
+    # the commit raises: an id gone from the fresh index is refused, as is a
+    # pinned one; the rest failed
+    tick.pins, tick.idx, tick.fail, ref = frozenset(), {c: sc}, True, set()
+    assert eventstore.reopen_episodes([b, c], refused=ref) is None and ref == {b}
+    tick.pins, tick.idx, ref = frozenset({b}), {b: sb, c: sc}, set()
+    assert eventstore.reopen_episodes([b, c], refused=ref) is None and ref == {b}
+    assert tick.idx[c]["status"] == "ended" and tick.commits == []
+
+
+def test_failed_reopen_starts_nothing_and_retries(tick, monkeypatch):
+    # a failed reopen is not a refusal: a new id would fragment the flood
+    # just like a superseded one, so nothing starts and the next tick retries
+    b, sb = _ev(G1, 10, status="ended", ended_h_ago=3)
+    tick.idx = {b: sb}
+    tick.picks = [G1]
+    detect = eventsim.detect
+
+    def detect_then_the_index_read_fails(max_events=1):
+        tick.idx = {}
+        return detect(max_events)
+
+    monkeypatch.setattr(eventsim, "detect", detect_then_the_index_read_fails)
+    eventsim.hourly_tick()
+    assert tick.runs == [] and tick.commits == []
+    monkeypatch.setattr(eventsim, "detect", detect)
+    tick.idx, tick.fail = {b: sb}, True                 # the commit raises
+    eventsim.hourly_tick()
+    assert tick.runs == [] and tick.idx[b]["status"] == "ended"
+    tick.fail = False                                   # next tick: it goes through
+    eventsim.hourly_tick()
+    assert [r["episode"] for r in tick.runs] == [b]
+    assert tick.idx[b]["status"] == "active" and "final" not in tick.idx[b]
+    assert tick.commits == [f"episodes reopened: {b}"]
+
+
+def test_failed_reopen_still_starts_a_new_id_where_it_refuses(tick, monkeypatch):
+    # a pinned episode starts a new id — so does one gone from the fresh
+    # index — also when the reopen fails for the episode beside it
+    b, sb = _ev(G1, 10, status="ended", ended_h_ago=3)
+    c, sc = _ev(G2, 10, status="ended", ended_h_ago=3)
+    tick.picks = [G1, G2]
+    detect = eventsim.detect
+    for pins, fresh, fail in (
+            (frozenset({b}), {}, False),               # the index read fails
+            (frozenset({b}), {b: sb, c: sc}, True),    # the commit raises
+            (frozenset(), {c: sc}, True)):             # ...b left the index
+        def detect_then_the_store_moves(max_events=1, fresh=fresh):
+            tick.idx = json.loads(json.dumps(fresh))
+            return detect(max_events)
+
+        monkeypatch.setattr(eventsim, "detect", detect_then_the_store_moves)
+        tick.pins, tick.fail, tick.runs = pins, fail, []
+        tick.idx = {b: dict(sb), c: dict(sc)}
+        eventsim.hourly_tick()
+        # b's gauge opens a new id; c's reopen failed: nothing, retried
+        assert [(r["gauge"], r["episode"]) for r in tick.runs] == [(G1, None)]
+        assert tick.commits == []
+
+
 def test_reopen_restarts_the_cpu_fallback_clock(tick):
     # last publish 9 h ago (before the end): measured from `generated` alone
     # the CPU rung would engage on the very next tick after the reopen
@@ -366,7 +473,7 @@ def missing_ef5(monkeypatch, tmp_path):
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     monkeypatch.setattr(eventqueue, "mode", lambda: "on")
     monkeypatch.setattr(eventqueue, "claim_fresh_for", lambda ev: None)
-    monkeypatch.setattr(eventstore, "load_index", lambda: json.loads(json.dumps(st.index)))
+    monkeypatch.setattr(eventstore, "load_index", lambda revision=None: json.loads(json.dumps(st.index)))
     monkeypatch.setattr(eventstore, "drop_events", lambda ids, purge=True, why="":
                         st.drops.append((list(ids), purge)) or True)
     monkeypatch.setattr(eventstore, "note_missed", lambda rec: st.notes.append(rec) or True)
@@ -397,3 +504,208 @@ def test_reopened_episode_miss_is_noted_never_purged(missing_ef5):
         assert missing_ef5.notes[-1]["reopened"] is True
         assert missing_ef5.notes[-1]["event"] == b
     assert len(eventsim._running["missed"]) == 3
+
+
+_STAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _hub_404(path):
+    """What hf_hub_download raises for a file not on the Hub (a real 404):
+    RemoteEntryNotFoundError on huggingface_hub 1.x, EntryNotFoundError
+    itself on 0.x (the Spaces pin) — an OSError on both."""
+    from huggingface_hub import errors
+    if not hasattr(errors, "RemoteEntryNotFoundError"):
+        return errors.EntryNotFoundError(f"404 {path}")
+    import httpx
+    return errors.RemoteEntryNotFoundError(f"404 {path}", response=httpx.Response(
+        404, request=httpx.Request("GET", f"https://huggingface.co/{path}")))
+
+
+def _hub_http(code):
+    """An HfHubHTTPError carrying status `code` (409/412: another writer
+    committed first), on huggingface_hub 0.x and 1.x."""
+    from huggingface_hub.utils import HfHubHTTPError
+    try:
+        import httpx
+        return HfHubHTTPError(f"{code}", response=httpx.Response(
+            code, request=httpx.Request("POST", "https://huggingface.co/api/commit")))
+    except Exception:
+        import requests
+        resp = requests.Response()
+        resp.status_code = code
+        return HfHubHTTPError(f"{code}", response=resp)
+
+
+@pytest.fixture
+def fin(tick, monkeypatch, tmp_path):
+    """finalize_episodes for real on the tick fixture's store: the manifest
+    is faked, hub downloads fail (no maxdepth stats) except scorecard.json,
+    served from `.card` (None: not on the Hub yet, a real 404 — the default;
+    an exception: raised; else the stored JSON), and the scorer calls
+    `.during(gauge)` — what lands while a finalize scores. `.stored` holds
+    what the commits wrote."""
+    tick.during, tick.scored, tick.logs, tick.card = None, [], [], None
+    t = _h(_now().replace(minute=0, second=0, microsecond=0)
+           - datetime.timedelta(hours=2))
+
+    def no_hub(repo_id, filename, *a, **k):
+        if filename != f"{eventstore.PREFIX}/scorecard.json":
+            raise OSError("offline")
+        if tick.card is None:
+            raise _hub_404(filename)
+        if isinstance(tick.card, BaseException):
+            raise tick.card
+        p = tmp_path / "scorecard.json"
+        p.write_text(json.dumps(tick.card), encoding="utf-8")
+        return str(p)
+
+    def score_episode(gid, start, end, log=print):
+        tick.scored.append(gid)
+        if tick.during:
+            tick.during(gid)
+        return {"n_issues": 6, "obs_peak_m3s": 61.0, "obs_peak_t": t,
+                "nse_h1": 0.8, "nse_h6": 0.5, "leads": {"6": {"peak_ratio": 0.9}}}
+
+    monkeypatch.setattr(eventstore, "finalize_episodes", _FINALIZE)
+    monkeypatch.setattr(eventstore, "_prior_manifest", lambda ev: {
+        "frames": [{"t": t, "file": "depth_x.tif"}], "hydro": []})
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", no_hub)
+    monkeypatch.setattr(eventscore, "score_episode", score_episode)
+    return tick
+
+
+def _finalize(fin, ids):
+    return eventstore.finalize_episodes(ids, log=fin.logs.append)
+
+
+def _files(*paths):
+    return sorted(f"{eventstore.PREFIX}/{p}" for p in paths)
+
+
+def test_finalize_writes_its_final_and_keeps_the_entry(fin):
+    # reopened long before this pass began, and merged by the script: the
+    # final lands; 'merged', the stamp and the rest of the entry stay
+    b, sb = _ev(G1, 30, status="ended", final=False)
+    sb["reopened"] = (_now() - datetime.timedelta(hours=20)).strftime(_STAMP)
+    sb["merged"] = {"n": 2, "ids": [b, f"2026110100_{G1}"],
+                    "first_start": sb["t0"], "last_end": sb["t_end"]}
+    fin.idx = {b: sb}
+    assert _finalize(fin, [b]) == 1
+    s = fin.idx[b]
+    assert s["status"] == "ended" and s["final"]["nse_h6"] == 0.5
+    assert {k: v for k, v in s.items() if k != "final"} == sb
+    assert fin.written == [_files(f"{b}/final.json", "index.json", "scorecard.json")]
+    assert _finalize(fin, [b]) == 0 and fin.scored == [G1]       # has a final now
+
+
+def test_finalize_starts_a_scorecard_only_where_there_is_none(fin):
+    # the running card gains this pass's scores beside every other gauge's;
+    # a fresh card only on a real 404 (nothing there yet)
+    card_key = f"{eventstore.PREFIX}/scorecard.json"
+    other = {G2: [{"event_id": f"2026103000_{G2}", "nse_h6": 0.7}]}
+    b, sb = _ev(G1, 10, status="ended", final=False)
+    for card in (None, other):
+        fin.idx, fin.card, fin.written, fin.stored = {b: dict(sb)}, card, [], {}
+        assert _finalize(fin, [b]) == 1
+        assert fin.written == [_files(f"{b}/final.json", "index.json", "scorecard.json")]
+        got = json.loads(fin.stored[card_key])
+        assert {g: r for g, r in got.items() if g != G1} == (card or {})
+        assert [r["event_id"] for r in got[G1]] == [b]
+    # any other read error — the Hub down (also an OSError on 1.x, like the
+    # 404), an offline cache miss (a subclass of EntryNotFoundError), a
+    # corrupt card — leaves scorecard.json out of the commit: a card of this
+    # pass's gauges alone would wipe every other gauge's track record. The
+    # episode's final.json and index entry are written all the same.
+    from huggingface_hub import errors
+    for card in (OSError("hub unavailable"),
+                 errors.LocalEntryNotFoundError("cannot reach the Hub"), ["corrupt"]):
+        fin.idx, fin.card, fin.written, fin.stored = {b: dict(sb)}, card, [], {}
+        fin.logs = []
+        assert _finalize(fin, [b]) == 1
+        assert fin.written == [_files(f"{b}/final.json", "index.json")]
+        assert card_key not in fin.stored
+        assert fin.idx[b]["status"] == "ended" and fin.idx[b]["final"]["nse_h6"] == 0.5
+        assert any("scorecard.json" in m for m in fin.logs)
+
+
+def test_finalize_never_re_ends_an_episode_reopened_meanwhile(fin):
+    b, sb = _ev(G1, 10, status="ended", final=False)
+
+    def republish():                    # a worker publish drops the stamp
+        fin.idx[b].pop("reopened")
+        fin.idx[b]["generated"] = _now().strftime(_STAMP)
+
+    landings = {
+        # a tick reopens the episode while this pass scores it
+        "active again": lambda g: eventstore.reopen_episodes([b]),
+        # ...and a later tick ends it again: that end's own finalize scores it
+        "reopened 20": lambda g: (eventstore.reopen_episodes([b]),
+                                  eventstore.mark_ended([b])),
+        # ...with a publish of the reopened episode in between
+        "re-published": lambda g: (eventstore.reopen_episodes([b]), republish(),
+                                   eventstore.mark_ended([b])),
+        # the fresh index unreadable at commit: never an emptied index.json
+        "left the index": lambda g: setattr(fin, "idx", {}),
+    }
+    for why, during in landings.items():
+        fin.idx, fin.commits, fin.during = {b: dict(sb)}, [], during
+        assert _finalize(fin, [b]) == 0
+        assert "final" not in fin.idx.get(b, {})
+        assert not [c for c in fin.commits if c.startswith("episode final")]
+        # an empty fresh index is an unreadable one: nothing is committed
+        want = ("finalize: index.json unreadable" if why == "left the index"
+                else f"finalize {b}: not written — {why}")
+        assert fin.logs[-1].startswith(want)
+    # one stale episode does not hold back another in the same pass
+    c, sc = _ev(G2, 8, status="ended", final=False)
+    fin.idx, fin.written = {c: sc, b: dict(sb)}, []
+    fin.during = lambda g: g == G1 and eventstore.reopen_episodes([b])
+    assert _finalize(fin, [b, c]) == 1
+    assert fin.idx[b]["status"] == "active" and "final" not in fin.idx[b]
+    assert fin.idx[c]["status"] == "ended" and fin.idx[c]["final"]
+    assert fin.written[-1] == _files(f"{c}/final.json", "index.json", "scorecard.json")
+
+
+def test_finalize_keeps_the_merge_scripts_contract(fin):
+    t, st = _ev(G1, 6, status="ended", final=False)      # the merge target
+    m, sm = _ev(G1, 30, status="ended", final=False)     # an older member
+    # an absorbed member (merged_into) is never scored nor written
+    fin.idx = {t: st, m: {**sm, "merged_into": t}}
+    assert _finalize(fin, [m]) == 0 and fin.scored == [] and fin.commits == []
+    # absorbed while this pass scored it: not written either
+    fin.idx = {t: dict(st), m: dict(sm)}
+    fin.during = lambda g: fin.idx[m].update(merged_into=t)
+    assert _finalize(fin, [m]) == 0
+    assert "final" not in fin.idx[m] and fin.commits == []
+    # the target merged while this pass scored its own window: the script's
+    # finalize scores the merged window, so this pre-merge final is dropped
+    merged = {"n": 2, "ids": [t, m], "first_start": sm["t0"], "last_end": st["t_end"]}
+    fin.idx = {t: dict(st), m: {**sm, "merged_into": t}}
+    fin.during = lambda g: fin.idx[t].update(merged=merged,
+                                             generated=_now().strftime(_STAMP))
+    assert _finalize(fin, [t]) == 0 and "final" not in fin.idx[t]
+    assert fin.logs[-1] == f"finalize {t}: not written — merged since this pass began"
+    # the script's own finalize after its merge commit: written, 'merged' kept
+    fin.during = None
+    assert _finalize(fin, [t]) == 1
+    s = fin.idx[t]
+    assert s["final"] and s["status"] == "ended" and s["merged"] == merged
+    assert "final" not in fin.idx[m]
+
+
+def test_finalize_rereads_and_retries_when_the_store_moved(fin, monkeypatch):
+    # another writer (the runner or the merger process) commits between the
+    # read and the commit: 412 -> re-read at the new head, write once
+    monkeypatch.setattr(eventstore.time, "sleep", lambda s: None)
+    b, sb = _ev(G1, 30, status="ended", final=False)
+    fin.idx = {b: sb}
+    fin.conflicts = 1
+    assert _finalize(fin, [b]) == 1
+    assert fin.conflicts == 0 and len(fin.commits) == 1
+    assert fin.idx[b]["final"]["nse_h6"] == 0.5
+    assert any("moved under us" in ln for ln in fin.logs)
+    # a store that keeps moving: nothing written, no exception
+    b2, sb2 = _ev(G2, 30, status="ended", final=False)
+    fin.idx = {b2: sb2}
+    fin.conflicts = 99
+    assert _finalize(fin, [b2]) == 0 and "final" not in fin.idx[b2]

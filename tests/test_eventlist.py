@@ -320,3 +320,37 @@ def _fold(idx):
                 if e != g["rep"]:
                     stored[e]["merged_into"] = g["rep"]
     return stored
+
+
+def test_admin_archive_listed_is_what_the_list_shows(monkeypatch):
+    """/api/admin/archive's `listed` = shown on the public list: a folded
+    fragment and a rolled-off flood are off it although the index holds
+    them, as is a stored folder the index never had."""
+    monkeypatch.setattr(eventlist, "MAX_AGE_D", 30.0)      # the server's defaults
+    monkeypatch.setattr(eventlist, "MERGE_GAP_H", 12.0)
+    t = datetime(2026, 10, 30, 18)
+    frags = [_ev(t + timedelta(hours=h), "09353800", depth=0.0, dur_h=2) for h in (0, 2, 4)]
+    old = _ev(NOW - timedelta(days=40), "06803513", depth=5.5)
+    recent = _ev(NOW - timedelta(days=5), "09337500", depth=20.8)
+    idx = _index(*frags, old, recent)
+    # eventstore.archive_index's shape: listed = "in the index"
+    rows = [{"id": e, "listed": True, "t0": s["t0"]} for e, s in idx.items()]
+    rows.append({"id": "2026090100_01000000", "listed": False, "t0": None})
+    snap = {"events": rows, "n": len(rows), "n_listed": len(idx), "building": False}
+    before = copy.deepcopy(snap)
+    out = eventlist.mark_listed(snap, idx, NOW)
+    assert [r["id"] for r in out["events"] if r["listed"]] == [frags[-1][0], recent[0]]
+    assert out["n_listed"] == 2 and out["n"] == len(rows) and out["building"] is False
+    assert [r["id"] for r in out["events"]] == [r["id"] for r in rows]   # order kept
+    assert [r["t0"] for r in out["events"]] == [r["t0"] for r in rows]
+    assert snap == before                                    # never modified
+    # the same pins as /api/events: a pinned old flood stays listed
+    out = eventlist.mark_listed(snap, idx, NOW, pinned=frozenset({old[0]}))
+    assert out["n_listed"] == 3 and next(
+        r["listed"] for r in out["events"] if r["id"] == old[0])
+    # pins unreadable (pinned_ids() -> None): nothing rolls off, folding stays
+    assert eventlist.mark_listed(snap, idx, NOW, pinned=None)["n_listed"] == 3
+    # an empty index (load_index's answer to any failure): the snapshot as is
+    assert eventlist.mark_listed(snap, {}, NOW) is snap
+    assert eventlist.mark_listed(snap, None, NOW) is snap
+    assert eventlist.mark_listed({"events": [], "n": 0}, idx, NOW)["n_listed"] == 0

@@ -209,7 +209,8 @@ def test_endpoint_serves_pooled_png_and_caches(tmp_path, monkeypatch):
     app = FastAPI()
     app.include_router(evtpng.router)
     c = TestClient(app)
-    r = c.get(f"/api/evt_png/{eid}/maxdepth.png?f=8&g=2026-10-22T19:16:27Z")
+    r = c.get(f"/api/evt_png/{eid}/maxdepth.png?f=8&s={evtpng.STYLE}"
+              "&g=2026-10-22T19:16:27Z")
     assert r.status_code == 200 and r.headers["content-type"] == "image/png"
     assert "immutable" in r.headers["cache-control"]
     im = np.asarray(Image.open(io.BytesIO(r.content)))
@@ -218,6 +219,12 @@ def test_endpoint_serves_pooled_png_and_caches(tmp_path, monkeypatch):
     r2 = c.get(f"/api/evt_png/{eid}/maxdepth.png?f=8")   # disk-cache hit
     assert r2.content == r.content and len(calls) == n_dl
     assert "immutable" not in r2.headers["cache-control"]   # no generation named
+    # an old app.js (another style, or none): today's colours, never pinned
+    for s in (f"&s={evtpng.STYLE - 1}", "&s=x", ""):
+        r3 = c.get(f"/api/evt_png/{eid}/maxdepth.png?f=8&g=2026-10-22T19:16:27Z{s}")
+        assert r3.status_code == 200 and r3.content == r.content, s
+        assert r3.headers["cache-control"] == evtpng.CC_SHORT, s
+    assert len(calls) == n_dl
     assert os.listdir(tmp_path / "cache")
     # strict validation before anything touches the store
     for bad in (f"/api/evt_png/{eid}/maxdepth.png?f=3",
@@ -229,6 +236,109 @@ def test_endpoint_serves_pooled_png_and_caches(tmp_path, monkeypatch):
     # a frame the manifest doesn't list, or an unknown event: 404
     assert c.get(f"/api/evt_png/{eid}/depth_202610211015.png?f=8").status_code == 404
     assert c.get("/api/evt_png/2026102122_00000000/maxdepth.png?f=8").status_code == 404
+
+
+def test_style_in_the_url_is_in_step_with_app_js():
+    """frontend/app.js puts evtpng.STYLE in every pooled URL (&s=), so a
+    colour change is a URL no browser has cached for good."""
+    import re
+
+    from conftest import ROOT
+    from hf_data import evtpng
+    with open(os.path.join(ROOT, "frontend", "app.js"), encoding="utf-8") as fp:
+        js = fp.read()
+    m = re.search(r"^const EVT_PNG_STYLE = (\d+);", js, re.M)
+    assert m and int(m.group(1)) == evtpng.STYLE
+    assert re.search(r"/api/evt_png/.*\?f=\$\{f\}&s=\$\{EVT_PNG_STYLE\}", js)
+
+
+def test_manifest_reread_only_for_a_newer_generation(tmp_path, monkeypatch):
+    """A client naming a NEWER generation than the memo forces a manifest
+    re-read (the event re-published); an older one (a page loaded before
+    that) is answered from the memo, under the short cache header."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from hf_data import evtpng
+    g0, g1, g2, g3 = (f"2026-10-22T{h}:16:27Z" for h in (18, 19, 20, 21))
+    eid, calls = _fake_store(tmp_path, monkeypatch, generated=g1)
+    monkeypatch.setattr(evtpng, "MAN_TTL_S", 60.0)
+    monkeypatch.setattr(evtpng, "_limiters", {})
+    app = FastAPI()
+    app.include_router(evtpng.router)
+    c = TestClient(app)
+    url = f"/api/evt_png/{eid}/maxdepth.png?f=8&s={evtpng.STYLE}&g="
+
+    def reads():
+        return calls.count(f"{eid}/manifest.json")
+
+    def age_memo():                     # past the 5 s re-read limit, inside the TTL
+        t, slim = evtpng._man_memo[eid]
+        evtpng._man_memo[eid] = (t - 10, slim)
+
+    assert "immutable" in c.get(url + g1).headers["cache-control"] and reads() == 1
+    age_memo()
+    r = c.get(url + g0)                                     # older: the memo
+    assert r.status_code == 200 and reads() == 1
+    assert r.headers["cache-control"] == evtpng.CC_SHORT
+    man = tmp_path / "store" / "events" / eid / "manifest.json"
+    man.write_text(json.dumps({**json.loads(man.read_text()), "generated": g2}))
+    r = c.get(url + g2)                                     # newer: re-read
+    assert reads() == 2 and evtpng._man_memo[eid][1]["generated"] == g2
+    assert "immutable" in r.headers["cache-control"]
+    age_memo()
+    r = c.get(url + g1)                                     # older than the memo now
+    assert reads() == 2 and r.headers["cache-control"] == evtpng.CC_SHORT
+    assert "immutable" in c.get(url + g2).headers["cache-control"] and reads() == 2
+    # a newer one right after a read waits out the 5 s limit on the memo
+    evtpng._man_memo.clear()
+    c.get(url + g2)
+    r = c.get(url + g3)
+    assert reads() == 3 and r.headers["cache-control"] == evtpng.CC_SHORT
+
+
+def test_unexpected_failures_reach_crashlog_once_per_type(tmp_path, monkeypatch):
+    """The generic 502 path records the exception (event, overlay, factor),
+    once per exception type per CRASH_EVERY_S; a missing overlay (404) or a
+    full queue (503) is an answer, not a crash, and is never recorded."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from hf_data import crashlog, evtpng
+    eid, _ = _fake_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(evtpng, "_limiters", {})
+    monkeypatch.setattr(evtpng, "_crashed", {})
+    got = []
+    monkeypatch.setattr(crashlog, "capture", lambda where, exc=None, message="", **ctx:
+                        got.append((where, type(exc).__name__, ctx)))
+    boom = [OSError("network down")]
+
+    def failing_compute(event_id, tif, f, cap):
+        raise boom[0]
+
+    monkeypatch.setattr(evtpng, "_compute", failing_compute)
+    app = FastAPI()
+    app.include_router(evtpng.router)
+    c = TestClient(app)
+    url = f"/api/evt_png/{eid}/maxdepth.png?f={{}}"
+    r = c.get(url.format(8))
+    assert r.status_code == 502 and "OSError" in r.text
+    assert got == [("evt_png", "OSError", {"event_id": eid, "name": "maxdepth", "f": 8})]
+    assert c.get(url.format(4)).status_code == 502 and len(got) == 1   # same type
+    boom[0] = ValueError("bad tif")
+    assert c.get(url.format(2)).status_code == 502
+    assert [k for _, k, _ in got] == ["OSError", "ValueError"]
+    monkeypatch.setattr(evtpng, "CRASH_EVERY_S", 0.0)      # the window passed
+    boom[0] = OSError("still down")
+    assert c.get(url.format(16)).status_code == 502 and len(got) == 3
+    # answers, not crashes
+    assert c.get(f"/api/evt_png/{eid}/depth_202610211015.png?f=8").status_code == 404
+    assert c.get("/api/evt_png/2026102122_00000000/maxdepth.png?f=8").status_code == 404
+    boom[0] = LookupError("the tif went away")
+    assert c.get(url.format(8)).status_code == 404
+    boom[0] = evtpng.Busy("queue full")
+    assert c.get(url.format(8)).status_code == 503
+    assert len(got) == 3
 
 
 def test_cold_render_burst_leaves_other_routes_responsive(tmp_path, monkeypatch):

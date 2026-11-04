@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-from hf_data import caljobs, crashlog, datamgr, gauges, persist, simjobs
+from hf_data import caljobs, crashlog, datamgr, eventmerger, gauges, persist, simjobs
 from hf_data.pipeline import parse_query
 from hf_data.statecache import CACHE_DIR
 
@@ -41,6 +41,8 @@ crashlog.install_thread_hook()     # record any thread that dies unwrapped
 datamgr.start_janitor()            # hourly cache cleanup + result compaction
 persist.start()                    # restore states/results/params/users from the
                                    # private dataset, then keep them synced
+eventmerger.start()                # EPISODE_MERGER=1 (runner Space only): the
+                                   # always-on episode merger, a supervised child
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(HERE, "frontend")
@@ -50,6 +52,14 @@ app = FastAPI(title="CREST_demo")
 app.add_middleware(SessionMiddleware,
                    secret_key=os.environ.get("SESSION_SECRET", secrets.token_hex(32)),
                    max_age=14 * 24 * 3600, same_site="lax", https_only=False)
+
+# basin-zoom inundation overlays: max-pooled PNGs (/api/evt_png); without it
+# the frontend falls back to the native overlay PNGs
+try:
+    from hf_data import evtpng
+    app.include_router(evtpng.router)
+except Exception as _e:
+    print(f"evt_png overlays disabled: {type(_e).__name__}: {_e}")
 
 # ---- HF OAuth (Space sets OAUTH_* env when README has hf_oauth: true) ------
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID")
@@ -774,7 +784,11 @@ def _remote_runner_status():
 @app.get("/api/events")
 def api_events(full: int = 0):
     """V25: published 2-D inundation events (CREST-iMAP v2) + runner state.
-    Frame/manifest files resolve at {base}/<event_id>/<file>."""
+    Frame/manifest files resolve at {base}/<event_id>/<file>. The list is a
+    VIEW (hf_data/eventlist.py): fragments of one flood folded into one entry
+    (merged_into ones never listed), floods ended (retrospectives: requested)
+    > EVENT_LIST_MAX_AGE_D (30) days ago left off; the store and
+    /api/admin/archive keep everything."""
     from hf_data import eventqueue, eventsim, eventstore
     try:
         q = eventqueue.queue_status()
@@ -789,20 +803,46 @@ def api_events(full: int = 0):
         autocal = eventstore.load_autocal()[-10:]
     except Exception:
         autocal = []
-    return {"events": eventstore.load_index(), "queue": q,
+    idx = eventstore.load_index()
+    try:                       # view only: on any error list the full index
+        from hf_data import eventlist
+        events, list_info = eventlist.list_view(
+            idx, pinned=eventstore.pinned_ids() if eventlist.KEEP_PINNED else frozenset())
+    except Exception as e:
+        crashlog.capture("eventlist", e)
+        events, list_info = idx, None
+    return {"events": events, "list_info": list_info, "queue": q,
             "runner": runner, "missed": missed, "autocal": autocal,
             "base": (f"https://huggingface.co/datasets/{eventstore.REPO}/"
                      f"resolve/main/{eventstore.PREFIX}")}
 
 
+@app.get("/api/merger_status")
+def api_merger_status():
+    """Always-on episode merger (hf_data/eventmerger.py; EPISODE_MERGER=1 on
+    the runner Space only): its status file (last pass, waiting groups,
+    recent merges, last error) + {enabled, alive, pid, restarts}."""
+    return eventmerger.status()
+
+
 @app.get("/api/admin/archive")
 def api_admin_archive(request: Request, refresh: int = 0):
     """Admin only: every stored 2-D inundation result — the listed events plus
-    those that rolled off the public list (results kept RESULTS_MAX_AGE_D)."""
+    those that rolled off the public list (results kept RESULTS_MAX_AGE_D).
+    `listed` = shown on the public list (eventlist view, same pins as
+    /api/events): rolled-off and folded episodes are off it."""
     if not _is_admin(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
     from hf_data import eventstore
-    return eventstore.archive_index(force=bool(refresh))
+    snap = eventstore.archive_index(force=bool(refresh))
+    try:                       # on any error: the snapshot's flag (in the index)
+        from hf_data import eventlist
+        return eventlist.mark_listed(
+            snap, eventstore.load_index() if snap.get("events") else {},
+            pinned=eventstore.pinned_ids() if eventlist.KEEP_PINNED else frozenset())
+    except Exception as e:
+        crashlog.capture("eventlist:archive", e)
+        return snap
 
 
 @app.get("/api/riskprobe/{event_id}")

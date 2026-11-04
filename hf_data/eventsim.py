@@ -1067,10 +1067,15 @@ def hourly_tick() -> dict:
                                             or _eq._spec(prev)):
             continue
         fresh.append((pick, prev))
-    reopened, superseded = set(), set()
+    reopened, superseded, refused, failed = set(), set(), set(), set()
     if any(prev for _, prev in fresh):
-        reopened = set(eventstore.reopen_episodes([p for _, p in fresh if p],
-                                                  superseded=superseded))
+        want = [p for _, p in fresh if p]
+        got = eventstore.reopen_episodes(want, superseded=superseded,
+                                         refused=refused)
+        if got is None:                  # failed: index unreadable / commit raised
+            # ids it refused (pinned, gone from the index) start a new id as ever
+            failed = set(want) - superseded - refused
+        reopened = set(got or ())
     for pick, prev in fresh:
         if prev in reopened:
             print(f"event tick: {pick['gauge']} flagged again — episode {prev} "
@@ -1087,6 +1092,12 @@ def hourly_tick() -> dict:
             # starts for the gauge this tick; the next tick's index decides.
             print(f"event tick: {pick['gauge']} flagged again — episode {prev} "
                   f"superseded in the index; nothing started this tick")
+        elif prev in failed:
+            # the reopen itself failed (not refused): a new id would fragment
+            # the flood just the same, so nothing starts for the gauge this
+            # tick; the next tick retries the reopen
+            print(f"event tick: {pick['gauge']} flagged again — reopening "
+                  f"episode {prev} failed; nothing started this tick")
         else:
             new_picks.append({"gauge": pick["gauge"], "episode": None,
                               "trigger": pick})

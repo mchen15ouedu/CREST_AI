@@ -82,12 +82,18 @@ RETRY_AFTER_S = 2
 # a cold manifest they park on the per-event lock while one download runs
 IO_WORKERS = 4
 # bump when the colouring changes: it keys the disk cache, which may live on
-# a persistent CREST_CACHE_DIR (2: shallow blocks fade by wet fraction)
+# a persistent CREST_CACHE_DIR (2: shallow blocks fade by wet fraction), and
+# rides in the URL (&s=): frontend/app.js EVT_PNG_STYLE — keep the two in step
 STYLE = 2
-# the frontend puts the manifest's `generated` in the URL (&g=): when it
-# matches what we rendered from, that URL's bytes never change
+# the frontend puts the manifest's `generated` (&g=) and STYLE (&s=) in the
+# URL: when both match what we rendered from, that URL's bytes never change.
+# Any other s (an old app.js, or none) gets today's colours, never immutable,
+# so a STYLE bump can't meet a tile a browser pinned in the old colours
 CC_IMMUTABLE = "public, max-age=31536000, immutable"
 CC_SHORT = "public, max-age=300"
+# unexpected failures (the 502 path) go to crashlog, one per exception type
+# per CRASH_EVERY_S: a scrub through an outage fails every frame at once
+CRASH_EVERY_S = 600.0
 # the native png's wet test (tif cm / 100.0 >= MIN_SHOW_M) in whole cm
 _WET_CM = next(c for c in range(65536) if c / 100.0 >= MIN_SHOW_M)
 
@@ -97,6 +103,7 @@ _prune_lock = threading.Lock()
 _man_memo: dict = {}                 # event_id -> (fetched_at, slim manifest)
 _limiters: dict = {}                 # "render"/"io" -> anyio.CapacityLimiter (made in the loop)
 _inflight: dict = {}                 # cache path -> _Job: one render per tile (event loop only)
+_crashed: dict = {}                  # exception type -> when last recorded (event loop only)
 
 router = APIRouter()
 
@@ -239,11 +246,14 @@ def _download(rel: str, dest: str) -> str:
 
 def _manifest(event_id: str, want_gen: str | None = None) -> dict:
     """Slim manifest (generated, cap, frame tifs), memoized MAN_TTL_S. A
-    client holding a different generation forces a re-read (rate-limited)."""
+    client holding a NEWER generation than the memo forces a re-read
+    (rate-limited); an older one is answered from the memo (not what that
+    URL named, so the caller sends the short cache header). `generated` is
+    '%Y-%m-%dT%H:%M:%SZ': as strings these compare chronologically."""
     now = time.time()
     hit = _man_memo.get(event_id)
     if hit and now - hit[0] < MAN_TTL_S and (
-            not want_gen or want_gen == hit[1]["generated"] or now - hit[0] < 5):
+            not want_gen or want_gen <= hit[1]["generated"] or now - hit[0] < 5):
         return hit[1]
     with _key_lock("man:" + event_id):
         hit = _man_memo.get(event_id)
@@ -403,10 +413,32 @@ async def render(event_id: str, name: str, f: int, want_gen: str | None = None):
     return job.data, current
 
 
+def _record(e: BaseException, **context) -> bool:
+    """crashlog an unexpected overlay failure, at most one per exception type
+    per CRASH_EVERY_S. True when recorded; never raises. Call it inside the
+    except block: crashlog takes the traceback from there."""
+    kind = f"{type(e).__module__}.{type(e).__qualname__}"
+    now = time.time()
+    last = _crashed.get(kind)
+    if last is not None and now - last < CRASH_EVERY_S:
+        return False
+    if len(_crashed) > 256:
+        _crashed.clear()
+    _crashed[kind] = now
+    try:
+        from hf_data import crashlog
+        crashlog.capture("evt_png", e, **context)
+    except Exception:
+        pass
+    return True
+
+
 @router.get("/api/evt_png/{event_id}/{name}.png")
-async def api_evt_png(event_id: str, name: str, f: int = 0, g: str = ""):
+async def api_evt_png(event_id: str, name: str, f: int = 0, g: str = "", s: str = ""):
     """Max-pooled overlay png of one event's maxdepth or depth frame, f x f
-    native cells per pixel (f in 2/4/8/16), coloured like the CDN overlay."""
+    native cells per pixel (f in 2/4/8/16), coloured like the CDN overlay.
+    g = the manifest generation the client holds, s = its STYLE: the png is
+    cached for good only when both are the ones it was rendered from."""
     if not valid_event_id(event_id) or not valid_name(name):
         raise HTTPException(400, "bad event id or overlay name")
     if not valid_factor(f):
@@ -419,6 +451,8 @@ async def api_evt_png(event_id: str, name: str, f: int = 0, g: str = ""):
     except LookupError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
+        _record(e, event_id=event_id, name=name, f=f)
         raise HTTPException(502, f"overlay unavailable ({type(e).__name__})")
+    current = current and s == str(STYLE)
     return Response(content=data, media_type="image/png",
                     headers={"Cache-Control": CC_IMMUTABLE if current else CC_SHORT})

@@ -175,12 +175,13 @@ def _api():
     return HfApi(token=tok) if tok else None
 
 
-def load_index() -> dict:
-    """{event_id: summary} newest-first insertion order; {} on any failure."""
+def load_index(revision: str | None = None) -> dict:
+    """{event_id: summary} newest-first insertion order (at `revision` when
+    given); {} on any failure."""
     try:
         from huggingface_hub import hf_hub_download
         p = hf_hub_download(REPO, f"{PREFIX}/index.json", repo_type="dataset",
-                            token=os.environ.get("HF_TOKEN"))
+                            token=os.environ.get("HF_TOKEN"), revision=revision)
         with open(p, encoding="utf-8") as fp:
             return json.load(fp)
     except Exception:
@@ -249,11 +250,12 @@ AUTOCAL_KEEP = 500
 AUTOCAL_DONE_FILE = f"{PREFIX}/autocal_done.json"
 
 
-def _load_hub_json(path: str, kind: type):
-    """`path` from the dataset (fresh), or kind() when the file does not exist
-    yet, or None when it could not be read (network, auth, corrupt JSON,
-    wrong type). Only a real 404 counts as missing: an offline
-    LocalEntryNotFoundError (a subclass of EntryNotFoundError) is an outage."""
+def _load_hub_json(path: str, kind: type, revision: str | None = None):
+    """`path` from the dataset (fresh; at `revision` when given), or kind()
+    when the file does not exist yet, or None when it could not be read
+    (network, auth, corrupt JSON, wrong type). Only a real 404 counts as
+    missing: an offline LocalEntryNotFoundError (a subclass of
+    EntryNotFoundError) is an outage."""
     try:
         from huggingface_hub import hf_hub_download
         from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
@@ -262,7 +264,7 @@ def _load_hub_json(path: str, kind: type):
     try:
         p = hf_hub_download(REPO, path, repo_type="dataset",
                             token=os.environ.get("HF_TOKEN"),
-                            force_download=True)
+                            revision=revision, force_download=True)
         with open(p, encoding="utf-8") as fp:
             data = json.load(fp)
     except LocalEntryNotFoundError:
@@ -419,6 +421,12 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
         # the episode keeps its first trigger time across hourly re-publishes
         summary["episode_started"] = ((prior or {}).get("episode_started")
                                       or manifest.get("t0"))
+        # ... and the record of the fragments merged into it
+        # (scripts/merge_episodes.py), so a reopened merged episode keeps it
+        if (prior or {}).get("merged"):
+            m = dict(prior["merged"])            # its span grows with the episode
+            m["last_end"] = max(m.get("last_end") or "", manifest.get("t_end") or "")
+            summary["merged"] = m
         summary["archive_frames"] = manifest.get("archive_frames")
         # newest first
         idx = {ev: summary, **idx}
@@ -581,7 +589,8 @@ def mark_ended(event_ids) -> bool:
             return False
 
 
-def reopen_episodes(event_ids, superseded: set | None = None) -> list:
+def reopen_episodes(event_ids, superseded: set | None = None,
+                    refused: set | None = None) -> list | None:
     """Flip ended episodes back to 'active' in the index (single small
     commit): their gauge was flagged again soon after they ended, so the
     flood continues under the original id and episode_started anchor instead
@@ -589,12 +598,18 @@ def reopen_episodes(event_ids, superseded: set | None = None) -> list:
     tick's finalize/heal pass recomputes it when the episode ends again — and
     the entry is stamped "reopened" (UTC), which restarts the tick's CPU
     fallback clock and keeps the CREST-miss guard from purging the episode.
-    Pinned demo events are never reopened. Neither is an episode the FRESH
+    Pinned demo events are never reopened, nor an episode gone from the FRESH
+    index: those ids are added to `refused` (when given) — pinned ones before
+    the index is read, so a failed reopen still tells them apart (a pinned
+    episode's gauge starts a new id). Neither is an episode the FRESH
     index shows superseded since the caller read it: absorbed into another
     (merged_into), or its gauge now has a newer episode or an active one —
     that one carries the flood. Those ids are added to `superseded` (when
     given). Returns the ids that are active afterwards (reopened now or
-    already active); [] when nothing was done."""
+    already active); [] when nothing was done (refused); None when the reopen
+    FAILED — the fresh index unreadable or the commit raised — so the caller
+    retries rather than open a new id beside the episode (the ids in
+    `superseded` and `refused` aside)."""
     from huggingface_hub import CommitOperationAdd
     api = _api()
     if api is None:
@@ -602,8 +617,16 @@ def reopen_episodes(event_ids, superseded: set | None = None) -> list:
     pins = pinned_ids(force=True)
     if pins is None:
         return []                       # can't tell demo events apart
+    event_ids = list(event_ids)
+    if refused is not None:
+        refused.update(e for e in event_ids if e in pins)
+    event_ids = [e for e in event_ids if e not in pins]
+    if not event_ids:
+        return []
     with _lock:
         idx = load_index()
+        if not idx:
+            return None                 # load_index failed: {} on any error
 
         def gauge(s):
             return str(((s.get("trigger") or {}).get("gauge")) or s.get("gauge") or "")
@@ -611,7 +634,9 @@ def reopen_episodes(event_ids, superseded: set | None = None) -> list:
         ids = []
         for e in event_ids:
             s = idx.get(e)
-            if s is None or e in pins:
+            if s is None:
+                if refused is not None:
+                    refused.add(e)
                 continue
             g = gauge(s)
             if s.get("merged_into") or (g and any(
@@ -639,7 +664,7 @@ def reopen_episodes(event_ids, superseded: set | None = None) -> list:
                 commit_message=f"episodes reopened: {', '.join(changed)}")
             return ids
         except Exception:
-            return []
+            return None
 
 
 def _parse_hydro_t(t):
@@ -650,6 +675,35 @@ def _parse_hydro_t(t):
         return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M")
     except ValueError:
         return None
+
+
+def _final_stale(s: dict | None, began: datetime.datetime, was: dict) -> str | None:
+    """Why a final computed by a finalize_episodes call that began at `began`
+    (UTC, whole seconds) from the entry `was` must not be written onto the
+    FRESH index entry `s`; None = write it. A reopen landing mid-finalize
+    leaves the entry active, or ended again — stamped "reopened" at/after
+    `began`, or re-published (a publish drops the stamp) — and that end's own
+    finalize scores the episode. The merge script's contract: never final or
+    status on an absorbed member (merged_into); a merge since ('merged'
+    changed) is scored by the script's own finalize of the merged window."""
+    if s is None:
+        return "left the index"
+    if s.get("merged_into"):
+        return f"absorbed into {s['merged_into']}"
+    if s.get("status") != "ended":
+        return f"{s.get('status') or 'active'} again"
+    try:
+        reopened = datetime.datetime.strptime(s.get("reopened") or "",
+                                              "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        reopened = None
+    if reopened is not None and reopened >= began:
+        return f"reopened {s['reopened']}"
+    if s.get("merged") != was.get("merged"):
+        return "merged"
+    if s.get("generated") != was.get("generated"):
+        return "re-published"
+    return None
 
 
 def finalize_episodes(event_ids, log=print) -> int:
@@ -664,23 +718,30 @@ def finalize_episodes(event_ids, log=print) -> int:
                                  card the dashboard shows instead of the
                                  live-event presentation)
       events/scorecard.json      per-gauge running list of episode scores
-                                 (the model's track record where it counts)
+                                 (the model's track record where it counts;
+                                 left out of a pass that cannot read it)
 
     Idempotent: episodes already carrying "final" are skipped, so the
     hourly tick can re-call it to heal a lost index race (a worker publish
-    that snapshotted the index mid-finalize). Returns episodes finalized."""
+    that snapshotted the index mid-finalize). Scoring takes minutes, so the
+    commit writes only entries the FRESH index still shows ended as computed
+    (_final_stale): one reopened or re-published since this call began,
+    absorbed into another (merged_into: never written) or merged since is
+    skipped and logged. The entry's other fields ('merged' included) are
+    kept. Returns episodes finalized."""
     from huggingface_hub import CommitOperationAdd, hf_hub_download
     from . import eventscore
     api = _api()
     if api is None:
         return 0
     tok = os.environ.get("HF_TOKEN")
+    began = datetime.datetime.utcnow().replace(microsecond=0)
     done = 0
     fin_by_ev = {}
     for ev in event_ids:
         idx = load_index()
         s = idx.get(ev)
-        if not s or s.get("final"):
+        if not s or s.get("final") or s.get("merged_into"):
             continue
         man = _prior_manifest(ev) or {}
         gid = str(((s.get("trigger") or {}).get("gauge"))
@@ -764,34 +825,70 @@ def finalize_episodes(event_ids, log=print) -> int:
                  "peak_sim_m3s": peak_sim, **depth_stats,
                  "nse_h1": (score or {}).get("nse_h1"),
                  "nse_h6": (score or {}).get("nse_h6")}
-        fin_by_ev[ev] = {"final": final, "score": score, "gauge": gid}
+        fin_by_ev[ev] = {"final": final, "score": score, "gauge": gid, "was": s}
         done += 1
 
     if not fin_by_ev:
         return 0
+    # the commit is checked against the revision it read (parent_commit): the
+    # episode merger finalizes from its own process, so _lock alone does not
+    # keep two writers of index.json / scorecard.json from undoing each other
+    from huggingface_hub.utils import HfHubHTTPError
+    computed = dict(fin_by_ev)
+    for attempt in range(1, FINAL_COMMIT_TRIES + 1):
+        fin_by_ev = dict(computed)
+        sha, n = _finalize_commit(api, fin_by_ev, began, log, HfHubHTTPError)
+        if sha != "moved":
+            return n
+        log(f"finalize: the store moved under us (attempt {attempt}): re-reading")
+        time.sleep(3 * attempt)
+    log("finalize commit failed (the store kept moving)")
+    return 0
+
+
+FINAL_COMMIT_TRIES = 4
+
+
+def _finalize_commit(api, fin_by_ev: dict, began, log, HfHubHTTPError):
+    """One read-modify-commit of finalize_episodes' products against the
+    head revision. ("moved", 0) on a concurrent commit (409/412: re-read and
+    retry), else (sha or None, episodes written)."""
+    from huggingface_hub import CommitOperationAdd
     with _lock:
-        idx = load_index()
-        ops = []
-        # scorecard: the model's running track record, episodes only
-        card = {}
         try:
-            p = hf_hub_download(REPO, f"{PREFIX}/scorecard.json",
-                                repo_type="dataset", token=tok,
-                                force_download=True)
-            with open(p, encoding="utf-8") as fp:
-                card = json.load(fp)
-        except Exception:
-            pass
+            sha = api.repo_info(REPO, repo_type="dataset").sha
+        except Exception as e:
+            log(f"finalize: head revision unreadable ({type(e).__name__}) — nothing committed")
+            return None, 0
+        idx = load_index(revision=sha)
+        if not idx:
+            log("finalize: index.json unreadable — nothing committed")
+            return None, 0
+        for ev in list(fin_by_ev):
+            why = _final_stale(idx.get(ev), began, fin_by_ev[ev]["was"])
+            if why:
+                log(f"finalize {ev}: not written — {why} since this pass began")
+                del fin_by_ev[ev]
+        if not fin_by_ev:
+            return None, 0
+        done = len(fin_by_ev)
+        ops = []
+        # scorecard: the model's running track record, episodes only. A fresh
+        # card only where none exists yet (a real 404): on any other read
+        # error it stays out of this commit — a card of this pass's gauges
+        # alone would wipe every other gauge's record (final.json keeps the
+        # episode's scores)
+        card = _load_hub_json(f"{PREFIX}/scorecard.json", dict, revision=sha)
+        if card is None:
+            log("finalize: scorecard.json unreadable — left out of this commit")
         for ev, d in fin_by_ev.items():
-            if ev in idx:
-                idx[ev]["status"] = "ended"
-                idx[ev]["final"] = d["final"]
+            idx[ev]["final"] = d["final"]        # ended, checked just above
             ops.append(CommitOperationAdd(
                 f"{PREFIX}/{ev}/final.json",
                 io.BytesIO(json.dumps(
                     {"event_id": ev, **d["final"],
                      "nowcast_verification": d["score"]}).encode())))
-            if d["gauge"] and d["score"]:
+            if card is not None and d["gauge"] and d["score"]:
                 rows = [r for r in card.get(d["gauge"], [])
                         if r.get("event_id") != ev]
                 rows.append({"event_id": ev, **{k: d["score"].get(k) for k in
@@ -800,7 +897,8 @@ def finalize_episodes(event_ids, log=print) -> int:
                              "peak_ratio_h6": (d["score"]["leads"].get("6")
                                                or {}).get("peak_ratio")})
                 card[d["gauge"]] = rows[-20:]
-        if any(d["gauge"] and d["score"] for d in fin_by_ev.values()):
+        if card is not None and any(d["gauge"] and d["score"]
+                                    for d in fin_by_ev.values()):
             ops.append(CommitOperationAdd(
                 f"{PREFIX}/scorecard.json",
                 io.BytesIO(json.dumps(card).encode())))
@@ -808,14 +906,20 @@ def finalize_episodes(event_ids, log=print) -> int:
             f"{PREFIX}/index.json", io.BytesIO(json.dumps(idx).encode())))
         try:
             api.create_commit(repo_id=REPO, repo_type="dataset",
-                              operations=ops,
+                              operations=ops, parent_commit=sha,
                               commit_message="episode final products: "
                                              + ", ".join(fin_by_ev))
             log(f"finalized {done} episode(s): {', '.join(fin_by_ev)}")
-            return done
+            return sha, done
+        except HfHubHTTPError as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (409, 412):
+                return "moved", 0
+            log(f"finalize commit failed ({type(e).__name__} {code})")
+            return None, 0
         except Exception as e:
             log(f"finalize commit failed ({type(e).__name__})")
-            return 0
+            return None, 0
 
 
 def retention_sweep() -> int:
