@@ -4,22 +4,27 @@ soon after an episode ended reopens it (same id + episode_started anchor)
 instead of opening a new event id. No network: detect, the observations,
 the nowcast store, the store's hub I/O, the queue and run_one are faked;
 mark_ended / reopen_episodes / publish_event run for real against an
-in-memory index. run_one's CREST-miss guard runs for real behind a faked
-EF5 (a reopened episode's miss is noted, never purged). finalize_episodes
-runs for real behind a faked scorer: a reopen or merge landing while it
-scores is never overwritten with its stale final."""
+in-memory index. The tick wrapper runs one visit at a time and reports its
+progress from memory. run_one runs for real behind a faked EF5, HUC12
+index, domain and boundary policy: an outlet-Q miss is advisory (never
+dropped, purged or noted as missed, reopened or not), and a basin whose full
+native HUC12 chain is oversize or incomplete is deferred whole, never
+trimmed. finalize_episodes runs for real behind a faked scorer: a reopen or
+merge landing while it scores is never overwritten with its stale final."""
 from __future__ import annotations
 
 import datetime
 import json
 import sys
 import tempfile
+import threading
 import types
 
 import huggingface_hub
 import pytest
 
 import hf_data
+from conftest import huc_chain_api
 from hf_data import eventqueue, eventscore, eventsim, eventstore, nowcaststore
 
 G1, G2 = "09353800", "08353000"
@@ -58,6 +63,14 @@ class _SyncThread:
 
     def start(self):
         self._run()
+
+
+def _thread(target=None, args=(), kwargs=None, **kw):
+    """eventsim's Thread: the tick's stall watchdog stays a real thread (it
+    only waits on the tick's stop event, set when the visit returns)."""
+    if target is eventsim._tick_watchdog:
+        return threading.Thread(target=target, args=args, kwargs=kwargs, **kw)
+    return _SyncThread(target, args, kwargs)
 
 
 @pytest.fixture
@@ -106,8 +119,13 @@ def tick(monkeypatch):
     monkeypatch.setattr(eventsim, "detect", detect)
     monkeypatch.setattr(eventsim, "_recent_obs_max", lambda gid: st.obs.get(gid))
     monkeypatch.setattr(eventsim, "run_one", run_one)
-    monkeypatch.setattr(eventsim, "threading", types.SimpleNamespace(Thread=_SyncThread))
+    monkeypatch.setattr(eventsim, "threading", types.SimpleNamespace(
+        Thread=_thread, Event=threading.Event))
     monkeypatch.setitem(eventsim._running, "id", None)
+    # process-memory tick progress and capacity deferrals start clean
+    monkeypatch.setattr(eventsim, "_tick_state", dict(eventsim._tick_state))
+    monkeypatch.setattr(eventsim, "_capacity_skips", {})
+    monkeypatch.setattr(eventsim, "_capacity_retry", {})
     monkeypatch.setattr(nowcaststore, "all_risk", lambda: {"tiers": {}})
     # baseflow 10 m3/s: observed flow keeps an episode alive at >= 50 m3/s
     monkeypatch.setattr(nowcaststore, "_thresholds", lambda: {g: {"qbase": 10.0} for g in (G1, G2)})
@@ -148,7 +166,9 @@ def test_redetection_within_window_reopens(tick):
     eventsim.hourly_tick()
     run, = tick.runs
     assert run["episode"] == b and run["gauge"] == G1 and not run["force_cpu"]
-    assert run["trigger"]["reopened"] is True                 # miss guard: no purge
+    # the episode's own trigger goes on (an outlet-Q miss is advisory, so no
+    # "reopened" mark is carried to spare the record from a purge)
+    assert run["trigger"] == {**sb["trigger"], "tier": 0}
     s = tick.idx[b]
     assert s["status"] == "active" and "final" not in s
     assert s["episode_started"] == sb["episode_started"]      # anchor kept
@@ -445,65 +465,207 @@ def test_reopen_restarts_the_cpu_fallback_clock(tick):
     assert [r["force_cpu"] for r in tick.runs] == [False]
 
 
+def test_overlapping_tick_is_skipped_and_progress_is_in_memory(tick, monkeypatch):
+    # one hourly visit at a time: a ping landing while one runs returns at
+    # once, without reading the store; tick_status() reads process memory
+    seen = {}
+    detect = eventsim.detect
+
+    def detect_while_the_next_ping_lands(max_events=1):
+        seen["status"] = eventsim.tick_status()
+        seen["overlap"] = eventsim.hourly_tick()
+        return detect(max_events)
+
+    monkeypatch.setattr(eventsim, "detect", detect_while_the_next_ping_lands)
+    tick.picks = [G1]
+    out = eventsim.hourly_tick()
+    assert out["ran"] == 1 and [r["episode"] for r in tick.runs] == [None]
+    assert seen["overlap"]["skipped"] == "runner busy"
+    assert seen["overlap"]["tick"]["running"]
+    assert tick.detect_budget == [eventsim.MAX_PER_TICK]       # one visit only
+    st = seen["status"]
+    assert st["running"] and st["preflight"] and st["phase"] == "preflight.detect"
+    after = eventsim.tick_status()
+    assert not after["running"] and after["phase"] == "idle"
+    assert after["outcome"] == "ok" and after["last_success"] == after["completed"]
+    assert after["busy_h"] is None
+
+
+def test_failed_tick_is_reported_and_frees_the_next_one(tick, monkeypatch):
+    def unreadable(revision=None):
+        raise OSError("hub unavailable")
+
+    monkeypatch.setattr(eventstore, "load_index", unreadable)
+    with pytest.raises(OSError):
+        eventsim.hourly_tick()
+    st = eventsim.tick_status()
+    assert not st["running"] and st["phase"] == "failed" and st["outcome"] == "error"
+    assert st["error"] == "OSError" and st["error_phase"] == "preflight.event_index"
+    # the visit lock was released: the next ping runs a whole visit
+    monkeypatch.setattr(eventstore, "load_index",
+                        lambda revision=None: json.loads(json.dumps(tick.idx)))
+    tick.picks = [G1]
+    assert eventsim.hourly_tick()["ran"] == 1
+    st = eventsim.tick_status()
+    assert st["outcome"] == "ok" and st["error"] is None
+
+
+def test_capacity_deferral_keeps_the_episode_and_its_slot(tick, monkeypatch):
+    # a re-sim deferred for native capacity neither ends its episode nor
+    # consumes one of the tick's EVENT_MAX_PER_TICK simulation slots
+    monkeypatch.setattr(eventsim, "MAX_PER_TICK", 2)
+    G3 = "07144100"
+    a, sa = _ev(G1, 3)
+    b, sb = _ev(G2, 3)
+    tick.idx = {a: sa, b: sb}
+    tick.obs = {G1: 60.0, G2: 60.0}                       # both still high
+    tick.picks = [G3]
+    fake = eventsim.run_one
+
+    def run_one(gid, **kw):
+        if gid == G1:
+            return eventsim._capacity_skip(gid, kw.get("episode_id"),
+                                           {"reason": "full_basin_exceeds_native_capacity"})
+        return fake(gid, **kw)
+
+    monkeypatch.setattr(eventsim, "run_one", run_one)
+    out = eventsim.hourly_tick()
+    assert [r["gauge"] for r in tick.runs] == [G3, G2] and out["ran"] == 2
+    assert out["capacity_blocked"] == 1 and out["capacity_skips"][0]["gauge"] == G1
+    # the next tick keeps the deferred episode intact without re-running it
+    tick.runs, tick.picks = [], []
+    out = eventsim.hourly_tick()
+    assert out["ended"] == [] and tick.idx[a]["status"] == "active"
+    assert [r["gauge"] for r in tick.runs] == [G2]
+    assert eventsim.tick_status()["capacity_blocked"] == 1
+
+
+BOUNDS = (-110.05, 34.95, -109.95, 35.05)
+
+
 @pytest.fixture
-def missing_ef5(monkeypatch, tmp_path):
-    """run_one up to its CREST-miss guard: EF5 (faked) delivers a tenth of
-    the observed peak. Returns the guard's drop_events / note_missed calls;
-    `.index` is what eventstore.load_index serves."""
-    st = types.SimpleNamespace(index={}, drops=[], notes=[])
+def outlet_miss(monkeypatch, tmp_path):
+    """run_one for real past EF5: EF5 (faked) delivers a tenth of the
+    observed peak; the basin outline, HUC12 index, domain build, boundary
+    policy and queue are faked. Records drop_events / note_missed calls,
+    EF5 runs and queued specs; `.index` is what eventstore.load_index
+    serves."""
+    from hf_data import basinextent, boundary_fallback, hucdomain
+    st = types.SimpleNamespace(index={}, drops=[], notes=[], ef5=[], specs=[],
+                               domain={"n_hucs": 1, "hucs": [{"huc12": "123"}],
+                                       "basin": [[35.0, -110.0]], "bbox": list(BOUNDS),
+                                       "n_bbox": 14_400})
     t0 = _now().replace(minute=0, second=0, microsecond=0)
     rows = [{"time": (t0 - datetime.timedelta(hours=h)).strftime("%Y-%m-%d %H:%M"),
              "sim_q": 5.0, "obs_q": 50.0} for h in range(3)]
 
     def run_gauge(gid, *a, **k):
+        st.ef5.append(gid)
         yield "meta", {"model": "crest"}
         yield "hydro", {"rows": rows}
         yield "done", {"returncode": 0}
 
-    from hf_data import basinextent
     pipeline = types.SimpleNamespace(run_gauge=run_gauge, gauge_info=lambda gid: {
-        "lat": 35.0, "lon": -110.0, "area": 1000.0})
+        "id": gid, "lat": 35.0, "lon": -110.0, "area": 1000.0})
     monkeypatch.setitem(sys.modules, "hf_data.pipeline", pipeline)
     monkeypatch.setattr(hf_data, "pipeline", pipeline, raising=False)
     monkeypatch.setitem(sys.modules, "crestimap", types.ModuleType("crestimap"))
     monkeypatch.setattr(sys.modules["crestimap"], "EventConfig", None, raising=False)
     monkeypatch.setattr(sys.modules["crestimap"], "run_event", None, raising=False)
     monkeypatch.setattr(basinextent, "ef5_extent", lambda g: {
-        "source": "test", "carved_km2": 1000.0, "cells": 100})
+        "source": "test", "carved_km2": 1000.0, "cells": 100, "bounds": BOUNDS})
+    for k, v in huc_chain_api(BOUNDS).items():
+        monkeypatch.setattr(hucdomain, k, v)
+    monkeypatch.setattr(hucdomain, "build_domain", lambda *a, **k: dict(st.domain))
+    policy = {"version": 1, "policy": boundary_fallback.POLICY, "mode": "runoff-only",
+              "fingerprint": "topology", "implementation": boundary_fallback.DEPLOYMENT_TAG,
+              "domain_mask_sha256": "mask", "content_sha256": "content",
+              "subsurface_routing": {"mode": "kw"}, "inlets": [], "excluded_gauges": []}
+    monkeypatch.setattr(boundary_fallback, "prepare", lambda g, out, dom, *a, **k: (policy, dom))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     monkeypatch.setattr(eventqueue, "mode", lambda: "on")
     monkeypatch.setattr(eventqueue, "claim_fresh_for", lambda ev: None)
+    monkeypatch.setattr(eventqueue, "enqueue", lambda ev, spec, out_dir, log=print:
+                        st.specs.append(spec) or True)
+    monkeypatch.setattr(eventqueue, "wait_for_claim", lambda ev, log=print: False)
     monkeypatch.setattr(eventstore, "load_index", lambda revision=None: json.loads(json.dumps(st.index)))
     monkeypatch.setattr(eventstore, "drop_events", lambda ids, purge=True, why="":
                         st.drops.append((list(ids), purge)) or True)
     monkeypatch.setattr(eventstore, "note_missed", lambda rec: st.notes.append(rec) or True)
     for k in ("log", "last", "missed"):
         monkeypatch.setitem(eventsim._running, k, [] if k != "last" else None)
+    monkeypatch.setattr(eventsim, "_capacity_skips", {})
+    monkeypatch.setattr(eventsim, "_capacity_retry", {})
     st.t0 = t0
     return st
 
 
-def test_reopened_episode_miss_is_noted_never_purged(missing_ef5):
+def test_outlet_miss_is_advisory_reopened_or_not(outlet_miss):
+    # outlet-Q policy (2026-10-27): an EF5 peak far below the observed one
+    # never drops, purges or notes an episode as missed — an ordinary re-run
+    # and a reopened one (stamped in the index) alike. The run goes on and
+    # queues its bundle under the same id and anchor, the advisory on its
+    # trigger.
     b, sb = _ev(G1, 10)
     trig = {"gauge": G1, "obs_m3s": 50.0}
-    # an ordinary episode re-run that misses is still disowned (guard as before)
-    missing_ef5.index = {b: sb}
-    out = eventsim.run_one(G1, t0=missing_ef5.t0, trigger=trig, episode_id=b)
-    assert out["skipped"] == "crest_missed" and not out["published"]
-    assert missing_ef5.drops == [([b], True)]
-    assert missing_ef5.notes[-1]["reopened"] is False
-    # reopened — stamped in the index (no publish since the reopen) or carried
-    # in the trigger (the tick's reopen run; manifests after a publish): the
-    # finalized record stays, the miss is only noted
-    for entry, tr in (({**sb, "reopened": "2026-11-03T10:00:00Z"}, trig),
-                      (sb, {**trig, "reopened": True})):
-        missing_ef5.index, missing_ef5.drops = {b: entry}, []
-        out = eventsim.run_one(G1, t0=missing_ef5.t0, trigger=tr, episode_id=b)
-        assert out["skipped"] == "crest_missed" and not out["published"]
-        assert missing_ef5.drops == []
-        assert missing_ef5.notes[-1]["reopened"] is True
-        assert missing_ef5.notes[-1]["event"] == b
-    assert len(eventsim._running["missed"]) == 3
+    anchor = datetime.datetime.strptime(sb["episode_started"], "%Y-%m-%dT%H:%MZ")
+    for entry in (sb, {**sb, "reopened": "2026-11-03T10:00:00Z"}):
+        outlet_miss.index, outlet_miss.specs = {b: entry}, []
+        out = eventsim.run_one(G1, t0=outlet_miss.t0, trigger=trig, episode_id=b)
+        assert out == {"event_id": b, "published": False, "queued": True}
+        assert outlet_miss.drops == [] and outlet_miss.notes == []
+        spec, = outlet_miss.specs
+        assert spec["event_id"] == b and spec["episode"] is True
+        assert spec["sim_start"] == _h(anchor - datetime.timedelta(hours=eventsim.SIM_BACKSET_H))
+        adv = spec["trigger"]["outlet_q_advisory"]
+        assert adv["action"] == "continue_runoff_driven_2d"
+        assert adv["reason"] == "severe_underprediction" and adv["frac"] == 0.1
+    assert eventsim._running["missed"] == []
+
+
+def test_oversize_basin_is_deferred_whole_before_ef5(outlet_miss, monkeypatch):
+    # protocol 2: a full native (1") HUC12 chain beyond EVENT_PREP_MAX_CELLS
+    # is deferred before EF5 allocates anything — never trimmed to fit. The
+    # deferral is memory-only and suppresses the gauge for the cooldown.
+    from hf_data import hucdomain
+    for k, v in huc_chain_api((-112.0, 33.0, -108.0, 37.0)).items():
+        monkeypatch.setattr(hucdomain, k, v)
+    out = eventsim.run_one(G1, t0=outlet_miss.t0, trigger={"gauge": G1})
+    assert out["skipped"] == "native_capacity" and not out["published"]
+    rec = out["native_capacity"]
+    assert rec["reason"] == "full_basin_exceeds_native_capacity"
+    assert rec["estimates"]["huc_native"]["n_bbox"] > eventsim.PREP_MAX_CELLS
+    assert outlet_miss.ef5 == [] and outlet_miss.specs == []
+    assert [r["gauge"] for r in eventsim.capacity_status()] == [G1]
+    monkeypatch.setattr(hucdomain, "gauge_huc12",
+                        lambda *a: pytest.fail("a suppressed gauge is not re-read"))
+    again = eventsim.run_one(G1, t0=outlet_miss.t0, trigger={"gauge": G1})
+    assert again["suppressed"] and again["skipped"] == "native_capacity"
+    assert eventsim._capacity_suppressed(G1)
+
+
+def test_incomplete_basin_chain_or_domain_is_deferred(outlet_miss, monkeypatch):
+    # a HUC12 chain whose traversal left upstream units out is no basin: it
+    # is deferred (short retry), never run as a smaller one
+    from hf_data import hucdomain
+    for k, v in huc_chain_api(BOUNDS, upstream=("456",)).items():
+        monkeypatch.setattr(hucdomain, k, v)
+    out = eventsim.run_one(G1, t0=outlet_miss.t0, trigger={"gauge": G1})
+    assert out["native_capacity"]["reason"] == "native_domain_incomplete"
+    assert outlet_miss.ef5 == [] and outlet_miss.specs == []
+    # the built 2-D domain must keep the whole preflight chain: a trimmed
+    # build is deferred after EF5, and nothing is queued
+    for k, v in huc_chain_api(BOUNDS).items():
+        monkeypatch.setattr(hucdomain, k, v)
+    for domain in ({**outlet_miss.domain, "trimmed": True},
+                   {**outlet_miss.domain, "hucs": []}):
+        monkeypatch.setattr(eventsim, "_capacity_retry", {})
+        outlet_miss.domain = domain
+        out = eventsim.run_one(G2, t0=outlet_miss.t0, trigger={"gauge": G2})
+        assert out["skipped"] == "native_capacity"
+        assert out["native_capacity"]["reason"] == "native_domain_incomplete"
+        assert outlet_miss.specs == []
+    assert outlet_miss.ef5 == [G2, G2]
 
 
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"

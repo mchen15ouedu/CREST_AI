@@ -10,9 +10,9 @@ domain is the whole catchment contributing to the trigger gauge as a union
 of WBD HUC12 units (hf_data/hucdomain.py) — the solver integrates only those
 cells (the raster outside them is a sink) and the HUC12 units are the tiles
 the parallel tier spreads across devices. RESOLUTION IS FIXED at the DEM's
-native cell size. Workers get the full basin; the demoted CPU rung, when it
-must run, keeps only the HUC12 units nearest the gauge that fit
-EVENT_MAX_CELLS (hydrologic-unit trimming — still a basin, never a window).
+native cell size. Protocol 2 prepares the full HUC basin and defers a basin
+that exceeds native preparation/worker capacity; upstream units are never
+dropped merely to fit a memory budget.
 crestimap installs from the CREST-iMAP fork's v2 branch (Dockerfile);
 everything here degrades to a clear error if it's missing.
 """
@@ -72,12 +72,11 @@ WARMUP_D = int(os.environ.get("EVENT_WARMUP_D", "30"))
 # back 12 h from t0 to capture the rising limb from the beginning
 SIM_BACKSET_H = int(os.environ.get("EVENT_SIM_BACKSET_H", "12"))
 MAX_CELLS = int(os.environ.get("EVENT_MAX_CELLS", "400000"))
-# GPU-queue budget (bbox cells of the bundled domain; 0 = whole basin). Set
-# when no worker can take very large basins (HPC released 2026-10-16; the
-# ZeroGPU worker accepts <= ZERO_MAX_CELLS): the bundle keeps the HUC12 units
-# nearest the gauge that fit — whole units at native resolution, never a box
-# or a coarser grid; EF5's routed flow enters at the cut as inlet inflow.
+# Retained for configuration compatibility. Protocol 2 does not trim HUC
+# units to this budget: its full native domain must pass PREP_MAX_CELLS.
 QUEUE_MAX_CELLS = int(os.environ.get("EVENT_QUEUE_MAX_CELLS", "0"))
+PREP_MAX_CELLS = int(os.environ.get("EVENT_PREP_MAX_CELLS", "35000000"))
+PREP_COOLDOWN_H = float(os.environ.get("EVENT_PREP_COOLDOWN_H", "6"))
 DEM_RES = os.environ.get("EVENT_DEM_RES", "1")
 DEM_CACHE = os.environ.get("EVENT_DEM_CACHE",
                            os.path.join(tempfile.gettempdir(), "dem_cache"))
@@ -92,9 +91,26 @@ DEM_RES_DEG = {"1": 1.0 / 3600.0, "13": 1.0 / 10800.0}
 _running: dict = {"id": None, "status": None, "log": [], "last": None,
                   "started": None}
 _lock = threading.Lock()
+# A job is marked running only after its expensive setup. Guard the entire
+# hourly visit separately, including preflight and retention, so repeated
+# updater pings cannot start overlapping SDK reads before run_one begins.
+_tick_lock = threading.Lock()
+_tick_state_lock = threading.Lock()
+_tick_state = {"running": False, "started": None, "completed": None,
+               "last_attempt": None, "last_success": None, "phase": "idle",
+               "phase_started": None, "last_progress": None, "outcome": None,
+               "error": None, "error_phase": None, "last_error_at": None,
+               "watchdog_dumped_at": None, "watchdog_phase": None}
+_tick_started_mono = None
+_tick_phase_mono = None
+_tick_watchdog_marker = None
+TICK_PREFLIGHT_STALL_S = 15 * 60
 # event ids whose local CPU solve blew CPU_MAX_H -> when it happened; the
 # tick's CPU-rung sweep skips them for CPU_COOLDOWN_H
 _cpu_timeout: dict = {}
+_capacity_lock = threading.Lock()
+_capacity_skips: dict = {}
+_capacity_retry: dict = {}
 
 
 def _busy_h() -> float | None:
@@ -116,8 +132,178 @@ def note_tick_attempt() -> None:
     endpoint's busy short-circuit, so `tick.last` means "the hourly ping is
     arriving" and the separate busy_h field carries the wedge alarm — before
     this, a wedged runner made the two indistinguishable."""
-    _running["last_tick"] = datetime.datetime.utcnow().strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
+    stamp = _tick_stamp()
+    _running["last_tick"] = stamp
+    with _tick_state_lock:
+        _tick_state["last_attempt"] = stamp
+
+
+def _tick_stamp():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def tick_status() -> dict:
+    """Pure process-memory progress; never reads the dataset or waits for work."""
+    with _tick_state_lock:
+        out = dict(_tick_state)
+        now = time.monotonic()
+        out["busy_h"] = (round(max(0, now - _tick_started_mono) / 3600, 3)
+                         if out["running"] and _tick_started_mono is not None else None)
+        out["phase_age_s"] = (round(max(0, now - _tick_phase_mono), 1)
+                              if out["running"] and _tick_phase_mono is not None else None)
+        out["preflight"] = out["running"] and out["phase"].startswith("preflight.")
+        out["watched_wait"] = out["running"] and _tick_wait_phase(out["phase"])
+        out["stalled"] = bool(out["watched_wait"] and out["phase_age_s"] is not None
+                               and out["phase_age_s"] >= TICK_PREFLIGHT_STALL_S)
+    blocked = capacity_status()
+    out["capacity_blocked"] = sum(1 for row in blocked if row.get("relevant", True))
+    out["capacity_skips"] = blocked
+    return out
+
+
+def capacity_status():
+    """Memory-only capacity deferrals; published maps are never edited here."""
+    with _capacity_lock:
+        return [dict(row) for row in _capacity_skips.values()]
+
+
+def _capacity_suppressed(gid):
+    gid = str(gid)
+    key = (gid, "1", PREP_MAX_CELLS, "protocol2-full-huc-chain")
+    with _capacity_lock:
+        if time.monotonic() < _capacity_retry.get(key, 0):
+            row = _capacity_skips.get(gid)
+            if row:
+                row["relevant"] = True
+                return dict(row)
+    return None
+
+
+def _capacity_reconcile(relevant):
+    with _capacity_lock:
+        for gid, row in _capacity_skips.items():
+            row["relevant"] = gid in relevant
+
+
+def _capacity_clear(gid):
+    with _capacity_lock:
+        _capacity_skips.pop(str(gid), None)
+        for key in list(_capacity_retry):
+            if key[0] == str(gid):
+                _capacity_retry.pop(key, None)
+
+
+def _capacity_skip(gid, event_id, details, retry_h=None):
+    now = datetime.datetime.utcnow()
+    retry_h = PREP_COOLDOWN_H if retry_h is None else retry_h
+    record = {"gauge": str(gid), "event_id": event_id, "skipped": "native_capacity",
+              "published": False, "dem_res": "1", "native_resolution": "1 arc-second (~30 m)",
+              "limit_cells": PREP_MAX_CELLS, "recorded": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "retry_after": (now + datetime.timedelta(hours=retry_h)).strftime(
+                  "%Y-%m-%dT%H:%M:%SZ"), "relevant": True,
+              "existing_result_preserved": True, **details}
+    key = (str(gid), "1", PREP_MAX_CELLS, "protocol2-full-huc-chain")
+    with _capacity_lock:
+        _capacity_skips[str(gid)] = record
+        _capacity_retry[key] = time.monotonic() + retry_h * 3600
+    _running["last"] = {"event": event_id, "ok": False,
+                        "skipped": "native_capacity", "native_capacity": record}
+    return {"event_id": event_id, "gauge": str(gid), "published": False,
+            "skipped": "native_capacity", "native_capacity": dict(record)}
+
+
+def _native_bbox_estimate(bounds):
+    """Native 1-arc-second lattice envelope, including the builder's 2-cell pad."""
+    w, s, e, n = map(float, bounds)
+    if not all(math.isfinite(v) for v in (w, s, e, n)) or w >= e or s >= n:
+        raise ValueError("invalid native basin extent")
+    res = DEM_RES_DEG["1"]
+    west, south = math.floor(w / res) - 2, math.floor(s / res) - 2
+    east, north = math.ceil(e / res) + 2, math.ceil(n / res) + 2
+    nx, ny = east - west, north - south
+    return {"bbox": [west * res, south * res, east * res, north * res],
+            "nx": nx, "ny": ny, "n_bbox": nx * ny, "pad_cells": 2, "dem_res": "1"}
+
+
+def _native_preflight(g, ext, hucdomain):
+    """Metadata-only full-chain estimates, before EF5 allocates its raster arrays.
+    ext: the gauge's basinextent.ef5_extent — EF5's raster extent is the basin
+    outline's, so the EF5 estimate covers it unioned with the HUC12 chain."""
+    if str(DEM_RES) != "1" or PREP_MAX_CELLS <= 0:
+        raise ValueError("protocol 2 requires nominal 30 m and a positive preparation cell limit")
+    h0 = hucdomain.gauge_huc12(float(g["lat"]), float(g["lon"]))
+    chain = hucdomain.upstream_chain(h0)
+    ids = {str(row["huc12"]) for row in chain}
+    if not ids or str(h0) not in ids:
+        raise ValueError("full HUC chain unavailable")
+    index = hucdomain.index()
+    for hid in ids:
+        # upstream_chain has a traversal ceiling: require closure so a
+        # partial chain can never masquerade as a safe, smaller full basin.
+        if any(str(index["huc12"][i]) not in ids for i in index["_up"].get(hid, [])):
+            raise ValueError("HUC chain traversal is incomplete")
+    ii = [index["_pos"][hid] for hid in ids]
+    hb = (float(index["minx"][ii].min()), float(index["miny"][ii].min()),
+          float(index["maxx"][ii].max()), float(index["maxy"][ii].max()))
+    eb = tuple(map(float, ext["bounds"]))
+    ef5_union = (min(hb[0], eb[0]), min(hb[1], eb[1]),
+                 max(hb[2], eb[2]), max(hb[3], eb[3]))
+    estimates = {"huc_native": _native_bbox_estimate(hb),
+                 "ef5_union_native": _native_bbox_estimate(ef5_union),
+                 "full_huc_count": len(ids)}
+    return estimates, ids
+
+
+def _tick_wait_phase(phase):
+    return phase.startswith("preflight.") or phase == "retention"
+
+
+def _tick_phase(phase):
+    global _tick_phase_mono
+    stamp = _tick_stamp()
+    with _tick_state_lock:
+        _tick_state.update(phase=phase, phase_started=stamp, last_progress=stamp)
+        _tick_phase_mono = time.monotonic()
+
+
+def _tick_note_error(exc):
+    with _tick_state_lock:
+        _tick_state.update(error=type(exc).__name__, error_phase=_tick_state["phase"],
+                           last_error_at=_tick_stamp())
+
+
+def _tick_watchdog_check() -> bool:
+    """Dump each stalled network-wait phase once, to authenticated runtime logs.
+
+    faulthandler prints code paths and stack frames, never frame locals or
+    configuration. No stack data is exposed through an HTTP endpoint.
+    """
+    global _tick_watchdog_marker
+    with _tick_state_lock:
+        marker = (_tick_started_mono, _tick_phase_mono)
+        phase = _tick_state["phase"]
+        if (not _tick_state["running"] or not _tick_wait_phase(phase)
+                or _tick_phase_mono is None
+                or time.monotonic() - _tick_phase_mono < TICK_PREFLIGHT_STALL_S
+                or marker == _tick_watchdog_marker):
+            return False
+        _tick_watchdog_marker = marker
+        _tick_state.update(watchdog_dumped_at=_tick_stamp(), watchdog_phase=phase)
+    import faulthandler
+    import sys
+    print(f"event tick watchdog: wait phase {phase} unchanged for at least "
+          f"{TICK_PREFLIGHT_STALL_S}s; private thread stacks follow", file=sys.stderr, flush=True)
+    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    return True
+
+
+def _tick_watchdog(stop):
+    while not stop.wait(30):
+        try:
+            _tick_watchdog_check()
+        except Exception as exc:
+            # Keep only the exception class in runtime diagnostics as well.
+            print(f"event tick watchdog: {type(exc).__name__}", flush=True)
 
 
 def status(full: bool = False) -> dict:
@@ -125,14 +311,14 @@ def status(full: bool = False) -> dict:
             "started": _running.get("started"), "busy_h": _busy_h(),
             "log": _running["log"][-(400 if full else 30):],
             "last": _running["last"],
-            "missed": _running.get("missed", [])[-20:]}
+            "missed": _running.get("missed", [])[-20:], "tick": tick_status(),
+            "capacity_skips": capacity_status()}
 
 
 OBS_GATE_FRAC = float(os.environ.get("EVENT_OBS_GATE", "0.3"))   # of Q2
 OBS_WINDOW_H = int(os.environ.get("EVENT_OBS_WINDOW_H", "6"))
-# Outlet-discharge disagreement is advisory: it does not measure the water
-# delivered by distributed surface/interflow grids. The same severe ratio
-# selects USGS fallback at a connected upstream cut gauge (not the outlet).
+# Outlet-discharge disagreement is advisory, not a distributed-runoff volume check.
+# The same severe ratio selects observed fallback only at safe upstream cuts.
 MIN_SIM_FRAC = float(os.environ.get("EVENT_MIN_SIM_FRAC", "0.3"))
 
 
@@ -271,6 +457,8 @@ def detect(max_events: int = 1) -> list[dict]:
         reds = [m for m in cluster.get("top_gauges", []) if m.get("tier") == 3]
         cands = []
         for m in reds:
+            if _capacity_suppressed(m["id"]):
+                continue
             g = pipeline.gauge_info(m["id"])
             if not g or g["id"] in seen:
                 continue
@@ -386,6 +574,12 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     after the engine/domain changed; the box-era frames must not survive)."""
     from . import eventqueue, eventstore, nowcaststore, pipeline
 
+    suppressed = _capacity_suppressed(gid)
+    if suppressed:
+        return {"event_id": suppressed.get("event_id"), "gauge": str(gid),
+                "published": False, "skipped": "native_capacity",
+                "native_capacity": suppressed, "suppressed": True}
+
     g = pipeline.gauge_info(gid)
     if g is None:
         raise ValueError(f"unknown gauge {gid}")
@@ -410,12 +604,8 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     # slice and the publish-time frame merge keeps the record fixed-start.
     anchor = t0
     if episode_id:
-        entry = eventstore.load_index().get(episode_id) or {}
-        st = entry.get("episode_started") or ""
-        if entry.get("reopened"):
-            # reopened since its last publish: carry the mark in the trigger
-            # (spec + manifest) so later re-sims see it too
-            trigger = {**(trigger or {}), "reopened": True}
+        st = (eventstore.load_index().get(episode_id) or {}).get(
+            "episode_started") or ""
         try:
             anchor = datetime.datetime.strptime(st, "%Y-%m-%dT%H:%MZ")
         except ValueError:
@@ -425,13 +615,13 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     t_start = min(t0 - datetime.timedelta(hours=HINDCAST_H), sim_anchor)
     t_end = t0 + datetime.timedelta(hours=HORIZON_H)
     ev_id = episode_id or f"{t0:%Y%m%d%H}_{gid}"
-    work = tempfile.mkdtemp(prefix=f"event_{gid}_")
+    work = None
 
     def log(s):
         _running["log"].append(s)
 
     with _lock:
-        _running.update(id=ev_id, status="ef5", log=[],
+        _running.update(id=ev_id, status="native_capacity", log=[],
                         started=datetime.datetime.utcnow().strftime(
                             "%Y-%m-%dT%H:%M:%SZ"))
     try:
@@ -443,6 +633,30 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         ext = basinextent.ef5_extent(g)
         log(f"EF5 extent from the basin outline ({ext['source']}, "
             f"{ext['carved_km2']:,.0f} km² catchment, {ext['cells']:,} cells)")
+        if _tick_state.get("running"):
+            _tick_phase(f"preflight.native_capacity:{gid}")
+        try:
+            estimates, full_huc_ids = _native_preflight(g, ext, hucdomain)
+        except Exception as e:
+            log(f"native preparation deferred: full basin extent/chain unavailable ({type(e).__name__})")
+            return _capacity_skip(gid, ev_id, {
+                "reason": "native_domain_incomplete", "error": type(e).__name__,
+                "needs": "verified_full_basin_extent_and_huc_chain"}, retry_h=.25)
+        if max(estimates["huc_native"]["n_bbox"], estimates["ef5_union_native"]["n_bbox"]) > PREP_MAX_CELLS:
+            log(f"native preparation deferred: full HUC bbox {estimates['huc_native']['n_bbox']:,} "
+                f"cells; EF5 union {estimates['ef5_union_native']['n_bbox']:,} cells; limit "
+                f"{PREP_MAX_CELLS:,}; a larger native-grid worker/preparation host is required")
+            return _capacity_skip(gid, ev_id, {
+                "reason": "full_basin_exceeds_native_capacity", "estimates": estimates,
+                "needs": "larger_native_grid_worker_and_preparation_capacity"})
+        _capacity_clear(gid)
+        log(f"native preparation capacity: full HUC bbox {estimates['huc_native']['n_bbox']:,}; "
+            f"EF5 union {estimates['ef5_union_native']['n_bbox']:,}; limit {PREP_MAX_CELLS:,}")
+        work = tempfile.mkdtemp(prefix=f"event_{gid}_")
+        with _lock:
+            _running["status"] = "ef5"
+        if _tick_state.get("running"):
+            _tick_phase(f"run:{gid}")
         log(f"EF5 nowcast-mode run {t_start:%m-%d %H}Z -> {t_end:%m-%d %H}Z "
             f"with gridded runoff output")
         meta = {}
@@ -516,12 +730,20 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         with _lock:
             _running["status"] = "domain"
         dom = hucdomain.build_domain(g, out_dir, dem_res=DEM_RES,
-                                     max_cells=QUEUE_MAX_CELLS or None, log=log)
-        if dom.get("trimmed"):
-            log(f"GPU budget: kept {dom['n_hucs']} of {dom.get('of_n_hucs')} HUC12 "
-                f"units nearest the gauge ({dom.get('area_km2')} of "
-                f"{dom.get('of_area_km2')} km2) to fit EVENT_QUEUE_MAX_CELLS="
-                f"{QUEUE_MAX_CELLS / 1e6:.1f}M")
+                                     max_cells=0, log=log)
+        built_huc_ids = {str(row["huc12"]) for row in dom.get("hucs", [])}
+        if dom.get("trimmed") or built_huc_ids != full_huc_ids:
+            log("native domain incomplete: generation must retain the full preflight HUC chain")
+            return _capacity_skip(gid, ev_id, {
+                "reason": "native_domain_incomplete", "estimates": estimates,
+                "full_huc_count": len(full_huc_ids), "built_huc_count": len(built_huc_ids),
+                "trimmed": bool(dom.get("trimmed")),
+                "needs": "verified_full_basin_domain_without_upstream_trimming"}, retry_h=.25)
+        if int(dom.get("n_bbox") or 0) > PREP_MAX_CELLS:
+            return _capacity_skip(gid, ev_id, {
+                "reason": "full_basin_exceeds_native_capacity", "estimates": estimates,
+                "actual_domain_bbox_cells": dom["n_bbox"],
+                "needs": "larger_native_grid_worker_and_preparation_capacity"})
         basin_ring = dom["basin"]
         dom_extent = tuple(dom["bbox"])        # raster extent of the HUC12 union
         # worker spec = full anchored span (fixed episode window); the local
@@ -877,6 +1099,45 @@ def run_detected(max_events: int = 1) -> list[dict]:
 
 
 def hourly_tick() -> dict:
+    """Run one complete hourly visit; overlapping pings return immediately."""
+    global _tick_started_mono
+    note_tick_attempt()
+    if not _tick_lock.acquire(blocking=False):
+        return {"skipped": "runner busy", "tick": tick_status()}
+    stop = threading.Event()
+    result = None
+    try:
+        stamp = _tick_stamp()
+        with _tick_state_lock:
+            _tick_started_mono = time.monotonic()
+            _tick_state.update(running=True, started=stamp, error=None, error_phase=None,
+                               outcome=None)
+        _tick_phase("preflight.runner")
+        threading.Thread(target=_tick_watchdog, args=(stop,), daemon=True,
+                         name="event-tick-watchdog").start()
+        if _running["id"]:
+            result = {"skipped": "runner busy"}
+        else:
+            result = _hourly_tick_body()
+        return result
+    except BaseException as exc:
+        _tick_note_error(exc)
+        raise
+    finally:
+        stop.set()
+        stamp = _tick_stamp()
+        with _tick_state_lock:
+            outcome = ("error" if _tick_state["error"] else
+                       "skipped" if result and result.get("skipped") else "ok")
+            _tick_state.update(running=False, completed=stamp, outcome=outcome,
+                               phase="failed" if outcome == "error" else "idle",
+                               phase_started=stamp, last_progress=stamp)
+            if outcome == "ok":
+                _tick_state["last_success"] = stamp
+        _tick_lock.release()
+
+
+def _hourly_tick_body() -> dict:
     """Called by the updater after each hourly data refresh.
 
     1. Every ACTIVE episode whose gauge is still at/above EVENT_CONT_TIER, or
@@ -890,16 +1151,17 @@ def hourly_tick() -> dict:
     Runs at most EVENT_MAX_PER_TICK simulations, sequentially.
     """
     from . import eventstore, nowcaststore
-    note_tick_attempt()                            # health: tick liveness
+    _tick_phase("preflight.conus_state")
     try:                       # CONUS state mosaic: index the fleet's new bundles
         from . import conusstate
         conusstate.maybe_refresh()
-    except Exception:
-        pass
-    if _running["id"]:
-        return {"skipped": "runner busy"}
+    except Exception as exc:
+        _tick_note_error(exc)
+    _tick_phase("preflight.nowcast_risk")
     risk = nowcaststore.all_risk()
     tiers = (risk or {}).get("tiers") or {}
+    _capacity_reconcile({str(gid) for gid, tier in tiers.items() if int(tier or 0) >= CONT_TIER})
+    _tick_phase("preflight.event_index")
     idx = eventstore.load_index()
     now = datetime.datetime.utcnow()
 
@@ -907,11 +1169,12 @@ def hourly_tick() -> dict:
     # still flooding, so its episode is not ended in this tick (ending it and
     # opening a new id for the same detection is what fragmented floods).
     # The budget covers every active gauge plus EVENT_MAX_PER_TICK new ones.
+    _tick_phase("preflight.detect")
     try:
         picks = detect(MAX_PER_TICK + sum(
             1 for s in idx.values() if s.get("status", "active") == "active"))
-    except Exception as e:
-        print(f"event tick: detection failed ({type(e).__name__}: {e})")
+    except Exception as exc:
+        _tick_note_error(exc)
         picks = []
     detected = {p["gauge"] for p in picks}
 
@@ -931,11 +1194,20 @@ def hourly_tick() -> dict:
         # recent USGS max is >= CONT_OBS_MULT x baseflow. AI tier only backs
         # up a gauge that went silent (obs None). A re-detected gauge goes on
         # regardless (detect() just read its observations).
+        _tick_phase(f"preflight.episode_observations:{gid}")
         obs = _recent_obs_max(gid) if gid and gid not in detected else None
         qbase = None
         try:
-            qbase = float((nowcaststore._thresholds().get(gid) or {}
-                           ).get("qbase") or 0) or None
+            _tick_phase(f"preflight.episode_thresholds:{gid}")
+            threshold = nowcaststore._thresholds().get(gid)
+            # Live threshold rows are (qbase, q2, q5, q10); older callers
+            # and fixtures provide a dictionary. Preserve observation-led
+            # episode continuation for both representations.
+            value = (threshold[0] if isinstance(threshold, (tuple, list)) and threshold
+                     else (threshold or {}).get("qbase"))
+            qbase = float(value or 0)
+            if not math.isfinite(qbase) or qbase <= 0:
+                qbase = None
         except Exception:
             pass
         if obs is not None and qbase:
@@ -943,6 +1215,8 @@ def hourly_tick() -> dict:
         else:
             still_high = tier >= CONT_TIER
         if gid and (still_high or gid in detected) and age_h <= MAX_EPISODE_H:
+            if _capacity_suppressed(gid):
+                continue  # keep the episode intact; capacity is not recession.
             # publish progress stale + nobody claiming -> this re-sim runs
             # on the CPU rung (V30 demotion: last resort, not default). A
             # reopened episode's clock starts at the reopen: its last publish
@@ -962,6 +1236,7 @@ def hourly_tick() -> dict:
         else:
             ended.append(eid)
     if ended:
+        _tick_phase("preflight.mark_ended")
         eventstore.mark_ended(ended)     # fast: stops re-sims immediately
 
     from . import eventqueue as _eq
@@ -970,21 +1245,30 @@ def hourly_tick() -> dict:
     for pick in picks:
         if len(fresh) >= MAX_PER_TICK:
             break
+        if _capacity_suppressed(pick["gauge"]):
+            continue
         if pick["gauge"] in active_gauges:
             continue
+        _tick_phase(f"preflight.queue_gauge:{pick['gauge']}")
         if _eq.mode() == "on" and _eq.gauge_pending(pick["gauge"]):
             continue           # already in the worker queue (index lags it)
         # never an id ended in this tick: its finalize thread starts below
         prev = _reopen_candidate(idx, pick["gauge"], now, skip=ended)
         # a worker is mid-solve on it, or its spec waits in the queue
         # unclaimed (a cold re-run: gauge_pending ignores those) — run_one
-        # would replace that spec; the queued job's publish reactivates it
-        if prev and _eq.mode() == "on" and (_eq.claim_fresh_for(prev)
-                                            or _eq._spec(prev)):
-            continue
+        # would replace that spec; the queued job's publish reactivates it.
+        # An unreadable queue counts as queued: the next tick retries.
+        if prev and _eq.mode() == "on":
+            try:
+                queued = _eq.claim_fresh_for(prev) or _eq._spec(prev, strict=True)
+            except Exception:
+                queued = True
+            if queued:
+                continue
         fresh.append((pick, prev))
     reopened, superseded, refused, failed = set(), set(), set(), set()
     if any(prev for _, prev in fresh):
+        _tick_phase("preflight.reopen")
         want = [p for _, p in fresh if p]
         got = eventstore.reopen_episodes(want, superseded=superseded,
                                          refused=refused)
@@ -996,11 +1280,9 @@ def hourly_tick() -> dict:
         if prev in reopened:
             print(f"event tick: {pick['gauge']} flagged again — episode {prev} "
                   f"reopened (ended < {REOPEN_H:g} h ago)")
-            # "reopened" spares the finalized record from the CREST-miss purge
             new_picks.append({"gauge": pick["gauge"], "episode": prev,
                               "trigger": {**(idx[prev].get("trigger") or {}),
-                                          "tier": int(tiers.get(pick["gauge"], 0)),
-                                          "reopened": True}})
+                                          "tier": int(tiers.get(pick["gauge"], 0))}})
         elif prev in superseded:
             # the fresh index has a newer or active episode at this gauge (or
             # merged prev into one) since this tick read it: that episode is
@@ -1028,6 +1310,7 @@ def hourly_tick() -> dict:
             and (_age_days_started(s) or 99.0) < 3.0 and e not in reopened]
     to_final = ended + [e for e in heal if e not in ended]
     if to_final:
+        _tick_phase("preflight.finalize_dispatch")
         threading.Thread(target=eventstore.finalize_episodes,
                          args=(to_final, print), daemon=True).start()
     # V30 CPU-rung last resort: queued bundles that were never published
@@ -1036,8 +1319,11 @@ def hourly_tick() -> dict:
     # when every worker is dead or busy. t0 comes from the event id so a
     # backdated refill keeps its window.
     if _eq.mode() == "on":
+        _tick_phase("preflight.queue_status")
         for row in _eq.queue_status():
             rid, rgid = str(row.get("id") or ""), str(row.get("gauge") or "")
+            if _capacity_suppressed(rgid):
+                continue
             if (not rgid or row.get("worker") or rid in idx
                     or rgid in active_gauges
                     or any(p["gauge"] == rgid for p in new_picks)):
@@ -1064,25 +1350,29 @@ def hourly_tick() -> dict:
     # starved every new trigger — Indiana flooded for two days unmapped
     # while the runner refreshed two known basins.)
     jobs = (new_picks[:1] + jobs + new_picks[1:])
-    if len(jobs) > MAX_PER_TICK:
-        starved = jobs[MAX_PER_TICK:]
-        print(f"event tick: {len(starved)} job(s) wait for a slot: "
-              f"{[j['gauge'] for j in starved]}")
-
     results = []
-    for j in jobs[:MAX_PER_TICK]:
+    for j in jobs:
+        if len(results) >= MAX_PER_TICK:
+            break
         try:
+            _tick_phase(f"run:{j['gauge']}")
             m = run_one(j["gauge"], t0=j.get("t0"), trigger=j["trigger"],
                         episode_id=j["episode"],
                         force_cpu=bool(j.get("force_cpu")))
+            if m.get("skipped") == "native_capacity":
+                continue  # a deferred map does not consume a simulation slot.
             results.append({"event_id": m.get("event_id"),
                             "published": m.get("published")})
         except Exception as e:
+            _tick_note_error(e)
             results.append({"gauge": j["gauge"],
                             "error": f"{type(e).__name__}: {e}"})
     try:                       # age out old events (no-op most hours)
+        _tick_phase("retention")
         swept = eventstore.retention_sweep()
-    except Exception:
+    except Exception as exc:
+        _tick_note_error(exc)
         swept = 0
+    blocked = [row for row in capacity_status() if row.get("relevant", True)]
     return {"ran": len(results), "ended": ended, "swept": swept,
-            "results": results}
+            "results": results, "capacity_blocked": len(blocked), "capacity_skips": blocked}

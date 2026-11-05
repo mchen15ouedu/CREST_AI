@@ -28,6 +28,22 @@ def write_grid(path, a, west, north, nodata=-9999.0, res=RES):
         dst.write(a, 1)
 
 
+def huc_chain_api(bounds, huc12="123", upstream=()):
+    """hucdomain's metadata calls behind eventsim's native-capacity preflight
+    (gauge_huc12 / upstream_chain / index) for a one-unit HUC12 chain with
+    (w, s, e, n) `bounds`. `upstream`: units the index lists upstream of it
+    that the chain leaves out — a traversal that stopped short."""
+    w, s, e, n = bounds
+    ids = [huc12, *upstream]
+    index = {"huc12": np.array(ids), "_pos": {h: i for i, h in enumerate(ids)},
+             "_up": {huc12: list(range(1, len(ids)))} if upstream else {},
+             "minx": np.full(len(ids), w), "miny": np.full(len(ids), s),
+             "maxx": np.full(len(ids), e), "maxy": np.full(len(ids), n)}
+    return {"gauge_huc12": lambda lat, lon: huc12,
+            "upstream_chain": lambda h0: [{"huc12": huc12, "depth": 0}],
+            "index": lambda: index}
+
+
 ROWS = [
     # id, kind, status, source, flags, area, snap_lat, snap_lon, snap_area, carved, w,s,e,n, cells
     ("05467000", "g", "ok", "gages2", "", 448.6, 41.2, -90.5, 433.6, 433.4,

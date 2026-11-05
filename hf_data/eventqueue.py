@@ -33,6 +33,7 @@ import json
 import os
 import tarfile
 import tempfile
+import threading
 import time
 
 from . import eventstore
@@ -97,9 +98,7 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
                CommitOperationAdd(f"{QPREFIX}/{event_id}.forcing.tar.gz",
                                   tar_path)]
         try:
-            existing = [f for f in api.list_repo_files(eventstore.REPO,
-                                                       repo_type="dataset")
-                        if f.startswith(f"{QPREFIX}/")]
+            existing = _queue_files(api)
         except Exception:
             existing = []
         # The id timestamp is the EPISODE START, which an active episode keeps
@@ -116,12 +115,12 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
 
         def _entry_idle_and_old(eid: str) -> bool:
             if eid not in claim_ok:
-                claim_ok[eid] = _fresh(_claim(eid))
+                claim_ok[eid] = _fresh(_claim(eid, strict=True))
             if claim_ok[eid]:
                 return False
             if eid not in spec_age_h:
                 age = float("inf")                # spec gone -> orphan, sweep
-                sp = _spec(eid)
+                sp = _spec(eid, strict=True)
                 if sp:
                     try:
                         age = (datetime.datetime.utcnow() -
@@ -180,41 +179,105 @@ def enqueue(event_id: str, spec: dict, ef5_dir: str, log=print) -> bool:
             pass
 
 
-_qs_cache: dict = {"t": 0.0, "rows": []}
+# Queue status must not block HTTP status routes behind Hub reads or cache locks.
+_QUEUE_READ_TIMEOUT = (5, 15)
+_qs_cache: dict = {"t": 0.0, "success_t": None, "rows": [], "error": None}
+_qs_refresh_lock = threading.Lock()
+
+
+def _read_headers():
+    from huggingface_hub.utils import build_hf_headers
+    return build_hf_headers(token=os.environ.get("HF_TOKEN"))
+
+
+def _queue_files(api) -> list[str]:
+    """Read only the queue tree, with bounded requests and explicit 404-empty."""
+    import requests
+    from urllib.parse import quote, urlsplit
+    endpoint = api.endpoint.rstrip("/")
+    url = (f"{endpoint}/api/datasets/{quote(eventstore.REPO, safe='/')}/tree/main/"
+           f"{quote(QPREFIX, safe='/')}")
+    origin = urlsplit(endpoint)
+    paths, seen = [], set()
+    for page in range(20):
+        if url in seen or (urlsplit(url).scheme, urlsplit(url).netloc) != (origin.scheme, origin.netloc):
+            raise RuntimeError("invalid queue-tree pagination link")
+        seen.add(url)
+        response = requests.get(url, headers=_read_headers(),
+                                params={"recursive": "false", "expand": "false", "limit": 1000}
+                                if page == 0 else None,
+                                timeout=_QUEUE_READ_TIMEOUT)
+        if response.status_code == 404 and page == 0:
+            return []
+        response.raise_for_status()
+        entries = response.json()
+        if not isinstance(entries, list):
+            raise ValueError("queue-tree response is not a list")
+        paths.extend(item["path"] for item in entries
+                     if item.get("type") == "file"
+                     and item.get("path", "").startswith(QPREFIX + "/"))
+        url = (response.links.get("next") or {}).get("url")
+        if not url:
+            return paths
+    raise RuntimeError("queue tree exceeded bounded pagination")
+
+
+def _cached_queue_rows():
+    # A stalled refresh must not leave an expired heartbeat marked active.
+    return [dict(row, worker=row.get("worker") if row.get("worker") and row.get("hb")
+                 and _fresh({"hb": row.get("hb")}) else None)
+            for row in _qs_cache["rows"]]
+
+
+def _refresh_queue_status():
+    try:
+        rows = []
+        api = eventstore._api()
+        if api is None:
+            raise RuntimeError("queue API is unavailable")
+        if api is not None:
+            files = _queue_files(api)
+            ids = sorted({os.path.basename(f)[:-5] for f in files
+                          if f.endswith(".json") and not f.endswith(".failed.json")})
+            for ev in ids:
+                sp = _spec(ev, strict=True)
+                if sp is None:  # A worker can consume it during this read.
+                    continue
+                c = _claim(ev, strict=True) if f"{QPREFIX}/{ev}.claim" in files else None
+                rows.append({"id": ev, "gauge": (sp.get("gauge") or {}).get("id"),
+                             "queued": sp.get("queued"),
+                             "worker": (c or {}).get("worker") if _fresh(c) else None,
+                             "hb": (c or {}).get("hb")})
+        now = time.time()
+        _qs_cache.update(t=now, success_t=now, rows=rows, error=None)
+    except Exception as exc:
+        # Retain the last successful view; never report a transport error as
+        # a successfully empty queue. Existing caller return type is preserved.
+        _qs_cache.update(t=time.time(), error=type(exc).__name__)
+    finally:
+        _qs_refresh_lock.release()
 
 
 def queue_status() -> list[dict]:
-    """Dashboard view of in-flight work: every queued spec with its claim
-    state — [{id, gauge, queued, worker}] (worker None = waiting). Cached
-    60 s; the event panel polls /api/events every ~20 s."""
-    now = time.time()
-    if now - _qs_cache["t"] < 60:
-        return _qs_cache["rows"]
-    rows = []
-    api = eventstore._api()
-    if api is not None:
+    """Cached queue view; refresh in one background thread, never in HTTP calls."""
+    if time.time() - _qs_cache["t"] >= 60 and _qs_refresh_lock.acquire(blocking=False):
         try:
-            files = [f for f in api.list_repo_files(eventstore.REPO,
-                                                    repo_type="dataset")
-                     if f.startswith(f"{QPREFIX}/")]
-            ids = sorted({os.path.basename(f)[:-5] for f in files
-                          if f.endswith(".json")
-                          and not f.endswith(".failed.json")})
-            for ev in ids:
-                sp = _spec(ev) or {}
-                c = _claim(ev) if f"{QPREFIX}/{ev}.claim" in files else None
-                rows.append({"id": ev,
-                             "gauge": (sp.get("gauge") or {}).get("id"),
-                             "queued": sp.get("queued"),
-                             "worker": (c or {}).get("worker")
-                             if _fresh(c) else None,
-                             # last heartbeat even if stale — health's
-                             # "when was any worker last alive" signal
-                             "hb": (c or {}).get("hb")})
+            threading.Thread(target=_refresh_queue_status, daemon=True,
+                             name="event-queue-status").start()
         except Exception:
-            pass
-    _qs_cache.update(t=now, rows=rows)
-    return rows
+            _qs_refresh_lock.release()
+            raise
+    return _cached_queue_rows()
+
+
+def queue_status_meta() -> dict:
+    """Read-only freshness of the cached view; no Hub access or refresh wait."""
+    succeeded = _qs_cache["success_t"]
+    return {"initialized": succeeded is not None,
+            "last_success_utc": (datetime.datetime.utcfromtimestamp(succeeded).strftime(_TS)
+                                 if succeeded is not None else None),
+            "age_s": max(0.0, time.time() - succeeded) if succeeded is not None else None,
+            "refreshing": _qs_refresh_lock.locked(), "error": _qs_cache["error"]}
 
 
 def claim_fresh_for(event_id: str) -> str | None:
@@ -233,7 +296,7 @@ def gauge_pending(gid: str) -> str | None:
     if api is None:
         return None
     try:
-        files = api.list_repo_files(eventstore.REPO, repo_type="dataset")
+        files = _queue_files(api)
     except Exception:
         return None
     suffix = f"_{gid}.json"
@@ -269,24 +332,31 @@ def _wake_workers(log=print):
     log(f"queue: pinged {len(urls)} worker Space(s) awake")
 
 
-def _claim(event_id: str) -> dict | None:
-    return _qjson(f"{event_id}.claim")
+def _claim(event_id: str, strict: bool = False) -> dict | None:
+    return _qjson(f"{event_id}.claim", strict=strict)
 
 
-def _spec(event_id: str) -> dict | None:
-    return _qjson(f"{event_id}.json")
+def _spec(event_id: str, strict: bool = False) -> dict | None:
+    return _qjson(f"{event_id}.json", strict=strict)
 
 
-def _qjson(basename: str) -> dict | None:
+def _qjson(basename: str, strict: bool = False) -> dict | None:
+    """Small queue documents need bounded HTTP, not a shared disk-cache lock."""
     try:
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(eventstore.REPO, f"{QPREFIX}/{basename}",
-                            repo_type="dataset",
-                            token=os.environ.get("HF_TOKEN"),
-                            force_download=True)
-        with open(p, encoding="utf-8") as fp:
-            return json.load(fp)
+        import requests
+        from huggingface_hub import hf_hub_url
+        url = hf_hub_url(eventstore.REPO, f"{QPREFIX}/{basename}", repo_type="dataset")
+        response = requests.get(url, headers=_read_headers(), timeout=_QUEUE_READ_TIMEOUT)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        value = response.json()
+        if not isinstance(value, dict):
+            raise ValueError("queue document is not an object")
+        return value
     except Exception:
+        if strict:
+            raise
         return None
 
 

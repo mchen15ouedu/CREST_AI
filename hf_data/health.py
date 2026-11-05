@@ -37,6 +37,7 @@ TICK_MAX_H = float(os.environ.get("HEALTH_TICK_MAX_H", "2"))
 # (2026-08-17) and the tick age alone could not say busy from dead
 WEDGE_MAX_H = float(os.environ.get("HEALTH_WEDGE_MAX_H", "4"))
 UNCLAIMED_MAX_H = float(os.environ.get("HEALTH_UNCLAIMED_MAX_H", "6"))
+QUEUE_REFRESH_MAX_S = 120.0
 
 _cache = {"t": 0.0, "snap": None}
 _lock = threading.Lock()
@@ -77,10 +78,91 @@ def _newest_publish_h() -> float | None:
         return None
 
 
+def _local_tick_health(last_publish_h=None, refresh_publish=False):
+    """Read whole-tick liveness from memory, separately from ping arrivals."""
+    from . import eventsim
+    progress = eventsim.tick_status()
+    lt = progress.get("last_attempt") or eventsim._running.get("last_tick")
+    age = _age_h(lt or "", "%Y-%m-%dT%H:%M:%SZ")
+    ages = [value for value in (progress.get("busy_h"), eventsim._busy_h())
+            if value is not None]
+    busy = max(ages) if ages else None
+    wedged = bool(progress.get("stalled") or (busy is not None and busy > WEDGE_MAX_H))
+    uptime_h = round((time.time() - _PROC_START) / 3600.0, 2)
+    failed = progress.get("outcome") == "error" and not progress.get("running")
+    capacity_blocked = int(progress.get("capacity_blocked") or 0)
+    tick = {"last": lt, "age_h": age,
+            "running": eventsim._running.get("id"),
+            "tick_running": bool(progress.get("running")), "busy_h": busy, "wedged": wedged,
+            "uptime_h": uptime_h, "started": progress.get("started"),
+            "completed": progress.get("completed"), "last_success": progress.get("last_success"),
+            "phase": progress.get("phase"), "phase_started": progress.get("phase_started"),
+            "phase_age_s": progress.get("phase_age_s"), "preflight": progress.get("preflight"),
+            "watched_wait": progress.get("watched_wait"),
+            "last_progress": progress.get("last_progress"), "outcome": progress.get("outcome"),
+            "error": progress.get("error"), "error_phase": progress.get("error_phase"),
+            "last_error_at": progress.get("last_error_at")}
+    tick["capacity_blocked"] = capacity_blocked
+    tick["capacity_skips"] = [row for row in progress.get("capacity_skips", [])
+                              if row.get("relevant", True)]
+    if age is not None:
+        tick["ok"] = age <= TICK_MAX_H and not wedged and not failed and not capacity_blocked
+    else:
+        pub = _newest_publish_h() if refresh_publish else last_publish_h
+        tick["last_publish_h"] = pub
+        if pub is not None and pub <= TICK_MAX_H:
+            tick.update(ok=not wedged and not failed and not capacity_blocked, via="publish")
+        elif uptime_h < TICK_MAX_H:
+            tick.update(ok=not wedged and not failed and not capacity_blocked, warming=True)
+        else:
+            tick["ok"] = False
+    return tick
+
+
+def _queue_read_health():
+    from . import eventqueue
+    meta = eventqueue.queue_status_meta()
+    age = meta.get("age_s")
+    fresh = bool(meta.get("initialized") and age is not None
+                 and age <= QUEUE_REFRESH_MAX_S and not meta.get("error"))
+    return {"read": meta, "initialized": bool(meta.get("initialized")), "fresh": fresh}
+
+
+def _overall_ok(out):
+    return all(out.get(k, {}).get("ok", True)
+               for k in ("nowcast", "mrms", "forcing", "tick", "queue", "runner_space"))
+
+
+def _memory_overlay(cached):
+    """Keep progress/error state current while slow feed checks stay cached."""
+    out = dict(cached)
+    if not os.environ.get("EVENT_RUNNER_URL", "").rstrip("/"):
+        try:
+            out["tick"] = _local_tick_health((out.get("tick") or {}).get("last_publish_h"))
+        except Exception as exc:
+            out["tick"] = {"ok": False, "error": type(exc).__name__}
+        try:
+            read = _queue_read_health()
+            queue = dict(out.get("queue") or {})
+            queue.update(read)
+            queue["ok"] = read["fresh"] and "depth" in queue and "oldest_unpublished_h" in queue and (
+                queue.get("oldest_unpublished_h") is None
+                or queue["oldest_unpublished_h"] <= UNCLAIMED_MAX_H)
+            out["queue"] = queue
+        except Exception as exc:
+            out["queue"] = {**(out.get("queue") or {}), "ok": False,
+                            "error": type(exc).__name__}
+    out["ok"] = _overall_ok(out)
+    return out
+
+
 def snapshot() -> dict:
+    cached = None
     with _lock:
         if _cache["snap"] is not None and time.time() - _cache["t"] < 120:
-            return _cache["snap"]
+            cached = _cache["snap"]
+    if cached is not None:
+        return _memory_overlay(cached)
     out = {"checked": datetime.datetime.utcnow().strftime(
         "%Y-%m-%dT%H:%M:%SZ")}
 
@@ -135,33 +217,7 @@ def snapshot() -> dict:
         out["runner_space"] = {"ok": True, "url": runner_url}
     else:
         try:
-            from . import eventsim
-            lt = eventsim._running.get("last_tick")
-            age = _age_h(lt or "", "%Y-%m-%dT%H:%M:%SZ")
-            busy = eventsim._busy_h()
-            wedged = busy is not None and busy > WEDGE_MAX_H
-            uptime_h = round((time.time() - _PROC_START) / 3600.0, 2)
-            tick = {"last": lt, "age_h": age,
-                    "running": eventsim._running.get("id"),
-                    "busy_h": busy, "wedged": wedged,
-                    "uptime_h": uptime_h}
-            if age is not None:
-                tick["ok"] = age <= TICK_MAX_H and not wedged
-            else:
-                # no ping since this container booted: fall back to the last
-                # publish, then to uptime. Only call it dead once the process
-                # has been up long enough that a ping was actually due.
-                pub = _newest_publish_h()
-                tick["last_publish_h"] = pub
-                if pub is not None and pub <= TICK_MAX_H:
-                    tick["ok"] = not wedged
-                    tick["via"] = "publish"
-                elif uptime_h < TICK_MAX_H:
-                    tick["ok"] = not wedged
-                    tick["warming"] = True
-                else:
-                    tick["ok"] = False
-            out["tick"] = tick
+            out["tick"] = _local_tick_health(refresh_publish=True)
         except Exception as e:
             out["tick"] = {"ok": False, "error": type(e).__name__}
         try:
@@ -196,6 +252,9 @@ def snapshot() -> dict:
                             "mode": eventqueue.mode(),
                             "ok": oldest_pending is None
                             or oldest_pending <= UNCLAIMED_MAX_H}
+            read = _queue_read_health()
+            out["queue"].update(read)
+            out["queue"]["ok"] = out["queue"]["ok"] and read["fresh"]
             out["workers"] = {"last_heartbeat_h": min(hbs) if hbs else None,
                               "active_claims": sum(1 for r in rows
                                                    if r.get("worker"))}
@@ -241,9 +300,7 @@ def snapshot() -> dict:
     except Exception as e:
         out["user_ops"] = {"error": type(e).__name__}
 
-    out["ok"] = all(out.get(k, {}).get("ok", True)
-                    for k in ("nowcast", "mrms", "forcing", "tick", "queue",
-                              "runner_space"))
+    out["ok"] = _overall_ok(out)
     with _lock:
         _cache.update(t=time.time(), snap=out)
     return out

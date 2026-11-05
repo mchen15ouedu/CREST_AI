@@ -155,8 +155,10 @@ def test_no_box_left_in_model_code():
     and nowcast_eval/ belongs to the separate basin-rainfall plan.)"""
     import re
     from conftest import ROOT
+    # a *domain_bbox_cells field is a cell count (eventsim's native-capacity
+    # record of the HUC12 domain raster), not an extent
     pat = re.compile(r"def basin_bbox|pipeline\.basin_bbox|import basin_bbox|"
-                     r"1\.2\s*\*\s*math\.sqrt|domain_bbox")
+                     r"1\.2\s*\*\s*math\.sqrt|domain_bbox(?!_cells)")
     hits = []
     for sub in ("hf_data", "fleet", "autocal", "fleet_space", "ungauged_space",
                 "autocal_space", "gpu_worker_space"):

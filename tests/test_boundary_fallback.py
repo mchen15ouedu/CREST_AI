@@ -9,6 +9,7 @@ import pytest
 import rasterio
 from rasterio.transform import from_origin
 
+from conftest import huc_chain_api
 from hf_data import boundary_fallback as bf
 
 
@@ -199,6 +200,12 @@ def test_non_30m_request_rejected():
         bf.prepare({}, "unused", {}, T0, T0 + dt.timedelta(hours=1), dem_res="13")
 
 
+def test_trimmed_parent_basin_rejected():
+    # protocol 2: upstream runoff-generating branches are never dropped
+    with pytest.raises(ValueError, match="untrimmed parent basin"):
+        bf.prepare({}, "unused", {"trimmed": True}, T0, T0 + dt.timedelta(hours=1))
+
+
 def test_changed_q_lattice_aborts_before_cutting(tmp_path, monkeypatch):
     gauge, out = fake_data(tmp_path, monkeypatch)
     path = out / "q.20261023_0100.crest.tif"
@@ -225,11 +232,17 @@ def test_outlet_disagreement_still_queues_and_preserves_prior_results(tmp_path, 
     set_module("pipeline", types.SimpleNamespace(gauge_info=lambda gid: {"id": gid, "lat": 38, "lon": -107},
                                                  run_gauge=run_gauge))
     set_module("nowcaststore", types.SimpleNamespace())
+    bounds = (-107.0, 37.9, -106.9, 38.0)
     set_module("basinextent", types.SimpleNamespace(ef5_extent=lambda g: {
-        "source": "test", "carved_km2": 10, "cells": 9}))
+        "source": "test", "carved_km2": 10, "cells": 9, "bounds": bounds}))
     domain = {"n_hucs": 1, "hucs": [{"huc12": "123"}], "basin": [[38, -107]],
               "bbox": [-107, 37, -106, 38], "n_bbox": 9}
-    set_module("hucdomain", types.SimpleNamespace(build_domain=lambda *a, **kw: domain, DomainError=RuntimeError))
+    # the native-capacity preflight reads the full HUC12 chain first
+    set_module("hucdomain", types.SimpleNamespace(build_domain=lambda *a, **kw: domain,
+                                                  DomainError=RuntimeError,
+                                                  **huc_chain_api(bounds)))
+    monkeypatch.setattr(eventsim, "_capacity_skips", {})
+    monkeypatch.setattr(eventsim, "_capacity_retry", {})
     def forbid_delete(*args, **kw):
         pytest.fail("outlet Q advisory must never delete or disown a result")
     set_module("eventstore", types.SimpleNamespace(drop_events=forbid_delete, note_missed=forbid_delete))

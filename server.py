@@ -817,6 +817,14 @@ def api_events(full: int = 0):
                      f"resolve/main/{eventstore.PREFIX}")}
 
 
+@app.get("/api/runner_status")
+async def api_runner_status(full: int = 0):
+    """In-memory dispatch progress; remains readable during dataset outages."""
+    from hf_data import eventqueue, eventsim
+    return {"runner": eventsim.status(bool(full)), "tick": eventsim.tick_status(),
+            "queue": eventqueue.queue_status_meta()}
+
+
 @app.get("/api/merger_status")
 def api_merger_status():
     """Always-on episode merger (hf_data/eventmerger.py; EPISODE_MERGER=1 on
@@ -896,6 +904,10 @@ def api_event_tick():
                              "crestimap not installed on this Space build"},
                             status_code=501)
     from hf_data import eventsim
+    tick = eventsim.tick_status()
+    if tick["running"]:
+        eventsim.note_tick_attempt()
+        return {"ok": False, "reason": "tick busy", "tick": tick}
     if eventsim.status()["running"]:
         # stamp liveness even here: the ping IS arriving, we are just busy.
         # Without this a wedged runner looked identical to a dead tick loop.
@@ -945,6 +957,10 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0,
                             status_code=501)
     from hf_data import eventsim
     st = eventsim.status()
+    tick = eventsim.tick_status()
+    if tick["running"]:
+        return {"ok": False, "reason": "an hourly event tick is already running",
+                "tick": tick, **st}
     if st["running"]:
         return {"ok": False, "reason": "an event simulation is already running",
                 **st}

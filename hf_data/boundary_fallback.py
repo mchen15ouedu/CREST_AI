@@ -282,6 +282,11 @@ def prepare(gauge, output_dir, domain, start, end, *, dem_res="1",
     """
     if str(dem_res) != "1":
         raise ValueError("event boundary policy requires nominal 30 m DEM_RES=1")
+    if domain.get("trimmed"):
+        raise ValueError(
+            "boundary protocol 2 requires an untrimmed parent basin: "
+            "all upstream runoff-generating branches must remain present "
+            "unless explicitly replaced by complete gauge boundary inputs")
     if not 0 < min_ratio < 1:
         raise ValueError("boundary minimum ratio must lie strictly between 0 and 1")
     import rasterio
