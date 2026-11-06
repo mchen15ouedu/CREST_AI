@@ -239,9 +239,13 @@ _last_check = 0.0
 def maybe_refresh(min_age_h: float = 24.0) -> None:
     """Keep the index current with the growing fleet: a background refresh at
     most every min_age_h. Called from the event runner's hourly tick — ONE
-    Space writes the index, so there is never a second writer to collide with."""
+    Space writes the index, so there is never a second writer to collide with.
+    CREST_MOSAIC_REFRESH=0 skips it: a tick host whose token cannot write
+    CREST_fleet (the index is the tick's only write outside CREST_data) would
+    otherwise read every new bundle's footer daily and then fail the commit."""
     global _last_check
-    if time.time() - _last_check < min_age_h * 3600 or not _token():
+    if (os.environ.get("CREST_MOSAIC_REFRESH", "1").strip() == "0"
+            or time.time() - _last_check < min_age_h * 3600 or not _token()):
         return
     _last_check = time.time()
 

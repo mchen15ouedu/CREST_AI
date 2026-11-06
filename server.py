@@ -781,6 +781,21 @@ def _remote_runner_status():
     return _runner_cache["status"]
 
 
+def _tick_host_runner():
+    """EVENT_TICK off and no job of this Space's own running: the runner state
+    the tick host publishes (events/tick_status.json; the Jetstream2 VM since
+    2026-11-05), else None. Blocking read, cached 60 s."""
+    if os.environ.get("EVENT_TICK", "1") == "1":
+        return None
+    from hf_data import eventsim, tickstatus
+    if eventsim._running.get("id"):              # a manual /api/event_run here
+        return None
+    try:
+        return tickstatus.remote_runner()
+    except Exception:
+        return None
+
+
 @app.get("/api/events")
 def api_events(full: int = 0):
     """V25: published 2-D inundation events (CREST-iMAP v2) + runner state.
@@ -794,7 +809,8 @@ def api_events(full: int = 0):
         q = eventqueue.queue_status()
     except Exception:
         q = []
-    runner = _remote_runner_status() or eventsim.status(bool(full))
+    runner = (_remote_runner_status() or _tick_host_runner()
+              or eventsim.status(bool(full)))
     try:                       # CREST misses: trigger fired, EF5 did not
         missed = eventstore.load_missed()[-30:]
     except Exception:
@@ -819,10 +835,22 @@ def api_events(full: int = 0):
 
 @app.get("/api/runner_status")
 async def api_runner_status(full: int = 0):
-    """In-memory dispatch progress; remains readable during dataset outages."""
+    """In-memory dispatch progress; remains readable during dataset outages.
+    EVENT_TICK off (the tick runs on another host, the Jetstream2 VM since
+    2026-11-05): runner + tick are that host's published status
+    (events/tick_status.json, read off the event loop, cached 60 s; both None
+    while it is unreadable, tick_status says why), tick_source "remote"; a
+    manual run of this Space's own shows as local_runner."""
     from hf_data import eventqueue, eventsim
+    if os.environ.get("EVENT_TICK", "1") != "1":
+        from hf_data import tickstatus
+        out = await asyncio.to_thread(tickstatus.remote_status)
+        if eventsim._running.get("id"):
+            out["local_runner"] = eventsim.status(bool(full))
+        out["queue"] = eventqueue.queue_status_meta()
+        return out
     return {"runner": eventsim.status(bool(full)), "tick": eventsim.tick_status(),
-            "queue": eventqueue.queue_status_meta()}
+            "queue": eventqueue.queue_status_meta(), "tick_source": "local"}
 
 
 @app.get("/api/merger_status")
@@ -903,7 +931,14 @@ def api_event_tick():
         return JSONResponse({"ok": False, "reason":
                              "crestimap not installed on this Space build"},
                             status_code=501)
-    from hf_data import eventsim
+    from hf_data import eventsim, tickstatus
+    # ticks never run on two hosts (PI 2026-11-05): while another host (the
+    # Jetstream2 VM) publishes a fresh, not-stopped tick status, this Space
+    # does not tick - `systemctl stop crest-events` there publishes "stopped"
+    elsewhere = tickstatus.ticking_elsewhere()
+    if elsewhere:
+        return {"ok": False, "reason": f"event tick runs on {elsewhere['host']}",
+                "tick_status": elsewhere}
     tick = eventsim.tick_status()
     if tick["running"]:
         eventsim.note_tick_attempt()
@@ -936,7 +971,11 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0,
     id (anchored at its recorded start; the folder is replaced in place) —
     e.g. re-running the whole list after an engine/domain change.
     cold=1 (with episode): no warm-start frame — the whole anchored span is
-    re-solved and every published frame replaced."""
+    re-solved and every published frame replaced.
+    EVENT_TICK off without EVENT_RUNNER_URL (the runner since the tick moved
+    to the Jetstream2 VM, 2026-11-05): while the tick host's fresh status
+    shows a tick or a run in progress, the gauge-less auto-detect and the
+    gauge it is running are refused; other gauges run here."""
     if os.environ.get("EVENT_TICK", "1") != "1" and EVENT_RUNNER_URL:
         try:                       # split dashboard: forward to the runner
             import requests
@@ -956,6 +995,20 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0,
                              "crestimap not installed on this Space build"},
                             status_code=501)
     from hf_data import eventsim
+    if os.environ.get("EVENT_TICK", "1") != "1":
+        # the tick runs on another host: its detection and its current gauge
+        # are its own. A sync handler runs in FastAPI's threadpool, so this
+        # bounded read (cached 60 s) stays off the event loop.
+        from hf_data import tickstatus
+        try:
+            remote = tickstatus.remote_status()
+        except Exception:
+            remote = {}
+        clash = tickstatus.run_conflict(
+            remote, gid or (episode.split("_", 1)[-1] if episode else ""))
+        if clash:
+            return {"ok": False, "reason": clash,
+                    "tick_status": remote.get("tick_status")}
     st = eventsim.status()
     tick = eventsim.tick_status()
     if tick["running"]:

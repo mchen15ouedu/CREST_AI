@@ -14,13 +14,20 @@ Checks:
             (restart-aware: a container younger than the
              threshold reports "warming", not STALE, and a
              fresh event publish counts as proof it ran)
+            EVENT_TICK != "1" (the tick runs elsewhere: the
+            Jetstream2 VM since 2026-11-05): the same rules on
+            the tick host's events/tick_status.json
+            (hf_data/tickstatus.py), plus STALE when that
+            file was not refreshed within the threshold (a
+            fresh file of a running tick counts as its attempt)
   queue     depth, oldest NEVER-PUBLISHED bundle age  (< 6 h unclaimed)
   workers   freshest claim heartbeat anywhere         (informational)
   events    active episodes, publishes in last 24 h   (informational)
 
 When EVENT_RUNNER_URL is set (V30 runner/dashboard split), tick+queue come
 from the runner Space's own /api/health so the dashboard reports the
-system, not itself.
+system, not itself; while the runner is unreachable the tick comes from the
+tick host's status file when one is published.
 """
 from __future__ import annotations
 
@@ -119,6 +126,94 @@ def _local_tick_health(last_publish_h=None, refresh_publish=False):
     return tick
 
 
+def _tick_here() -> bool:
+    """Does THIS process run the hourly tick (server.py's EVENT_TICK gate)?"""
+    return os.environ.get("EVENT_TICK", "1") == "1"
+
+
+def _remote_tick_health(last_publish_h=None, refresh_publish=False):
+    """_local_tick_health's rules on the tick host's published status
+    (hf_data/tickstatus.py), for a process that does not run the tick. The
+    clocks run from the published stamps; a status file not refreshed within
+    TICK_MAX_H means its publisher is gone (STALE), and a daemon that
+    published its stop is not ticking. While a tick runs, a fresh document
+    is itself the attempt: the daemon refreshes it every 15 min of a tick
+    and notes the attempts that fall due meanwhile, so a legitimate 2-4 h
+    tick is ok and only busy_h past WEDGE_MAX_H (or a daemon that published
+    "wedged") reads as wedged. Never raises."""
+    from . import tickstatus
+    doc, err = tickstatus.read_remote()
+    if doc is None:
+        pub = _newest_publish_h() if refresh_publish else last_publish_h
+        return {"ok": False, "source": "remote", "file": tickstatus.STATUS_FILE,
+                "reason": "tick status unreadable", "error": err, "last_publish_h": pub}
+    _ts = "%Y-%m-%dT%H:%M:%SZ"
+    progress = tickstatus.live_tick(doc)
+    runner = tickstatus.live_runner(doc)
+    daemon = doc.get("daemon") or {}
+    status_age = _age_h(doc.get("published_at") or "", _ts)
+    stale = status_age is None or status_age > TICK_MAX_H
+    # a restarted daemon's memory starts empty; its persisted schedule does not
+    lt = progress.get("last_attempt") or daemon.get("last_tick_started")
+    if progress.get("running") and not stale:
+        # the HF runner's busy branch stamped each hourly ping that found the
+        # tick running; here the heartbeat of a running tick says the same
+        lt = max(stamp for stamp in (lt, doc.get("published_at")) if stamp)
+    age = _age_h(lt or "", _ts)
+    ages = [value for value in (progress.get("busy_h"), runner.get("busy_h"))
+            if value is not None]
+    busy = max(ages) if ages else None
+    daemon_wedged = daemon.get("state") == "wedged"
+    wedged = bool(progress.get("stalled") or daemon_wedged
+                  or (busy is not None and busy > WEDGE_MAX_H))
+    failed = progress.get("outcome") == "error" and not progress.get("running")
+    capacity_blocked = int(progress.get("capacity_blocked") or 0)
+    stopped = daemon.get("state") == "stopped"
+    uptime_h = _age_h(daemon.get("started") or "", _ts)
+    tick = {"last": lt, "age_h": age, "running": runner.get("running"),
+            "tick_running": bool(progress.get("running")), "busy_h": busy, "wedged": wedged,
+            "uptime_h": uptime_h, "started": progress.get("started"),
+            "completed": progress.get("completed"), "last_success": progress.get("last_success"),
+            "phase": progress.get("phase"), "phase_started": progress.get("phase_started"),
+            "phase_age_s": progress.get("phase_age_s"), "preflight": progress.get("preflight"),
+            "watched_wait": progress.get("watched_wait"),
+            "last_progress": progress.get("last_progress"), "outcome": progress.get("outcome"),
+            "error": progress.get("error"), "error_phase": progress.get("error_phase"),
+            "last_error_at": progress.get("last_error_at"),
+            "capacity_blocked": capacity_blocked,
+            "capacity_skips": [row for row in progress.get("capacity_skips", [])
+                               if row.get("relevant", True)],
+            "source": "remote", "host": doc.get("host"), "file": tickstatus.STATUS_FILE,
+            "status_published": doc.get("published_at"), "status_age_h": status_age,
+            "status_read_error": err, "daemon_state": daemon.get("state"),
+            "blocked": daemon.get("blocked")}
+    bad = wedged or failed or capacity_blocked or stale or stopped
+    if stale:
+        tick["reason"] = "tick status stale"
+    elif stopped:
+        tick["reason"] = "tick daemon stopped"
+    elif daemon_wedged:
+        tick["reason"] = "tick wedged: the daemon is restarting"
+    if age is not None:
+        tick["ok"] = age <= TICK_MAX_H and not bad
+    else:
+        pub = _newest_publish_h() if refresh_publish else last_publish_h
+        tick["last_publish_h"] = pub
+        if pub is not None and pub <= TICK_MAX_H:
+            tick.update(ok=not bad, via="publish")
+        elif uptime_h is not None and uptime_h < TICK_MAX_H:
+            tick.update(ok=not bad, warming=True)
+        else:
+            tick["ok"] = False
+    return tick
+
+
+def _tick_health(last_publish_h=None, refresh_publish=False):
+    if _tick_here():
+        return _local_tick_health(last_publish_h, refresh_publish)
+    return _remote_tick_health(last_publish_h, refresh_publish)
+
+
 def _queue_read_health():
     from . import eventqueue
     meta = eventqueue.queue_status_meta()
@@ -138,7 +233,7 @@ def _memory_overlay(cached):
     out = dict(cached)
     if not os.environ.get("EVENT_RUNNER_URL", "").rstrip("/"):
         try:
-            out["tick"] = _local_tick_health((out.get("tick") or {}).get("last_publish_h"))
+            out["tick"] = _tick_health((out.get("tick") or {}).get("last_publish_h"))
         except Exception as exc:
             out["tick"] = {"ok": False, "error": type(exc).__name__}
         try:
@@ -217,7 +312,7 @@ def snapshot() -> dict:
         out["runner_space"] = {"ok": True, "url": runner_url}
     else:
         try:
-            out["tick"] = _local_tick_health(refresh_publish=True)
+            out["tick"] = _tick_health(refresh_publish=True)
         except Exception as e:
             out["tick"] = {"ok": False, "error": type(e).__name__}
         try:
@@ -262,12 +357,17 @@ def snapshot() -> dict:
             out["queue"] = {"ok": False, "error": type(e).__name__}
             out["workers"] = {}
         if runner_url:
-            # The runner owns the tick; THIS process never ticks (EVENT_TICK=0)
+            # The runner owned the tick; THIS process never ticks (EVENT_TICK=0)
             # and its uptime counts from first import, so the local reading
             # said "warming", ok:true, through the whole 2026-10-02..05 runner
-            # sleep. Unreachable runner = no tick.
-            out["tick"] = {"ok": False, "reason": "runner unreachable",
-                           "last_publish_h": _newest_publish_h()}
+            # sleep. Unreachable runner = no tick - unless the tick host
+            # publishes its status (the Jetstream2 VM since 2026-11-05): then
+            # that file, not the runner, says whether the tick lives.
+            if out["tick"].get("status_published"):
+                out["tick"]["runner_unreachable"] = True
+            else:
+                out["tick"] = {"ok": False, "reason": "runner unreachable",
+                               "last_publish_h": _newest_publish_h()}
 
     # event throughput (index reads work from any Space)
     try:
