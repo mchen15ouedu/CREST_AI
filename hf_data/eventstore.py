@@ -193,8 +193,11 @@ MISSED_KEEP = 200
 
 
 def load_missed() -> list:
-    """Recorded CREST misses (newest last): events the trigger opened but
-    EF5 did not reproduce, so no map was published. [] on any failure."""
+    """Recorded CREST outlet-Q misses (newest last): events whose EF5 peak
+    fell far short of the observed one. Historic rows: the live runner no
+    longer writes them (an outlet-Q miss is advisory, the 2-D run goes on)
+    and CREST_autocal no longer reads them; the dashboard still lists recent
+    ones. [] on any failure."""
     try:
         from huggingface_hub import hf_hub_download
         p = hf_hub_download(REPO, MISSED_FILE, repo_type="dataset",
@@ -208,8 +211,9 @@ def load_missed() -> list:
 def note_missed(rec: dict) -> bool:
     """Record one miss. One row per event id: the row carries the latest
     check's numbers plus `checks` (every hourly check so far: at, t0, frac,
-    sim/obs peaks), `n_checks` and `first_at` — the auto-calibration
-    trigger reads 'missed every hour for the whole event' from that history."""
+    sim/obs peaks), `n_checks` and `first_at`. No caller left: the outlet-Q
+    check is advisory now, and the auto-calibration trigger is a low CREST
+    1-D NSE over the episode (autocal/autocal_run.py), not a miss streak."""
     from huggingface_hub import CommitOperationAdd
     api = _api()
     if api is None:
@@ -243,10 +247,12 @@ def note_missed(rec: dict) -> bool:
 
 AUTOCAL_FILE = f"{PREFIX}/autocal.json"
 AUTOCAL_KEEP = 500
-# permanent calibrate-once ledger: autocal.json keeps only the last
-# AUTOCAL_KEEP rows, so a gauge calibrated long ago would roll off it and be
-# picked again. {gauge: {first, last, n}} of ran=True records, never truncated
-# (one small entry per calibrated gauge), committed with the record itself.
+# permanent calibration ledger: autocal.json keeps only the last
+# AUTOCAL_KEEP rows, so a gauge calibrated long ago would roll off it and lose
+# its last calibration time (autocal's cooldown and stale-episode rule; the
+# retired backlog read it as calibrate-once). {gauge: {first, last, n}} of
+# ran=True records, never truncated (one small entry per calibrated gauge),
+# committed with the record itself.
 AUTOCAL_DONE_FILE = f"{PREFIX}/autocal_done.json"
 
 
@@ -279,9 +285,10 @@ def _load_hub_json(path: str, kind: type, revision: str | None = None):
 def load_autocal() -> list | None:
     """Auto-calibration records (newest last): one per (event, gauge) the
     CREST_autocal Space looked at — ran (with before/after NSE and whether
-    the winner was saved) or skipped with a reason. `kind` is "miss",
-    "oversim" or "backlog" (older rows: no kind = miss); western-backlog
-    skips arrive only in periodic kind "backlog_skips" summaries (gauge None).
+    the winner was saved) or skipped with a reason. `kind` is "low_nse" (an
+    episode's CREST 1-D NSE below the threshold: nse, n_pairs, nse_max);
+    older rows keep the retired kinds "miss" (no kind = miss), "oversim",
+    "backlog" and the "backlog_skips" summaries (gauge None).
     [] only when the file does not exist yet; None when it could not be read —
     an outage must never look like "no history" (the autocal loop would
     re-calibrate, note_autocal would overwrite the log with one row)."""
@@ -289,7 +296,7 @@ def load_autocal() -> list | None:
 
 
 def load_autocal_done() -> dict | None:
-    """The calibrate-once ledger {gauge: {first, last, n}} (ran=True records
+    """The calibration ledger {gauge: {first, last, n}} (ran=True records
     only, never truncated). {} when it does not exist yet, None when it could
     not be read."""
     return _load_hub_json(AUTOCAL_DONE_FILE, dict)
@@ -297,19 +304,23 @@ def load_autocal_done() -> dict | None:
 
 def _ledger_add(ledger: dict, rec: dict) -> None:
     """Fold one ran=True record into the ledger (in place). `at` strings are
-    %Y-%m-%dT%H:%M:%SZ, so plain comparison orders them."""
+    %Y-%m-%dT%H:%M:%SZ, so plain comparison orders them. `finished` (the
+    latest calibration end, kept when records carry one) keeps autocal's
+    stale-episode rule exact after the row rolls off autocal.json."""
     g = rec.get("gauge")
     if not rec.get("ran") or not g:
         return
     e = ledger.get(str(g)) or {}
     ats = [str(t) for t in (e.get("first"), e.get("last"), rec.get("at")) if t]
+    fins = [str(t) for t in (e.get("finished"), rec.get("finished")) if t]
     ledger[str(g)] = {"first": min(ats, default=None), "last": max(ats, default=None),
-                      "n": int(e.get("n") or 0) + 1}
+                      "n": int(e.get("n") or 0) + 1,
+                      **({"finished": max(fins)} if fins else {})}
 
 
 def note_autocal(rec: dict) -> bool:
     """Append one auto-calibration record and commit — together with its
-    calibrate-once ledger entry (autocal_done.json) when it ran, in the same
+    calibration ledger entry (autocal_done.json) when it ran, in the same
     commit. False, with nothing committed, when either file could not be read
     (never [rec] over the whole log) or the commit failed: the caller keeps
     the record and retries."""
@@ -349,7 +360,8 @@ def note_autocal(rec: dict) -> bool:
 
 def drop_events(event_ids, purge: bool = True, why: str = "") -> bool:
     """Remove events from the list (and, with purge, delete their result
-    folders) — e.g. an episode whose map the CREST-miss guard disowned."""
+    folders). No automatic caller any more: the outlet-Q check that once
+    disowned an episode's map this way is advisory now and drops nothing."""
     from huggingface_hub import CommitOperationAdd, CommitOperationDelete
     api = _api()
     pins = pinned_ids(force=True)
@@ -551,7 +563,7 @@ def _prior_manifest(ev: str) -> dict | None:
 def load_manifest(ev: str) -> dict | None:
     """A published event's manifest, HF-cached (re-downloaded only when it
     changed on the Hub) — for readers that scan many events, e.g. the
-    autocal over-prediction trigger. None on any failure."""
+    autocal low-NSE trigger. None on any failure."""
     try:
         from huggingface_hub import hf_hub_download
         p = hf_hub_download(REPO, f"{PREFIX}/{ev}/manifest.json",
@@ -597,7 +609,7 @@ def reopen_episodes(event_ids, superseded: set | None = None,
     of a new event. The stale "final" product is dropped from the entry — the
     tick's finalize/heal pass recomputes it when the episode ends again — and
     the entry is stamped "reopened" (UTC), which restarts the tick's CPU
-    fallback clock and keeps the CREST-miss guard from purging the episode.
+    fallback clock.
     Pinned demo events are never reopened, nor an episode gone from the FRESH
     index: those ids are added to `refused` (when given) — pinned ones before
     the index is read, so a failed reopen still tells them apart (a pinned

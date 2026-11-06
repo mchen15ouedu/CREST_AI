@@ -3006,11 +3006,13 @@ async function loadEvents() {
       `EF5 ${m.sim_peak_m3s} vs obs ${m.obs_peak_m3s} m³/s (${Math.round((m.frac || 0) * 100)}%)</div>`;
   });
   if (misses.length > 6) html += `<div style="color:#8fa3b8;font-size:11px">+${misses.length - 6} more gauges CREST missed this week</div>`;
-  // auto-calibrations (CREST_autocal Space): whole-event misses, EF5
-  // over-predictions of published events, or the western backlog
+  // auto-calibrations (CREST_autocal Space): a low CREST 1-D NSE in a flood
+  // episode (older rows: whole-event misses, EF5 over-predictions of
+  // published events, or the western backlog)
   (d.autocal || []).filter((a) => a.ran && Date.parse(a.at || 0) >= missCut).slice(-3).reverse().forEach((a) => {
     const f = (v) => (v === null || v === undefined) ? "n/a" : Number(v).toFixed(2);
-    const why = a.kind === "oversim" ? `EF5 peaked at ${a.ratio}× the observed peak in event ${a.event}`
+    const why = a.kind === "low_nse" ? `CREST 1-D NSE ${f(a.nse)} < ${a.nse_max ?? 0.1} over ${a.n_pairs} h of episode ${a.event}`
+      : a.kind === "oversim" ? `EF5 peaked at ${a.ratio}× the observed peak in event ${a.event}`
       : a.kind === "backlog" ? `western backlog (tier ${a.tier}), no triggering event`
       : `CREST missed every hourly check of event ${a.event}`;
     html += `<div style="color:#9fd8c8;font-size:12px" title="6-month auto-calibration: ${why}">` +

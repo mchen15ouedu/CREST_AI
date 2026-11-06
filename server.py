@@ -815,7 +815,7 @@ def api_events(full: int = 0):
         missed = eventstore.load_missed()[-30:]
     except Exception:
         missed = []
-    try:                       # auto-calibrations those misses triggered
+    try:                       # auto-calibrations (low-NSE episodes; older: misses)
         autocal = eventstore.load_autocal()[-10:]
     except Exception:
         autocal = []

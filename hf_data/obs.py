@@ -12,12 +12,18 @@ columns, covered time-windows recorded in the schema metadata). A request
 serves cached rows and hits NWIS only for the parts of the window the store
 has never seen; the last CREST_OBS_LAG_H hours (default 24) are never marked
 covered, so the provisional near-real-time tail refreshes on the next request.
-The obs/ store syncs to the private CREST_state dataset (persist.SYNC_DIRS),
-so observations survive Space restarts. Calibration is the big winner: all
-candidate runs of a gauge reuse one download instead of re-fetching NWIS.
+An empty answer is marked covered only when stored rows bracket that window
+on BOTH sides (a site that reports before and after it): NWIS also answers
+200 with an empty series when it fails quietly — a gap open towards now is
+what that looks like — and a covered window is never asked again. The obs/
+store syncs to the private CREST_state dataset
+(persist.SYNC_DIRS), so observations survive Space restarts. Calibration is
+the big winner: all candidate runs of a gauge reuse one download instead of
+re-fetching NWIS.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import threading
@@ -30,6 +36,10 @@ import requests
 CFS_TO_CMS = 0.0283168
 _IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
 LAG_H = float(os.environ.get("CREST_OBS_LAG_H", "24"))   # provisional-tail window
+# an empty answer counts as covered only when the store holds a row within
+# this before AND after the window (the fetch's ±1-day pad plus a day):
+# get_series, _bracketed
+_NEAR = timedelta(days=2)
 
 _locks: dict[str, threading.Lock] = {}                    # per-site store lock
 _locks_lock = threading.Lock()
@@ -154,50 +164,109 @@ def _gaps(cov: list[list[datetime]], t0: datetime, t1: datetime) -> list[list[da
     return [g for g in gaps if g[1] - g[0] >= timedelta(hours=1)]
 
 
+def _inside(times: list[datetime], a: datetime, b: datetime) -> bool:
+    """True when a row (sorted `times`) lies strictly inside (a, b) — a row
+    at an edge brackets the window (_bracketed)."""
+    i = bisect.bisect_right(times, a)
+    return i < len(times) and times[i] < b
+
+
+def _bracketed(times: list[datetime], a: datetime, b: datetime) -> bool:
+    """True when rows (sorted `times`) bracket [a, b] on BOTH sides: one in
+    [a - _NEAR, a] and one in [b, b + _NEAR]. A window with rows on one side
+    only — a gap open towards now above all — is what NWIS failing quietly
+    looks like, not a site that reports around a gap in its record."""
+    i = bisect.bisect_left(times, a - _NEAR)
+    j = bisect.bisect_left(times, b)
+    return (i < len(times) and times[i] <= a) and (j < len(times) and times[j] <= b + _NEAR)
+
+
+def _trusted(cov: list[list[datetime]], rows: dict) -> list[list[datetime]]:
+    """Coverage that stands: windows with a row in them, or rowless ones that
+    rows bracket (_bracketed). Any other rowless window is what an empty
+    answer marked before get_series stopped trusting those (stores synced
+    from CREST_state still carry them): it is asked again."""
+    times = sorted(rows)
+    return [[a, b] for a, b in cov if _inside(times, a, b) or _bracketed(times, a, b)]
+
+
 def get_series(site: str, t_start: datetime, t_end: datetime,
-               info: dict | None = None) -> list[tuple[datetime, float]]:
+               info: dict | None = None,
+               refresh: bool = False) -> list[tuple[datetime, float]]:
     """Observed discharge (m³/s) for [t_start, t_end] — cached-first.
 
     Serves rows from the parquet store and fetches only the windows NWIS has
     never been asked for. Never raises on fetch errors: returns whatever the
     store already holds (failed gaps stay uncovered and retry next time).
     Coverage is never marked inside the last LAG_H hours, so provisional
-    recent obs refresh on later requests. `info` (optional dict) gets
-    {"cached": bool, "fetched_windows": n, "fetch_error": str?} for status text.
+    recent obs refresh on later requests, nor for an answer without a row in
+    the window unless stored rows bracket it on both sides (_bracketed), nor
+    for an empty answer for a window the store still holds rows in (_trusted
+    drops rowless coverage an older store still carries the same way).
+    `refresh` asks NWIS for the whole window again, covered or not (a fresh
+    answer replaces the window's rows; an empty one never drops covered
+    rows). `info` (optional
+    dict) gets {"cached": bool, "fetched_windows": n, "empty_windows": n
+    (answered without a row), "from_store": bool (part of the window came
+    from the store's earlier answers, not a request of this call),
+    "fetch_error": str?, "fetch_exc": the exception?} for status text and
+    the caller's outage rule.
     """
     site = str(site).zfill(8)
     with _site_lock(site), _store_lock(site):  # this process's threads, then other processes
-        rows, cov = _load_store(site)
+        rows, stored = _load_store(site)
+        cov = _trusted(stored, rows)
+        changed = cov != stored
         gaps = _gaps(cov, t_start, t_end)
-        fetched = 0
+        from_store = gaps != [[t_start, t_end]]
+        if refresh and t_end > t_start:
+            gaps, from_store = [[t_start, t_end]], False
+        held = list(cov)                     # coverage before this call's answers
+        fetched = empty = 0
         for a, b in gaps:
             try:
                 got = fetch_usgs_discharge(site, a, b)
             except Exception as e:
                 if info is not None:
-                    info["fetch_error"] = str(e)
+                    info.update({"fetch_error": str(e), "fetch_exc": e})
                 continue                     # gap stays uncovered -> retry later
             got = dict(got)
             # replace, don't merge: USGS scrubs bad provisional values by
             # DELETING them, so cached rows in the refetched window that the
             # fresh answer no longer carries must go too (seen live: a phantom
             # 38,400 cfs flood at a dry TX gauge survived in the store — and
-            # the scorecard — long after NWIS had removed it)
-            for t in [t for t in rows if a <= t <= b and t not in got]:
+            # the scorecard — long after NWIS had removed it). An empty
+            # answer leaves covered rows alone (only a refresh asks a covered
+            # window again): it may be NWIS failing quietly
+            for t in [t for t in rows if a <= t <= b and t not in got
+                      and (got or not any(c <= t <= d for c, d in held))]:
                 del rows[t]
+                changed = True
             rows.update(got)
-            # even an empty answer is an answer (gauge has no record there) —
-            # mark covered so we stop hammering NWIS, but never inside the
-            # provisional tail
+            changed = changed or bool(got)
+            # no row in the window is an answer (the gauge has no record
+            # there) only from a site that reports on BOTH sides of it: NWIS
+            # also answers 200 with an empty series when it fails quietly —
+            # a gap open towards now is what that looks like — and a covered
+            # window is never asked again, so without rows bracketing it the
+            # window stays uncovered and the next call asks again. An empty
+            # answer for a window the store still holds rows in (a refresh of
+            # a covered one) covers nothing new either. Never covered inside
+            # the provisional tail
             cap = (datetime.now(timezone.utc).replace(tzinfo=None)
                    - timedelta(hours=LAG_H))
-            if a < cap:
-                cov.append([a, min(b, cap)])
+            times, cb = sorted(rows), min(b, cap)
+            if a < cap and ((_inside(times, a, cb) or _bracketed(times, a, cb)) if got
+                            else _bracketed(times, a, cb) and not _inside(times, a, cb)):
+                cov.append([a, cb])
+                changed = True
             fetched += 1
-        if fetched:
+            empty += not got
+        if changed:
             _save_store(site, rows, _merge_cov(cov))
         if info is not None:
-            info.update({"cached": not gaps, "fetched_windows": fetched})
+            info.update({"cached": not gaps, "fetched_windows": fetched,
+                         "empty_windows": empty, "from_store": from_store})
     # match fetch_usgs_discharge's ±1-day pad so EF5 obs/coverage behave the same
     lo, hi = t_start - timedelta(days=1), t_end + timedelta(days=1)
     return sorted((t, q) for t, q in rows.items() if lo <= t <= hi)

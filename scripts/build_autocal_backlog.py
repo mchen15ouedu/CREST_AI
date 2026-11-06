@@ -2,8 +2,15 @@
 "The auto-calibration, we should prioritize the western part of the USA,
 since those areas have more issues").
 
-When no event (whole-event miss or over-prediction) is eligible, the autocal
-loop calibrates the next gauge of this list, once each. Eligible: western
+RETIRED as a trigger (PI 2026-11-05: a low CREST 1-D NSE in a flood episode
+is autocal's only trigger): autocal/autocal_run.py no longer reads
+hf_data/data/autocal_west_backlog.json — script and file stay in the repo
+for reference. The reservoir table this script also writes
+(gagesii_reservoir_stor.json) is still read: it drives the western
+reservoir hold.
+
+When no event (whole-event miss or over-prediction) was eligible, the autocal
+loop calibrated the next gauge of this list, once each. Eligible: western
 gauges (lon < pipeline.WEST_LON) with a usable basin-extent row
 (basinextent.ef5_extent does not raise), a multiplier row, and ACTIVE USGS
 instantaneous discharge (NWIS site service, one request per western state).

@@ -110,8 +110,12 @@ def _heuristic_candidates(base: dict, k: int, rnd: random.Random) -> list[dict]:
 def propose(base: dict, metrics: dict, history: list[dict], k: int,
             round_index: int, rnd: random.Random, trace: list | None = None) -> list[dict]:
     """One round of candidates: LLM if available, heuristic ladder otherwise.
-    trace: optional list; one note describing what produced the candidates
-    (and what the LLM was shown / replied) is appended for caltrace."""
+    Each candidate carries its "source" ("llm" or "heuristic"; a heuristic
+    one also "why" the LLM gave none), so the caller can tell an AI-guided
+    round from a fallback. trace: optional list; one note describing what
+    produced the candidates (and what the LLM was shown / replied) is
+    appended for caltrace."""
+    why = "no LLM configured"
     if llm.available():
         payload = {
             "round": round_index,
@@ -139,20 +143,23 @@ def propose(base: dict, metrics: dict, history: list[dict], k: int,
                        if kk in PARAM_BOUNDS and kk not in FROZEN}
                 if ups:
                     out.append({"id": str(c.get("id", f"cand{i}")),
-                                "goal": str(c.get("goal", ""))[:120], "updates": ups})
+                                "goal": str(c.get("goal", ""))[:120], "updates": ups,
+                                "source": "llm"})
             if out:
                 caltrace.note(trace, source="llm", provider=_prov, shown=payload, raw=txt)
                 return out
-            caltrace.note(trace, source="heuristic", why="LLM reply had no usable candidates",
-                          shown=payload, raw=txt)
+            why = "LLM reply had no usable candidates"
+            caltrace.note(trace, source="heuristic", why=why, shown=payload, raw=txt)
         except Exception as e:                    # heuristic fallback degrades
             from hf_data import crashlog          # calibration quality — record it
             crashlog.capture("cal:llm-propose", e, round=rnd)
             caltrace.note(trace, source="heuristic", why=f"LLM error: {type(e).__name__}",
                           shown=payload, raw=txt)
+            why = f"LLM error: {type(e).__name__}: {str(e)[:160]}"
     else:
-        caltrace.note(trace, source="heuristic", why="no LLM configured")
-    return _heuristic_candidates(base, k, rnd)
+        caltrace.note(trace, source="heuristic", why=why)
+    return [{**c, "source": "heuristic", "why": why}
+            for c in _heuristic_candidates(base, k, rnd)]
 
 
 def _mock_nse(params: dict) -> float:
@@ -167,7 +174,8 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                     model: str = "auto", snow: str = "auto", use_mock: bool = True,
                     rounds: int = 4, k: int = 3, timestep: str = "1h",
                     ext_rounds: int = EXT_ROUNDS, ext_k: int = EXT_K,
-                    ext_nse: float = EXT_NSE, save_vs_baseline: bool = False):
+                    ext_nse: float = EXT_NSE, save_vs_baseline: bool = False,
+                    require_llm: bool = False, cand_errors: list | None = None):
     """_run_calibration, with its rounds recorded for the review pilot
     (caltrace). Recording only observes: the event stream is unchanged, and a
     calibration stopped early (autocal preemption, client gone) still uploads
@@ -180,6 +188,7 @@ def run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                                     timestep=timestep, ext_rounds=ext_rounds,
                                     ext_k=ext_k, ext_nse=ext_nse,
                                     save_vs_baseline=save_vs_baseline,
+                                    require_llm=require_llm, cand_errors=cand_errors,
                                     rec=rec if rec.on else None)
     except GeneratorExit:                      # consumer stopped early (autocal preempt)
         rec.finish(status="stopped")
@@ -193,6 +202,7 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                      rounds: int = 4, k: int = 3, timestep: str = "1h",
                      ext_rounds: int = EXT_ROUNDS, ext_k: int = EXT_K,
                      ext_nse: float = EXT_NSE, save_vs_baseline: bool = False,
+                     require_llm: bool = False, cand_errors: list | None = None,
                      rec: caltrace.Recorder | None = None):
     """Generator of calibration events for the SSE stream.
 
@@ -201,10 +211,24 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
     stored record's NSE from whatever window it came from; the saved record
     is also pushed to CREST_state so other Spaces pick it up.
 
+    require_llm: a search without the LLM is not wanted (CREST_autocal,
+    AUTOCAL_REQUIRE_LLM). When a round's candidates fall back to the
+    heuristic before any round got LLM candidates, the calibration stops
+    there — no candidate runs, nothing is saved or pushed (done: llm_rounds
+    0, llm_stopped: why) and its trace is not uploaded. Dashboard
+    calibrations leave it off: they fall back to the heuristic as before.
+    cand_errors: optional list; every exception a candidate run raised (the
+    calibration swallows them: that candidate scores no NSE) is appended,
+    for the caller's outage rule.
+
     Two-stage budget: rounds*k candidates, then — only if the best NSE is
     still below ext_nse — one extended stage of ext_rounds*ext_k more.
-    Yields ("status", str) | ("round", dict) | ("hydro", {rows}) |
-    ("done", {best_nse, baseline_nse, best_params, saved, improved, extended}).
+    Yields ("status", str) | ("round", dict: also the candidates' "source")
+    | ("hydro", {rows}) | ("done", {best_nse, baseline_nse, best_params,
+    saved, improved, extended, rounds (rounds whose candidates ran),
+    llm_rounds (how many of them had LLM candidates), pushed (push_remote's
+    answer for a saved save_vs_baseline winner, else None), model (the EF5
+    model the parameters are stored under)}).
     """
     from hf_data import multipliers
     from hf_data.pipeline import gauge_info, run_gauge
@@ -278,6 +302,8 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
     extended = False
     r = 0                           # global round counter across stages
     si = 0
+    llm_rounds = 0                  # rounds whose candidates the LLM proposed
+    stopped = None                  # require_llm: why the search stopped
     while si < len(stages):
         n_rounds, kk = stages[si]
         for _ in range(n_rounds):
@@ -285,6 +311,11 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
             ptrace = [] if rec is not None else None
             nse_before = best_nse
             cands = propose(best_params, base_metrics, history, kk, r, rnd, trace=ptrace)
+            src = cands[0].get("source") if cands else None
+            if require_llm and not llm_rounds and src != "llm":
+                stopped = (cands[0].get("why") if cands else None) or "no candidates"
+                break
+            llm_rounds += src == "llm"
             tried = []
             rec_cands = []
             for c in cands:
@@ -296,6 +327,8 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                 except Exception as e:
                     nse, m, rows = None, {}, []
                     err = f"{type(e).__name__}: {str(e)[:200]}"
+                    if cand_errors is not None:
+                        cand_errors.append(e)
                     yield ("status", f"round {r}: candidate {c['id']} failed ({e})")
                 done_runs += 1
                 tried.append({"id": c["id"], "goal": c["goal"], "nse": nse,
@@ -312,7 +345,10 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                 rec.round(r, ptrace[-1] if ptrace else None, rec_cands, nse_before,
                           best_nse, extended)
             yield ("round", {"round": r, "tried": tried, "best_nse": best_nse,
-                             "best_params": best_params, "extended": extended})
+                             "best_params": best_params, "extended": extended,
+                             "source": src})
+        if stopped is not None:
+            break
         si += 1
         # still a poor fit after the standard budget -> widen the search once
         if si == 1 and not extended and ext_rounds > 0 and ext_k > 0 \
@@ -326,9 +362,13 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                              f"+{ext_rounds} rounds × {ext_k} candidates "
                              f"({ext_rounds * ext_k} more runs)")
 
+    if stopped is not None:
+        r -= 1                      # the stopped round ran no candidate
+        yield ("status", f"round {r + 1}: no LLM candidates ({stopped}) — stopped: "
+                         f"a heuristic-only search is not wanted here")
     improved = (base_nse is None) or (best_nse is not None and best_nse > base_nse)
-    saved = False
-    if best_nse is not None:
+    saved, pushed = False, None
+    if best_nse is not None and not (require_llm and not llm_rounds):
         wb_best = {p: best_params[p] for p in wb0 if p in best_params}
         kw_best = {p: best_params[p] for p in kw0 if p in best_params}
         saved = paramstore.maybe_save(
@@ -337,11 +377,17 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
             window=[t_start.strftime("%Y-%m-%d %H:%M"), t_end.strftime("%Y-%m-%d %H:%M")],
             baseline_nse=(base_nse if save_vs_baseline else None))
         if saved and save_vs_baseline:
-            yield ("status", "winner pushed to CREST_state: "
-                   + ("ok" if paramstore.push_remote(g["id"], ef5_model) else "FAILED"))
+            pushed = paramstore.push_remote(g["id"], ef5_model)
+            yield ("status", "winner pushed to CREST_state: " + ("ok" if pushed else "FAILED"))
     done = {"best_nse": best_nse, "baseline_nse": base_nse,
             "best_params": best_params, "saved": saved, "improved": improved,
-            "extended": extended}
+            "extended": extended, "rounds": r, "llm_rounds": llm_rounds,
+            "pushed": pushed, "model": ef5_model}
+    if stopped is not None:
+        done["llm_stopped"] = stopped
     if rec is not None:
-        rec.finish(done)
+        if stopped is not None:
+            rec.discard()           # a baseline alone: no reasoning to review
+        else:
+            rec.finish(done)
     yield ("done", done)
