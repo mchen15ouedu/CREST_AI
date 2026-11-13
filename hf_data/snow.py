@@ -186,71 +186,62 @@ def _temp_pixels(lons, lats, nxll, nyll, cell, shape):
     return m
 
 
-def _basin_min_temp(bbox, t_start, t_end, sample_hours=6, cells=None):
+def _basin_min_temp(bbox, t_start, t_end, sample_hours=6, cells=None, archive=None):
     """Min basin temperature (°C) over the window from HF temp forcing (sampled).
     cells=(lons, lats) of the basin's EF5 nodes restricts the minimum to the
-    temperature pixels the basin touches (not the whole extent rectangle)."""
-    import io
-    import tarfile
-    import truststore
-    truststore.inject_into_ssl()
-    from huggingface_hub import hf_hub_download
-    from hf_data.forcing import VARS, _read_pqf, _clip
-    cfg = VARS["temp"]
+    temperature pixels the basin touches (not the whole extent rectangle).
+    Reads through the forcing archive, so it sees exactly the grids the EF5
+    run sees (Kelvin hours converted, implausible grids rejected)."""
+    from hf_data.forcing_archive import ArchiveGap, ForcingArchive, ForcingRangeError
+    if archive is None:
+        import truststore
+        truststore.inject_into_ssl()
+        with ForcingArchive() as arc:
+            return _basin_min_temp(bbox, t_start, t_end, sample_hours, cells, arc)
     steps = []
     t = t_start.replace(minute=0, second=0, microsecond=0)
     while t <= t_end:
         steps.append(t)
         t += timedelta(hours=sample_hours)
-    by_month = {}
-    for s in steps:
-        by_month.setdefault((s.year, s.month), []).append(s)
     gmin = None
+    gap_month = None                   # (year, month) the archive has no tar for
     pix: dict = {}                     # temp-clip geometry -> basin pixel mask
-    for (yr, mo), group in sorted(by_month.items()):
-        ref = group[0]
+    for s in steps:
+        if gap_month == (s.year, s.month):
+            continue
         try:
-            tar_path = hf_hub_download("vincewin/CREST_data", ref.strftime(cfg.month_fmt), repo_type="dataset")
-        except Exception:
-            try:
-                tar_path = hf_hub_download("vincewin/CREST_data", ref.strftime(cfg.year_fmt), repo_type="dataset")
-            except Exception:
-                continue
-        with tarfile.open(tar_path) as tf:
-            names = set(tf.getnames())
-            for s in group:
-                member = s.strftime(cfg.member_fmt)
-                if member not in names:                # NARR-derived members
-                    member = s.strftime(cfg.out_fmt)   # use the generic name
-                if member not in names:
-                    continue
-                a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())
-                clip = _clip(a, xll, yll, cell, nod, bbox)
-                if clip is None:
-                    continue
-                sub = clip[0]
-                keep = (sub > -90) & (sub < 60) & np.isfinite(sub)       # plausible °C only
-                if cells is not None:
-                    # the basin's temp pixels: one clip geometry per run, so
-                    # map the (millions of) basin cells once, not per sample
-                    gkey = (round(clip[1], 9), round(clip[2], 9), cell, sub.shape)
-                    if gkey not in pix:
-                        pix[gkey] = _temp_pixels(cells[0], cells[1], clip[1], clip[2],
-                                                 cell, sub.shape)
-                    keep &= pix[gkey]
-                v = sub[keep]
-                if v.size:
-                    m = float(v.min())
-                    gmin = m if gmin is None else min(gmin, m)
+            g = archive.read("temp", s, bbox)
+        except ArchiveGap:             # no tar this month: skip the month
+            gap_month = (s.year, s.month)
+            continue
+        except ForcingRangeError:      # implausible grid: the hour is not counted
+            continue
+        if g is None:                  # hour missing, or box off the grid
+            continue
+        sub = g.values
+        keep = np.isfinite(sub) & (sub != g.nodata) & (sub > -9000)
+        if cells is not None:
+            # the basin's temp pixels: one clip geometry per run, so
+            # map the (millions of) basin cells once, not per sample
+            gkey = (round(g.xll, 9), round(g.yll, 9), g.cell, sub.shape)
+            if gkey not in pix:
+                pix[gkey] = _temp_pixels(cells[0], cells[1], g.xll, g.yll,
+                                         g.cell, sub.shape)
+            keep &= pix[gkey]
+        v = sub[keep]
+        if v.size:
+            m = float(v.min())
+            gmin = m if gmin is None else min(gmin, m)
     return gmin
 
 
 def detect_snow(bbox, t_start, t_end, dem_path=None, force: str | None = None,
-                use_temp: bool = True, basin=None) -> dict:
+                use_temp: bool = True, basin=None, archive=None) -> dict:
     """Decide whether SNOW17 should be on. force in {'on','off',None}.
     basin=(mask, transform): the run's EF5 nodes on dem_path's grid. Latitude,
     mean elevation and the minimum temperature are then taken over the basin
-    itself (M2, PI OK 2026-10-23), not over the extent rectangle."""
+    itself (M2, PI OK 2026-10-23), not over the extent rectangle.
+    archive: a ForcingArchive to read temperature from (default: the Hub)."""
     if force == "on":
         return {"snow": True, "reason": "user override: on"}
     if force == "off":
@@ -275,7 +266,7 @@ def detect_snow(bbox, t_start, t_end, dem_path=None, force: str | None = None,
 
     if use_temp:                                          # data-driven confirmation
         try:
-            mn = _basin_min_temp(bbox, t_start, t_end, cells=cells)
+            mn = _basin_min_temp(bbox, t_start, t_end, cells=cells, archive=archive)
         except Exception:
             mn = None
         if mn is not None:
