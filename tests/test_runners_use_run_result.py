@@ -34,22 +34,20 @@ def mock_runs(offline, monkeypatch):
 def hub(monkeypatch):
     """Records what fleet_run commits to the fleet repo (file contents read at
     commit time: the local files are deleted afterwards)."""
-    import huggingface_hub
-    commits = []
-
-    class FakeApi:
-        def __init__(self, *a, **k):
-            pass
-
-        def create_commit(self, repo_id, repo_type, operations, commit_message):
-            files = {}
-            for op in operations:
-                with open(op.path_or_fileobj, "rb") as fh:
-                    files[op.path_in_repo] = fh.read()
-            commits.append({"repo": repo_id, "message": commit_message, "files": files})
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    from hf_data import fleetstore
+    from hf_data.hubdata import Dataset, MemoryHub, Put
+    mem = MemoryHub()
+    monkeypatch.setattr(fleetstore, "DATASET", Dataset("me/fleet", adapter=mem))
     monkeypatch.setenv("HF_TOKEN", "test-token")
+    commits = []
+    real = mem.commit
+
+    def commit(repo, ops, message):
+        real(repo, ops, message)
+        commits.append({"repo": repo, "message": message,
+                        "files": {op.path: mem.files[op.path]
+                                  for op in ops if isinstance(op, Put)}})
+    mem.commit = commit
     return commits
 
 
