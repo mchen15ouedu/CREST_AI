@@ -213,3 +213,77 @@ def test_hub_adapter_only_a_real_404_is_missing(monkeypatch, tmp_path):
     for e in (LocalEntryNotFoundError("offline"), OSError("disk"), RuntimeError("401")):
         _fake_download(monkeypatch, tmp_path, {}, err=e)
         assert ds.read_json("b.json").unreachable
+
+
+def test_concurrent_commits_never_overspend_the_budget():
+    """Check-and-spend is one step: two writers racing for the last commit of
+    the hour cannot both get it."""
+    import threading
+    from hf_data.hubdata import CommitBudget, Put
+
+    class SlowHub(MemoryHub):
+        def __init__(self):
+            super().__init__()
+            self.calls, self.inside, self.go = 0, threading.Event(), threading.Event()
+
+        def commit(self, repo, ops, message):
+            self.calls += 1
+            self.inside.set()
+            self.go.wait(timeout=2)
+            super().commit(repo, ops, message)
+
+    hub = SlowHub()
+    ds = Dataset("me/repo", adapter=hub, budget=CommitBudget(limit=1))
+    first = threading.Thread(target=ds.commit, args=([Put("a", b"1")], "m"))
+    first.start()
+    assert hub.inside.wait(timeout=2)
+    second = ds.commit([Put("b", b"2")], "m")        # races the first one
+    hub.go.set()
+    first.join()
+    assert not second and "budget" in second.error
+    assert hub.calls == 1 and sorted(hub.files) == ["a"]
+
+
+def test_a_failed_commit_gives_its_budget_back():
+    from hf_data.hubdata import CommitBudget, Put
+    hub = MemoryHub()
+    budget = CommitBudget(limit=1)
+    ds = Dataset("me/repo", adapter=hub, budget=budget)
+    hub.outage = True
+    assert not ds.commit([Put("a", b"1")], "m")
+    assert budget.remaining() == 1
+    hub.outage = False
+    assert ds.commit([Put("a", b"1")], "m") and budget.remaining() == 0
+
+
+def test_memory_hub_keeps_one_file_map_per_repo():
+    from hf_data.hubdata import Put
+    hub = MemoryHub({"a.json": b"[1]"})
+    data = Dataset("me/data", adapter=hub)
+    fleet = Dataset("me/fleet", adapter=hub)
+    assert data.read_json("a.json").value == [1]           # seeded: the first repo used
+    assert fleet.read_json("a.json").missing
+    assert fleet.commit([Put("b.json", [2])], "m")
+    assert fleet.list_files().value == ["b.json"]
+    assert data.list_files().value == ["a.json"]
+    assert sorted(hub.files) == ["a.json"]                  # .files = the first repo's map
+    assert sorted(hub.repo_files("me/fleet")) == ["b.json"]
+
+
+def test_batch_entries_group_ops_and_bound_the_queue_after_a_failure():
+    """An entry (several ops under one key) is queued, replaced and committed
+    as a unit; a failed flush keeps the oldest `max_pending` entries."""
+    from hf_data.hubdata import Put
+    hub = MemoryHub()
+    ds = Dataset("me/repo", adapter=hub)
+    batch = ds.batch("ckpts", min_interval_s=0, max_pending=1)
+    batch.add([Put("s/a.pqf", b"1"), Put("r/a.json", b"{}")], key="a")
+    batch.add([Put("s/b.pqf", b"22")], key="b")
+    assert batch.pending == 2 and batch.nbytes == 5 and batch.keys() == ["a", "b"]
+    hub.outage = True
+    assert not batch.flush(force=True) and "outage" in batch.error
+    assert batch.keys() == ["a"]                             # cut to max_pending
+    hub.outage = False
+    batch.add([Put("s/a.pqf", b"3")], key="a")               # replaces the whole entry
+    assert batch.flush(force=True) and batch.error is None
+    assert hub.files == {"s/a.pqf": b"3"} and hub.commits[0]["message"] == "ckpts x1"

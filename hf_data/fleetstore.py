@@ -387,40 +387,28 @@ class Batch:
     so RAM stays bounded while the Hub is down (`error` says why)."""
 
     def __init__(self, label: str, max_pending: int = 400):
-        self.label, self.max_pending = label, max_pending
-        self.error: str | None = None
-        self._q: dict[str, Publication] = {}
-        self._lock = threading.Lock()
+        self._q = DATASET.batch(label, min_interval_s=0.0, max_ops=None,
+                                max_pending=max_pending)
+
+    @property
+    def error(self) -> str | None:
+        return self._q.error
 
     @property
     def pending(self) -> int:
-        return len(self._q)
+        return self._q.pending
 
     @property
     def nbytes(self) -> int:
-        return sum(p.nbytes for p in list(self._q.values()))
+        return self._q.nbytes
 
     def add(self, pub: Publication) -> None:
-        with self._lock:
-            self._q.pop(pub.key, None)
-            self._q[pub.key] = pub
+        self._q.add(pub.ops(), key=pub.key)
 
     def flush(self) -> list[str]:
         """Commit everything queued; the keys that landed ([] on failure or
         when nothing was queued)."""
-        with self._lock:
-            if not self._q:
-                return []
-            pubs = list(self._q.values())
-            c = publish(pubs, f"{self.label} x{len(pubs)}")
-            if not c:
-                self.error = c.error
-                for k in list(self._q)[self.max_pending:]:
-                    del self._q[k]
-                return []
-            self.error = None
-            self._q.clear()
-            return [p.key for p in pubs]
+        return self._q.flush_keys(force=True)
 
 
 def batch(label: str, max_pending: int = 400) -> Batch:
