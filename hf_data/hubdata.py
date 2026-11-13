@@ -316,8 +316,9 @@ class Dataset:
                clock=time.time) -> "Cached":
         """A TTL-cached read of `path` (JSON unless `load` is given) that
         serves the last good copy, marked stale, while the Hub is unreachable."""
-        return Cached(self, path, ttl_s, load or _json_loader(kind),
-                      ttl_s if retry_s is None else retry_s, fresh, clock)
+        load = load or _json_loader(kind)
+        return cached(lambda: self.read(path, load, fresh=fresh), ttl_s,
+                      retry_s=retry_s, clock=clock)
 
     def list_files(self, prefix: str = "") -> Read:
         """Sorted repo paths starting with `prefix` (DATA or UNREACHABLE)."""
@@ -357,14 +358,20 @@ def _json_loader(kind: type | None):
     return load
 
 
+def cached(fetch, ttl_s: float, retry_s: float | None = None,
+           clock=time.time) -> "Cached":
+    """A TTL cache over any `fetch() -> Read` (a read assembled from several
+    files, say) with the same outage policy as Dataset.cached."""
+    return Cached(fetch, ttl_s, ttl_s if retry_s is None else retry_s, clock)
+
+
 class Cached:
-    """See Dataset.cached. `get()` re-reads after `ttl_s`; after an
-    unreachable read it waits `retry_s` before trying again. A MISSING answer
+    """See Dataset.cached. `get()` re-fetches after `ttl_s`; after an
+    unreachable fetch it waits `retry_s` before trying again. A MISSING answer
     drops the cached copy (the file is gone, that is not an outage)."""
 
-    def __init__(self, ds, path, ttl_s, load, retry_s, fresh, clock):
-        self.ds, self.path, self.ttl_s, self.load = ds, path, ttl_s, load
-        self.retry_s, self.fresh, self.clock = retry_s, fresh, clock
+    def __init__(self, fetch, ttl_s, retry_s, clock):
+        self.fetch, self.ttl_s, self.retry_s, self.clock = fetch, ttl_s, retry_s, clock
         self._serve: Read | None = None       # the answer until the next Hub read
         self._next = 0.0                      # clock time of the next Hub read
         self._lock = threading.Lock()
@@ -374,7 +381,7 @@ class Cached:
             now = self.clock()
             if not force and self._serve is not None and now < self._next:
                 return self._serve
-            r = self.ds.read(self.path, self.load, fresh=self.fresh)
+            r = self.fetch()
             if not r.unreachable:
                 self._serve, self._next = r, now + self.ttl_s
             else:
