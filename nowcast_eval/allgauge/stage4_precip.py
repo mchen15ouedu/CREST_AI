@@ -8,14 +8,17 @@ else the Pass2 month tar (only the Jul 18-22 window tails need this).
 Output: precip.npz (gids, hours as YYYYMMDDHH strings, pmat[n_gauge, n_hour])
 """
 import glob
-import io
 import math
 import os
+import sys
 import tarfile
 from datetime import datetime, timedelta
 
 import numpy as np
 import pyarrow.parquet as pq
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from hf_data.forcing_archive import read_pqf  # noqa: E402  (numpy + pyarrow only)
 
 # ---- verbatim copies of run_nowcast_all.py grid helpers (importing that
 # module drags in truststore, absent from the nowcast env) -------------------
@@ -23,13 +26,8 @@ MRMS_GRID = (-130.0, 20.0, 0.01, 3500, 7000, -9999.0)
 
 
 def _read_pqf_bytes(data: bytes) -> np.ndarray | None:
-    pf = pq.ParquetFile(io.BytesIO(data))
-    meta = {k.decode(): v.decode() for k, v in pf.schema_arrow.metadata.items()
-            if not k.startswith(b"ARROW")}
-    nr, nc = int(meta["nrows"]), int(meta["ncols"])
-    if (nr, nc) != MRMS_GRID[3:5]:
-        return None
-    return pf.read().column("v").to_numpy().reshape(nr, nc)
+    a = read_pqf(data)[0]                  # the forcing archive's decoder
+    return a if a.shape == MRMS_GRID[3:5] else None
 
 
 def _basin_box(lon, lat, area_km2, pad=1.2):
