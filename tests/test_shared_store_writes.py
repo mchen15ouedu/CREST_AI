@@ -1,9 +1,11 @@
 """Shared-store writes: one temp file per CALL (threads + processes write the
-same forcing/param/obs stores), the obs store's cross-process lock, and the
-ungauged runner's spawn pool (a forked worker inherits hf-xet mid-state)."""
+same forcing/param/obs/state/lake/carve/fleet/population stores), the obs
+store's cross-process lock, and the ungauged runner's spawn pool (a forked
+worker inherits hf-xet mid-state)."""
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import threading
 from datetime import datetime
@@ -171,6 +173,176 @@ def test_persist_scan_skips_tmp_and_lock(tmp_path, monkeypatch):
     for n in ("01234567.parquet", "01234567.parquet.lock", "01234567.parquet.k3x9.tmp"):
         (d / n).write_bytes(b"x")
     assert list(persist._scan()) == ["obs/01234567.parquet"]
+
+
+# --- every other shared-store writer: N threads, overlapping temp files -------
+N = 8
+
+
+def _overlap(monkeypatch, refuse=lambda src: False) -> list:
+    """From here on os.replace waits until all N writers hold their temp file,
+    then the replaces run one at a time (see serial_replace), and no writer
+    goes on until all have replaced (Windows refuses a replace onto a file
+    another thread already reopened). A writer that names its temp per process
+    hands one name to all N threads, and the first replace moves it away from
+    under the others. `refuse(src)` -> the rename fails as across filesystems.
+    Returns the replace sources, in order."""
+    replace, one = os.replace, threading.Lock()
+    gate, srcs = threading.Barrier(N), []
+
+    def rep(a, b):
+        if refuse(str(a)):
+            raise OSError(18, "Invalid cross-device link")
+        srcs.append(str(a))
+        gate.wait(timeout=20)
+        try:
+            with one:
+                replace(a, b)
+        finally:
+            gate.wait(timeout=20)
+    monkeypatch.setattr(os, "replace", rep)
+    return srcs
+
+
+def _one_temp_per_call(srcs, d, writes_per_thread=1):
+    assert len(srcs) == N * writes_per_thread
+    assert len(set(srcs)) == len(srcs)               # no two calls shared a temp
+    assert _tmp_left(d) == []
+
+
+def test_lake_states_threads(tmp_path, monkeypatch):
+    import pandas as pd
+    from hf_data import lakes
+    monkeypatch.setattr(lakes, "_tbl", (pd.DataFrame(), {"table_version": "tv1"}))
+    dem = str(tmp_path / "dem.tif")
+    write_grid(dem, np.zeros((5, 5)), -110.0, 38.0)
+    got = pd.DataFrame([{"id": "NID0", "r": 1, "c": 2, "s0_m3": 6.0e6}])
+    sd = tmp_path / "states"
+    t = datetime(2026, 10, 20, 16)
+    srcs = _overlap(monkeypatch)
+    assert _threads(lambda i: lakes.prepare_states(str(sd), t, got, dem), N) == []
+    _one_temp_per_call(srcs, sd, 3)                  # storage, outflow, lake_set
+    assert json.loads((sd / "lake_set_20261020_1600.json").read_text())["ids"] == ["NID0"]
+
+
+def test_run_states_cross_fs_commit_threads(tmp_path, monkeypatch):
+    from hf_data import runstates
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    runs = []
+    for i in range(N):
+        rd = tmp_path / f"run{i}"
+        rd.mkdir()
+        (rd / "sm.tif").write_text(str(i))
+        runs.append(rd)
+    srcs = _overlap(monkeypatch, refuse=lambda s: os.path.dirname(s) != str(shared))
+    oks = []
+    assert _threads(lambda i: oks.append(runstates._replace(
+        str(runs[i] / "sm.tif"), str(shared / "sm.tif"), tries=1)), N) == []
+    assert oks == [True] * N
+    _one_temp_per_call(srcs, shared)
+    assert (shared / "sm.tif").read_text() in {str(i) for i in range(N)}
+
+
+def test_carve_cache_threads(tmp_path, monkeypatch):
+    from conftest import RES
+    from hf_data import basinextent
+    f = np.full((7, 7), -9999.0)                     # 3x3 bowl draining to (3,3)
+    f[2, 2], f[2, 3], f[2, 4] = 2, 4, 8
+    f[3, 2], f[3, 3], f[3, 4] = 1, 4, 16
+    f[4, 2], f[4, 3], f[4, 4] = 128, 64, 32
+    write_grid(str(tmp_path / "fdir_clip.tif"), f, -90.0, 41.0)
+    ext = {"snap": {"lat": 41.0 - 3.5 * RES, "lon": -90.0 + 3.5 * RES, "area": 1.0}}
+    srcs, cells = _overlap(monkeypatch), []
+    assert _threads(lambda i: cells.append(
+        basinextent.carve(str(tmp_path), ext, "t")["cells"]), N) == []
+    assert cells == [9] * N
+    _one_temp_per_call(srcs, tmp_path)
+    assert np.load(tmp_path / "carve_3_3.npy").sum() == 9
+
+
+def test_state_bundle_unpack_threads(tmp_path, monkeypatch):
+    from hf_data import statebundle
+    src = tmp_path / "src"
+    src.mkdir()
+    write_grid(str(src / "sm_20261020_1600.tif"), np.full((4, 5), 0.25), -90.0, 41.0)
+    data = statebundle.pack_dir(str(src))
+    sd = tmp_path / "states"
+    srcs = _overlap(monkeypatch)
+    assert _threads(lambda i: statebundle.unpack(data, str(sd), overwrite=True), N) == []
+    _one_temp_per_call(srcs, sd)
+
+
+def test_fleet_rows_merge_threads(tmp_path, monkeypatch):
+    from hf_data import fleetstore, statecache
+    monkeypatch.setattr(statecache, "CACHE_DIR", str(tmp_path))
+    fl = tmp_path / "fleet.json"
+    fl.write_text(json.dumps({"rows": [{"time": "2026-10-01T00:00", "q": 1.0}],
+                              "state_times": [], "variant": None}))
+    srcs = _overlap(monkeypatch)
+    assert _threads(lambda i: fleetstore._merge_rows("1234567", "m", str(fl), None), N) == []
+    _one_temp_per_call(srcs, tmp_path / "results")
+    assert statecache.load_record("1234567", "m")["rows"][0]["q"] == 1.0
+
+
+def test_conus_states_threads(tmp_path, monkeypatch):
+    from hf_data import conusstate
+    res = {"time": datetime(2026, 10, 20, 16),
+           "grids": {"sm": np.full((3, 4), 0.5, "float32")}}
+    dst = {"nrows": 3, "ncols": 4, "xll": -100.0, "yll": 35.0}
+    sd = tmp_path / "states"
+    srcs = _overlap(monkeypatch)
+    assert _threads(lambda i: conusstate.write_states(res, dst, str(sd), overwrite=True),
+                    N) == []
+    _one_temp_per_call(srcs, sd)
+
+
+def test_persist_restore_tif_threads(tmp_path, monkeypatch):
+    from hf_data import forcing, persist
+    pqf = str(tmp_path / "x.pqf")
+    forcing._write_pqf(pqf, np.full((4, 5), 2.0, "float32"), -90.0, 40.0, 0.01, -9999.0)
+    out = tmp_path / "tif"
+    srcs = _overlap(monkeypatch)
+    assert _threads(lambda i: persist._pqf_to_tif(pqf, str(out / "x.tif")), N) == []
+    _one_temp_per_call(srcs, out)
+
+
+def test_population_window_threads(tmp_path, monkeypatch):
+    from affine import Affine
+    from hf_data import worldpop
+    monkeypatch.setattr(worldpop, "RV_DIR", str(tmp_path))
+    monkeypatch.setattr(worldpop, "_pick_mode", lambda bbox, year: "1km")
+    monkeypatch.setattr(worldpop, "_read_window", lambda url, bbox, res: (
+        np.ones((2, 2), "float32"), Affine(0.01, 0, -90, 0, -0.01, 41)))
+    srcs = _overlap(monkeypatch)
+    assert _threads(lambda i: worldpop.build_window(
+        "20261020_x", (-90, 40.98, -89.98, 41), log=lambda m: None), N) == []
+    _one_temp_per_call(srcs, tmp_path)
+    assert str(np.load(tmp_path / "pop_20261020_x.npz")["res"]) == "1km"
+
+
+def test_population_band_download_threads(tmp_path, monkeypatch):
+    import requests
+    from hf_data import worldpop
+    tif = tmp_path / "band.tif"
+    write_grid(str(tif), np.ones((4, 4)), -90.0, 41.0, res=0.01)
+    body = tif.read_bytes()
+    rv = tmp_path / "rv"
+    monkeypatch.setattr(worldpop, "RV_DIR", str(rv))
+
+    class Resp:
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, n):
+            yield body
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Resp())
+    srcs = _overlap(monkeypatch)
+    assert _threads(lambda i: worldpop._read_window(
+        "https://example.invalid/band_1km.tif", (-89.98, 40.98, -89.96, 41.0), "1km"),
+        N) == []
+    _one_temp_per_call(srcs, rv)
+    assert (rv / "band_1km.tif").read_bytes() == body
 
 
 # --- ungauged runner: workers are spawned, never forked -----------------------

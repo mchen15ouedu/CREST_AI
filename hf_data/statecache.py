@@ -56,7 +56,9 @@ def load_record(gauge, model) -> dict | None:
 
 
 def save_record(gauge, model, rows: list[dict], state_times: list[str],
-                variant: str | None = None):
+                variant: str | None = None, provenance: dict | None = None):
+    """Merge rows into the record; `provenance` ({extent, cut_ids, lakes}: what
+    the rows were simulated on) is stamped onto it."""
     rec = load_record(gauge, model) or {"gauge": str(gauge).zfill(8), "model": model,
                                         "rows": [], "window": None, "state_times": []}
     if variant is not None and rec.get("variant") != variant:
@@ -73,6 +75,8 @@ def save_record(gauge, model, rows: list[dict], state_times: list[str],
         ts = [_rt(r["time"]) for r in merged]
         rec["window"] = [min(ts).strftime(TS_FMT), max(ts).strftime(TS_FMT)]
     rec["state_times"] = sorted(set(rec["state_times"]) | set(state_times))
+    if provenance:
+        rec.update(provenance)
     with open(results_path(gauge, model), "w") as f:
         json.dump(rec, f)
     return rec
