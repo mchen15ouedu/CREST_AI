@@ -32,6 +32,7 @@ import threading
 import time
 
 from hf_data import statecache
+from hf_data.atomicfile import atomic_path
 
 REPO = os.environ.get("CREST_FLEET_REPO", "vincewin/CREST_fleet")
 # re-probe a key this often: the ungauged fleet re-uploads checkpoints, the
@@ -102,10 +103,8 @@ def _merge_rows(gauge, rows_model, path: str, variant: str | None) -> int:
            "window": [rows[0]["time"], rows[-1]["time"]],
            "state_times": states, "variant": var, "fleet_sig": sig}
     dst = statecache.results_path(gauge, rows_model)
-    tmp = dst + ".tmp"
-    with open(tmp, "w") as fh:
+    with atomic_path(dst) as tmp, open(tmp, "w") as fh:
         json.dump(rec, fh)
-    os.replace(tmp, dst)
     return len(frows)
 
 
