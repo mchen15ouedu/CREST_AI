@@ -23,6 +23,8 @@ import os
 
 import numpy as np
 
+from hf_data.atomicfile import atomic_path
+
 _GEO_KEYS = (b"nrows", b"ncols", b"xllcorner", b"yllcorner", b"cellsize", b"nodata")
 
 
@@ -143,14 +145,13 @@ def unpack(data: bytes | str, state_dir: str, overwrite: bool = False) -> int:
         a = pf.read(columns=[name]).column(0).to_numpy().astype("float32").reshape(nr, nc)
         if not _lossless(name):
             a[a == nod16] = nodata                 # restore exact nodata value
-        tmp = p + ".tmp"
         # untiled/uncompressed/stripped: the EF5 reader is picky (persist.py profile)
-        with rasterio.open(tmp, "w", driver="GTiff", height=nr, width=nc, count=1,
-                           dtype="float32", crs="EPSG:4326",
-                           transform=from_origin(xll, yll + nr * cell, cell, cell),
-                           nodata=nodata, tiled=False, blockysize=1) as ds:
+        with atomic_path(p) as tmp, rasterio.open(
+                tmp, "w", driver="GTiff", height=nr, width=nc, count=1,
+                dtype="float32", crs="EPSG:4326",
+                transform=from_origin(xll, yll + nr * cell, cell, cell),
+                nodata=nodata, tiled=False, blockysize=1) as ds:
             ds.write(a, 1)
-        os.replace(tmp, p)
         written.add(name)
         n += 1
     for k, v in md.items():

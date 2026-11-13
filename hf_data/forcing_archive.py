@@ -58,6 +58,13 @@ VARS = {
                    "h", "TEMPForcing TEMP", "temp_YYYYMMDDHH.pqf", "C", "1h"),
 }
 
+# Canonical temperature grid: the geometry of every full-domain temp PQF in the
+# store (NLDAS-heritage 0.125-deg CONUS). NARR-derived members (scripts/
+# update_temp_narr.py) are resampled onto this same grid so ALL temp timesteps
+# — and the temperature-extrapolation DEM built against them — share one
+# geometry. (xll, yll, cellsize, nrows, ncols, nodata)
+TEMP_GRID = (-124.9375, 25.0625, 0.12473060344827586, 224, 464, -9999.0)
+
 
 def store_key(bbox) -> str:
     """Key of the per-(variable, basin box) clipped-forcing store
@@ -128,6 +135,11 @@ def check_temp_units(a: np.ndarray, nodata: float, name: str,
     return out, True
 
 
+def kelvin_to_degc(a: np.ndarray) -> np.ndarray:
+    """Kelvin source field -> degC (for writers whose upstream ships Kelvin)."""
+    return np.asarray(a, dtype="float64") - K_OFFSET
+
+
 def validate(var: str, a: np.ndarray, nodata: float, name: str) -> tuple[np.ndarray, bool]:
     """Apply THE RULE above to a full-domain grid -> (grid in EF5 unit, was_kelvin)."""
     if var == "temp":
@@ -154,6 +166,31 @@ def _read_pqf(data: bytes):
     return a, float(m["xllcorner"]), float(m["yllcorner"]), float(m["cellsize"]), float(m["nodata"])
 
 
+def _encode_pqf(a: np.ndarray, xll: float, yll: float, cell: float, nodata: float,
+                where) -> None:
+    """Write grid `a` as a PQF to `where` (a path or a binary file object)."""
+    import pyarrow as pa
+    nr, nc = a.shape
+    meta = {b"ncols": str(nc).encode(), b"nrows": str(nr).encode(),
+            b"xllcorner": repr(float(xll)).encode(), b"yllcorner": repr(float(yll)).encode(),
+            b"cellsize": repr(float(cell)).encode(), b"nodata": repr(float(nodata)).encode()}
+    schema = pa.schema([pa.field("v", pa.float32())]).with_metadata(meta)
+    pq.write_table(pa.table({"v": np.asarray(a).reshape(-1).astype("float32")},
+                            schema=schema), where, compression="zstd")
+
+
+def _write_pqf(path: str, a: np.ndarray, xll: float, yll: float, cell: float, nodata: float):
+    """Atomic PQF file write, temp name unique per call: the shared store may
+    have concurrent readers (EF5), and two writers - fleet workers or dashboard
+    threads - may clip the same hour (nested basins share a store)."""
+    from hf_data.atomicfile import atomic_path
+    with atomic_path(path) as tmp:
+        _encode_pqf(a, xll, yll, cell, nodata, tmp)
+
+
+read_pqf = _read_pqf          # public name: PQF bytes -> (array, xll, yll, cell, nodata)
+
+
 def clip_window(bbox, xll, yll, cell, nr, nc):
     """Row/col window of bbox on a grid — the SAME arithmetic as _clip, so a
     grid built from this geometry is cell-identical to the clipped forcing."""
@@ -166,6 +203,18 @@ def clip_window(bbox, xll, yll, cell, nr, nc):
     return r0, r1, c0, c1
 
 
+def temp_clip_geometry(bbox):
+    """Geometry of the basin-clipped temp grid ->
+    (nxll, nyll, cell, nrows, ncols) or None if bbox is outside the grid."""
+    xll, yll, cell, nr, nc = TEMP_GRID[:5]
+    win = clip_window(bbox, xll, yll, cell, nr, nc)
+    if win is None:
+        return None
+    r0, r1, c0, c1 = win
+    top = yll + nr * cell
+    return xll + c0 * cell, top - r1 * cell, cell, r1 - r0, c1 - c0
+
+
 def _clip(a, xll, yll, cell, nodata, bbox):
     """Clip full-domain grid to bbox (W,S,E,N). Returns (sub, nxll, nyll) or None."""
     nr, nc = a.shape
@@ -175,6 +224,37 @@ def _clip(a, xll, yll, cell, nodata, bbox):
     r0, r1, c0, c1 = win
     top = yll + nr * cell
     return a[r0:r1, c0:c1], xll + c0 * cell, top - r1 * cell
+
+
+# --------------------------------------------------------------------------- #
+# write interface
+# --------------------------------------------------------------------------- #
+def check_for_store(var: str, a: np.ndarray, nodata: float, name: str) -> None:
+    """The per-variable rules a stored grid must pass — the same rules `read`
+    applies, except nothing is converted: a temperature grid must already be
+    degC (a Kelvin grid raises TempUnitsError), never stored to be undone later."""
+    if var == "temp":
+        check_temp_units(a, nodata, name, convert=False)
+    else:
+        validate(var, a, nodata, name)
+
+
+def store_bytes(var: str, a: np.ndarray, xll: float, yll: float, cell: float,
+                nodata: float, name: str = "") -> bytes:
+    """Encode a full-domain grid of `var` as archive member bytes (PQF), after
+    the per-variable rules. Raises ForcingRangeError rather than store a bad grid."""
+    check_for_store(var, a, nodata, name or var)
+    buf = io.BytesIO()
+    _encode_pqf(a, xll, yll, cell, nodata, buf)
+    return buf.getvalue()
+
+
+def store_file(path: str, var: str, a: np.ndarray, xll: float, yll: float,
+               cell: float, nodata: float) -> None:
+    """Like store_bytes, written atomically to `path` (a basin-store clip)."""
+    import os
+    check_for_store(var, a, nodata, os.path.basename(path))
+    _write_pqf(path, a, xll, yll, cell, nodata)
 
 
 # --------------------------------------------------------------------------- #

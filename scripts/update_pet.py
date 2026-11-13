@@ -40,7 +40,7 @@ import truststore
 truststore.inject_into_ssl()
 
 from forcing_update_common import HF_REPO, hf_token, scan_months, update_month  # noqa: E402
-from hf_data.forcing import _write_pqf                                          # noqa: E402
+from hf_data.forcing_archive import store_bytes                               # noqa: E402
 
 BASE_URL = ("https://edcintl.cr.usgs.gov/downloads/sciweb1/shared/fews/web/"
             "global/daily/pet/downloads/daily")
@@ -93,10 +93,7 @@ def produce(t: datetime) -> bytes | None:
     xll, yll, cell, nr, nc, nod = PET_GRID
     if a.shape != (nr, nc):
         return None
-    buf = os.path.join(tempfile.gettempdir(), "_pet_member.pqf")
-    _write_pqf(buf, a, xll, yll, cell, nod)
-    with open(buf, "rb") as fh:
-        return fh.read()
+    return store_bytes("pet", a, xll, yll, cell, nod, name=t.strftime(MEMBER_FMT))
 
 
 def main() -> int:
