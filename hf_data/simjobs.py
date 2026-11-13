@@ -124,7 +124,7 @@ class SimJob:
         """The browser's end-of-gauge event, derived from the run's result."""
         self._finished.add(gid)                  # frees the timeline pacing check
         self._emit({"kind": "gauge_done", "gauge_id": gid,
-                    "outcome": res.outcome.value, "reason": res.reason,
+                    "outcome": res.outcome.value, "ok": res.ok, "reason": res.reason,
                     "n": len(self.hydro.get(gid, []))})
 
     def _run_one(self, gid):

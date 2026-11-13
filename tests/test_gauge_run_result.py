@@ -99,6 +99,31 @@ def test_run_stopped_mid_stream_ends_cancelled(offline):
     assert 0 < len(res.rows) < 25
 
 
+# ---- the chat demo's analyze() ends the same way ----------------------------
+def _analyze(offline, monkeypatch, gid):
+    import types
+    monkeypatch.setattr(offline, "parse_query", lambda q, hours=48: types.SimpleNamespace(
+        label="test", anchor=(41.2, -90.5), t_start=T0, t_end=T1))
+    monkeypatch.setattr(offline, "select_outlet", lambda anchor: {
+        "id": gid, "name": "Test Creek", "lat": 41.2, "lon": -90.5, "area": 448.6})
+    return _drain(offline.analyze("test", use_mock=True, hours=3))
+
+
+def test_analyze_without_a_basin_ends_with_a_typed_result(offline, monkeypatch):
+    from hf_data.runresult import GaugeRunResult, Outcome
+    _, res = _analyze(offline, monkeypatch, "15019990")
+    assert isinstance(res, GaugeRunResult)
+    assert res.outcome is Outcome.NO_BASIN and res.reason == "no_terrain" and not res.ok
+
+
+def test_analyze_mock_run_ends_ok_with_its_rows(offline, monkeypatch):
+    from hf_data.runresult import GaugeRunResult, Outcome
+    evs, res = _analyze(offline, monkeypatch, "05467000")
+    streamed = [r for k, p in evs if k == "hydro" for r in p["rows"]]
+    assert isinstance(res, GaugeRunResult) and res.outcome is Outcome.OK and res.ok
+    assert res.gauge_id == "05467000" and res.rows == streamed and len(res.rows) == 3
+
+
 # ---- web job runner: the browser's gauge_done is derived from the result ----
 def _job(offline, monkeypatch, gauge_ids, cancelled=False):
     from hf_data import llm, simjobs
@@ -117,6 +142,8 @@ def test_job_reports_outcomes_not_return_codes(offline, monkeypatch):
     assert done["15019990"]["outcome"] == "no_basin"
     assert done["15019990"]["reason"] == "no_terrain"
     assert not any("returncode" in e for e in done.values())
+    # the browser reads `ok` from the result, it does not re-derive it
+    assert done["05467000"]["ok"] is True and done["15019990"]["ok"] is False
 
 
 def test_job_reports_cached_and_cancelled(offline, monkeypatch):

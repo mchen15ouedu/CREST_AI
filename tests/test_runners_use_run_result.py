@@ -256,3 +256,15 @@ def test_calibration_stops_when_the_baseline_does_not_simulate(mock_runs, monkey
     kind, done = evs[-1]
     assert kind == "done" and "ef5 rc=139" in done["error"]
     assert not [p for k_, p in evs if k_ == "round"]
+
+
+def test_calibration_of_an_outlet_without_a_basin_ends_by_outcome(mock_runs):
+    """The no-basin exit says so with the run outcome vocabulary; `error`
+    stays, so autocal still records the gauge as not calibrated."""
+    from hf_data import calibrate
+    from hf_data.runresult import Outcome
+    kind, done = list(calibrate._run_calibration("15019990", T0, T1, use_mock=True,
+                                                 rounds=1, k=2, ext_rounds=0))[-1]
+    assert kind == "done" and done["outcome"] == Outcome.NO_BASIN.value
+    assert done["reason"] == "no_terrain" and "no basin boundary" in done["error"]
+    assert "no_basin" not in done

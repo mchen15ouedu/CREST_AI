@@ -204,7 +204,9 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
     Two-stage budget: rounds*k candidates, then — only if the best NSE is
     still below ext_nse — one extended stage of ext_rounds*ext_k more.
     Yields ("status", str) | ("round", dict) | ("hydro", {rows}) |
-    ("done", {best_nse, baseline_nse, best_params, saved, improved, extended}).
+    ("done", {best_nse, baseline_nse, best_params, saved, improved, extended}),
+    or ("done", {error, ...}) when nothing was calibrated — for an outlet
+    without a basin outline also {outcome: "no_basin", reason}.
     """
     from hf_data import multipliers
     from hf_data.pipeline import gauge_info, run_gauge
@@ -219,7 +221,9 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
         basinextent.ef5_extent(g)
     except basinextent.BasinExtentError as e:
         yield ("status", f"⚠️ {e} — not calibrated")
-        yield ("done", {"error": f"no basin boundary: {e.reason}", "no_basin": True})
+        from hf_data.runresult import Outcome
+        yield ("done", {"error": f"no basin boundary: {e.reason}",
+                        "outcome": Outcome.NO_BASIN.value, "reason": e.reason})
         return
     wb_model = "crest" if (model == "crest" or (model == "auto" and g["lon"] < -105)) else "crestphys"
     ef5_model = wb_model if model in ("auto", "crest", "crestphys") else model

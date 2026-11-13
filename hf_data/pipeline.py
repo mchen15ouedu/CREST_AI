@@ -151,7 +151,7 @@ def analyze(query: str, use_mock: bool = True, hours: int = 48, model: str = "cr
         ext = basinextent.ef5_extent(g)
     except basinextent.BasinExtentError as e:
         yield ("status", f"⚠️ {e} — not simulated; CREST-AI never falls back to a box")
-        yield ("done", {"returncode": -2, "no_basin": True, "reason": e.reason})
+        yield ("done", GaugeRunResult(Outcome.NO_BASIN, g["id"], reason=e.reason))
         return
     bbox = ext["bounds"]
     sn = ext["snap"]
@@ -187,8 +187,23 @@ def analyze(query: str, use_mock: bool = True, hours: int = 48, model: str = "cr
     else:
         handle = run_ef5(spec.control_path, out_dir, g["id"], model=model)
 
+    rows = []
     for ev in stream_run(handle, poll=0.2):
-        yield (ev["kind"], ev)          # 'hydro' | 'q2d' | 'done'
+        if ev["kind"] != "done":
+            if ev["kind"] == "hydro":
+                rows += ev["rows"]
+            yield (ev["kind"], ev)      # 'hydro' | 'q2d'
+            continue
+        rc = ev.get("returncode")
+        if ev.get("cancelled"):
+            res = GaugeRunResult(Outcome.CANCELLED, g["id"], rows)
+        elif rc in (0, None):
+            res = GaugeRunResult(Outcome.OK, g["id"], rows, cache_model=model)
+        else:
+            res = GaugeRunResult(Outcome.FAILED, g["id"], rows,
+                                 ev.get("error") or f"EF5 exited rc={rc}")
+        yield ("done", res)
+        return
 
 
 WEST_LON = -105.0          # west of the Rocky Mountain front -> CREST (task #8)
@@ -1171,4 +1186,6 @@ if __name__ == "__main__":
         elif kind == "q2d":
             nq += 1
         elif kind == "done":
-            print(f"DONE rc={payload.get('returncode')} | {nrows} hydro rows, {nq} q-grids")
+            print(f"DONE {payload.outcome.value}"
+                  f"{' (' + payload.reason + ')' if payload.reason else ''}"
+                  f" | {nrows} hydro rows, {nq} q-grids")
