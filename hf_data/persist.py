@@ -103,18 +103,18 @@ def _pqf_to_tif(pqf_path: str, tif_path: str):
     reader is picky, same profile as the snow/temp-DEM writer)."""
     import rasterio
     from rasterio.transform import from_origin
+    from hf_data.atomicfile import atomic_path
     from hf_data.forcing import _read_pqf
     with open(pqf_path, "rb") as fh:
         a, xll, yll, cell, nodata = _read_pqf(fh.read())
     nr, nc = a.shape
     os.makedirs(os.path.dirname(tif_path), exist_ok=True)
-    tmp = tif_path + ".tmp"
-    with rasterio.open(tmp, "w", driver="GTiff", height=nr, width=nc, count=1,
-                       dtype="float32", crs="EPSG:4326",
-                       transform=from_origin(xll, yll + nr * cell, cell, cell),
-                       nodata=nodata, tiled=False, blockysize=1) as ds:
+    with atomic_path(tif_path) as tmp, rasterio.open(
+            tmp, "w", driver="GTiff", height=nr, width=nc, count=1,
+            dtype="float32", crs="EPSG:4326",
+            transform=from_origin(xll, yll + nr * cell, cell, cell),
+            nodata=nodata, tiled=False, blockysize=1) as ds:
         ds.write(a.astype("float32"), 1)
-    os.replace(tmp, tif_path)
 
 
 # ---- scan / naming ----------------------------------------------------------
