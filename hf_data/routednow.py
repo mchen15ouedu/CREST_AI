@@ -87,24 +87,28 @@ def compute(gid: str, t0: datetime, hist_days: int = HIST_DAYS,
     cuts: list = []
 
     def _drain(gen, tag):
+        from hf_data.runresult import Outcome
         rows: list[dict] = []
-        model = None
         n_up = None
+        res = None
         for kind, ev in gen:
             if kind == "hydro":
                 rows += ev.get("rows", [])
             elif kind == "status":
                 status.append(f"[{tag}] {ev}")
             elif kind == "params":
-                if ev.get("state_model") or ev.get("cache_model"):
-                    # the key EF5 actually saved state under
-                    model = ev.get("state_model") or ev["cache_model"]
                 if ev.get("n_upstream") is not None:
                     n_up = ev["n_upstream"]
-                if ev.get("cut_ids") is not None:
-                    cuts[:] = list(ev["cut_ids"])
-            elif kind == "done" and ev.get("no_basin"):
-                no_basin.append(ev.get("reason"))
+            elif kind == "done":
+                res = ev
+        model = None
+        if res is not None:
+            if res.outcome is Outcome.NO_BASIN:
+                no_basin.append(res.reason)
+            # the key EF5 actually saved state under, and the run's cut set
+            model = res.state_model or res.cache_model
+            if (res.provenance or {}).get("cut_ids") is not None:
+                cuts[:] = list(res.provenance["cut_ids"])
         return rows, model, n_up
 
     # Phase A: cached hindcast to t0 (advances + saves state; observed only).
