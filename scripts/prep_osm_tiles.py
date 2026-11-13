@@ -39,6 +39,7 @@ import truststore
 truststore.inject_into_ssl()
 
 from forcing_update_common import hf_token   # noqa: E402
+from hf_data.atomicfile import atomic_path   # noqa: E402
 
 REPO = "vincewin/CREST_riskdata"
 SRC = os.environ.get("OSM_SRC", r"E:\hydroZone\riskdata_src\osm")
@@ -88,11 +89,9 @@ def download_state(state: str) -> str:
     r = requests.get(url, stream=True, timeout=3600,
                      headers={"User-Agent": "CREST-AI/1.0"})
     r.raise_for_status()
-    tmp = local + ".part"
-    with open(tmp, "wb") as fh:
+    with atomic_path(local) as tmp, open(tmp, "wb") as fh:
         for chunk in r.iter_content(1 << 22):
             fh.write(chunk)
-    os.replace(tmp, local)
     print(f"  {os.path.getsize(local) / 1e6:.0f} MB in "
           f"{time.time() - t0:.0f} s", flush=True)
     return local
@@ -224,19 +223,20 @@ def process_state(state: str):
         road = grids.road.get(k)
         if os.path.exists(f):
             # context-manage the npz: np.load keeps the file handle open
-            # (lazy NpzFile) and Windows then refuses the os.replace below
+            # (lazy NpzFile) and Windows then refuses the replace below
             with np.load(f) as z:
                 old_b, old_r = z["bld"], z["road"]
             bld = old_b if bld is None else (old_b.astype(np.uint32)
                                              + bld).clip(0, 65535
                                                          ).astype(np.uint16)
             road = old_r if road is None else np.maximum(old_r, road)
-        np.savez_compressed(f + ".tmp.npz",
-                            bld=bld if bld is not None
-                            else np.zeros((N, N), np.uint16),
-                            road=road if road is not None
-                            else np.zeros((N, N), np.uint8))
-        os.replace(f + ".tmp.npz", f)
+        # a file object, not a path: savez would append ".npz" to the temp name
+        with atomic_path(f) as tmp, open(tmp, "wb") as fh:
+            np.savez_compressed(fh,
+                                bld=bld if bld is not None
+                                else np.zeros((N, N), np.uint16),
+                                road=road if road is not None
+                                else np.zeros((N, N), np.uint8))
     if grids.crit:
         import pandas as pd
         cf = os.path.join(ACC, f"crit_{state}.parquet")

@@ -27,7 +27,7 @@ import time
 
 import numpy as np
 
-from hf_data.atomicfile import atomic_path
+from hf_data.atomicfile import atomic_path, move_into_place
 
 MIN_COVER = float(os.environ.get("CREST_MOSAIC_MIN_COVER", "0.90"))
 PARTIAL_COVER = float(os.environ.get("CREST_STATE_PARTIAL_COVER", "0.50"))
@@ -134,7 +134,7 @@ def _replace(src: str, dst: str, tries: int = 5) -> bool:
     hard-linked into another run's private folder."""
     for i in range(tries):
         try:
-            os.replace(src, dst)
+            move_into_place(src, dst)
             return True
         except OSError:
             pass

@@ -346,6 +346,45 @@ def test_population_band_download_threads(tmp_path, monkeypatch):
     assert (rv / "band_1km.tif").read_bytes() == body
 
 
+# --- results records + the one place that moves files into place --------------
+def test_save_record_failure_keeps_the_old_record(tmp_path, monkeypatch):
+    from hf_data import statecache
+    monkeypatch.setattr(statecache, "CACHE_DIR", str(tmp_path))
+    row = {"time": "2026-10-20 16:00", "sim_q": 1.0}
+    statecache.save_record("01234567", "m", [row], [])
+
+    def half(obj, fh, **kw):
+        fh.write('{"rows": [')
+        raise OSError("disk full")
+    with monkeypatch.context() as m:
+        m.setattr(statecache.json, "dump", half)
+        with pytest.raises(OSError):
+            statecache.save_record("01234567", "m", [dict(row, sim_q=9.0)], [])
+    assert statecache.load_record("01234567", "m")["rows"] == [row]
+    assert _tmp_left(tmp_path / "results") == []
+
+
+def test_only_atomicfile_moves_files_into_place():
+    """Ticket 11: shared-store writers (and the offline prep scripts) go
+    through hf_data.atomicfile; nobody else calls os.replace / os.rename or
+    builds per-process temp names."""
+    import ast
+    import pathlib
+    root = pathlib.Path(ROOT)
+    offenders = []
+    for d in ("hf_data", "scripts", "fleet"):
+        for p in sorted((root / d).rglob("*.py")):
+            rel = p.relative_to(root).as_posix()
+            if rel == "hf_data/atomicfile.py":
+                continue
+            for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"))):
+                if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                        and node.value.id == "os"
+                        and node.attr in ("replace", "rename", "getpid")):
+                    offenders.append(f"{rel}:{node.lineno} os.{node.attr}")
+    assert offenders == []
+
+
 # --- ungauged runner: workers are spawned, never forked -----------------------
 def test_ungauged_pass_spawns_workers(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location(
