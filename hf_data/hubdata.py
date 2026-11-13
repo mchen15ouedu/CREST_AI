@@ -115,6 +115,14 @@ def fleet_repo() -> str:
     return os.environ.get("CREST_FLEET_REPO", DEFAULT_FLEET_REPO)
 
 
+DEFAULT_STATE_REPO = "vincewin/CREST_state"
+
+
+def state_repo() -> str:
+    """The private cache mirror (persist.py: states, results, params, ...)."""
+    return os.environ.get("CREST_STATE_REPO", DEFAULT_STATE_REPO)
+
+
 def token() -> str | None:
     """The Hub token, or None (read-only, anonymous)."""
     return os.environ.get("HF_TOKEN") or None
@@ -472,3 +480,8 @@ def feedback() -> Dataset:
 def fleet() -> Dataset:
     """The fleet dataset repo on the real Hub."""
     return Dataset(fleet_repo())
+
+
+def state() -> Dataset:
+    """The state (cache mirror) dataset repo on the real Hub."""
+    return Dataset(state_repo())
