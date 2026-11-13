@@ -134,6 +134,10 @@ def fetch_usgs_hourly_batch(sites: list[str], t0: datetime, t1: datetime,
 
 
 # ---- pqf reader (CREST_data forcing format) ----------------------------------
+# The one PQF decoder kept outside hf_data.forcing_archive.read_pqf, on purpose:
+# this directory is deployed ALONE as the CREST_nowcast Gradio Space (imports
+# `data` top-level, requirements.txt only), so hf_data is not importable here.
+# Keep in sync with hf_data/forcing_archive.py::_read_pqf.
 def _read_pqf(data: bytes):
     pf = pq.ParquetFile(io.BytesIO(data))
     m = {k.decode(): v.decode() for k, v in pf.schema_arrow.metadata.items()

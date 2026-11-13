@@ -21,14 +21,6 @@ MRMS_TAR = "mrms/2026/mrms_2026_07.tar"
 MRMS_MEMBER = "mrms_corr_2026072005.pqf"
 
 
-def test_decode_returns_the_full_domain_grid():
-    from hf_data.forcing_archive import decode
-    g = decode("mrms", pqf_bytes(MRMS), "x.pqf")
-    np.testing.assert_array_equal(g.values, MRMS)
-    assert (g.xll, g.yll, g.cell, g.nodata) == (-100.0, 40.0, 1.0, NODATA)
-    assert g.member == "x.pqf"
-
-
 def test_read_without_a_box_returns_the_full_domain():
     from hf_data.forcing_archive import ForcingArchive
     arc = ForcingArchive(fetch=FakeStore({MRMS_TAR: tar_bytes({MRMS_MEMBER: pqf_bytes(MRMS)})}))

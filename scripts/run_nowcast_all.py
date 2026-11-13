@@ -151,30 +151,30 @@ def _statics_z(token, ck, gid, fname="gauges/gauge_statics.parquet",
 
 
 # ---- precip: summed-area-table box means -------------------------------------
-def _on_mrms_grid(g) -> np.ndarray | None:
-    """Grid values when the grid is on the writer's MRMS lattice, else None."""
-    if g is None or g.values.shape != tuple(MRMS_GRID[3:5]):
+def _on_mrms_grid(a) -> np.ndarray | None:
+    """The grid when it is on the writer's MRMS lattice, else None."""
+    if a is None or a.shape != tuple(MRMS_GRID[3:5]):
         return None
-    return g.values
+    return a
 
 
 def _hour_grid(t: datetime, recent: dict, arc, load_recent) -> tuple[np.ndarray | None, bool]:
     """(full MRMS grid for hour t or None, came from the Pass2 tar).
     The mrms_recent Pass1 grid when there is one (what operations ran on),
     else the Pass2 month tar through the forcing archive."""
-    from hf_data.forcing_archive import decode
+    from hf_data.forcing_archive import read_pqf
     if t in recent:
         try:
             data = load_recent(recent[t])
         except Exception:
             data = None
         if data is not None:
-            return _on_mrms_grid(decode("mrms", data, recent[t])), False
+            return _on_mrms_grid(read_pqf(data)[0]), False
     try:
         g = arc.read("mrms", t)
     except Exception:                      # gap or network: the hour is missing
         return None, False
-    return _on_mrms_grid(g), g is not None
+    return _on_mrms_grid(g.values if g is not None else None), g is not None
 
 
 def _basin_box(lon, lat, area_km2, pad=1.2):

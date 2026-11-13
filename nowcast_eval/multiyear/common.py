@@ -5,14 +5,17 @@ models (v1, v3-full) is 2023-01..2025-06 -> those months are IN-SAMPLE (time),
 everything else is out-of-sample. Gauges: all served (allgauge/eval_gauges.txt).
 """
 import glob
-import io
 import math
 import os
+import sys
 import tarfile
 from datetime import datetime, timedelta
 
 import numpy as np
 import pyarrow.parquet as pq
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from hf_data.forcing_archive import read_pqf  # noqa: E402  (numpy + pyarrow only)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ALLG = os.path.join(BASE, "..", "allgauge")
@@ -68,13 +71,8 @@ def gauges():
 
 # ---- verbatim copies of run_nowcast_all.py grid helpers ----------------------
 def read_pqf_bytes(data):
-    pf = pq.ParquetFile(io.BytesIO(data))
-    meta = {k.decode(): v.decode() for k, v in pf.schema_arrow.metadata.items()
-            if not k.startswith(b"ARROW")}
-    nr, nc = int(meta["nrows"]), int(meta["ncols"])
-    if (nr, nc) != MRMS_GRID[3:5]:
-        return None
-    return pf.read().column("v").to_numpy().reshape(nr, nc)
+    a = read_pqf(data)[0]                  # the forcing archive's decoder
+    return a if a.shape == MRMS_GRID[3:5] else None
 
 
 def _basin_box(lon, lat, area_km2, pad=1.2):

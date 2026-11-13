@@ -272,16 +272,6 @@ class Grid:
     was_kelvin: bool = False  # temperature stored in K, converted to degC on read
 
 
-def decode(var: str, data: bytes, name: str = "") -> Grid:
-    """PQF bytes of one `var` timestep -> full-domain Grid, validated for its
-    variable (THE RULE above). For grids that do not come out of a forcing tar
-    (e.g. the mrms_recent Pass1 files); tar members go through
-    ForcingArchive.read."""
-    a, xll, yll, cell, nod = _read_pqf(data)
-    a, was_k = validate(var, a, nod, name)
-    return Grid(a, xll, yll, cell, nod, name, was_k)
-
-
 class ArchiveGap(LookupError):
     """The archive has no tar (month or year) for this variable and month."""
     def __init__(self, var: str, year: int, month: int):
@@ -335,14 +325,15 @@ class ForcingArchive:
             member = t.strftime(cfg.out_fmt)    # the generic name
         if member not in names:
             return None
-        g = decode(var, tf.extractfile(member).read(), member)  # validated whole
+        a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())
+        a, was_k = validate(var, a, nod, member)     # full grid, before clipping
         if bbox is None:
-            return g
-        clip = _clip(g.values, g.xll, g.yll, g.cell, g.nodata, bbox)
+            return Grid(a, xll, yll, cell, nod, member, was_k)
+        clip = _clip(a, xll, yll, cell, nod, bbox)
         if clip is None:                        # box outside the archive grid
             return None
         sub, nxll, nyll = clip
-        return Grid(sub, nxll, nyll, g.cell, g.nodata, member, g.was_kelvin)
+        return Grid(sub, nxll, nyll, cell, nod, member, was_k)
 
     def close(self):
         for tf, _ in self._open.values():
