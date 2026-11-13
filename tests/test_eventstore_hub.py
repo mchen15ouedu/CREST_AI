@@ -37,8 +37,9 @@ def test_note_autocal_commits_record_and_ledger_together(hub, monkeypatch):
     rows = [{"gauge": "09000003", "ran": True, "at": "2026-10-01T00:00:00Z"},
             {"gauge": "09000002", "ran": False, "at": "2026-10-02T00:00:00Z"}]
     hub.files[es.AUTOCAL_FILE] = json.dumps(rows).encode()
-    rec = {"gauge": "09000004", "kind": "backlog", "ran": True,
-           "at": "2026-10-20T00:00:00Z", "baseline_nse": 0.1, "best_nse": 0.4}
+    rec = {"gauge": "09000004", "kind": "low_nse", "event": "E", "ran": True,
+           "at": "2026-10-20T00:00:00Z", "nse": -0.4, "n_pairs": 20,
+           "baseline_nse": 0.1, "best_nse": 0.4}
     assert es.note_autocal(rec) is True
     assert len(hub.commits) == 1                            # one commit, both files
     assert _json(hub, es.AUTOCAL_FILE) == rows + [rec]
@@ -53,6 +54,11 @@ def test_note_autocal_commits_record_and_ledger_together(hub, monkeypatch):
     assert len(_json(hub, es.AUTOCAL_FILE)) == 2           # the log is capped ...
     assert set(_json(hub, es.AUTOCAL_DONE_FILE)) == {"09000003", "09000004"}   # ... the ledger not
     assert _json(hub, es.AUTOCAL_DONE_FILE)["09000004"]["n"] == 2
+    # an existing ledger is extended, never re-seeded from the (capped) log
+    hub.files[es.AUTOCAL_DONE_FILE] = json.dumps(
+        {"09000001": {"first": "a", "last": "a", "n": 1}}).encode()
+    assert es.note_autocal(rec) is True
+    assert set(_json(hub, es.AUTOCAL_DONE_FILE)) == {"09000001", "09000004"}
 
 
 def test_note_autocal_never_overwrites_history_it_could_not_read(hub):

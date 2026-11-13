@@ -1,6 +1,6 @@
 """V25: nowcast-triggered 2-D inundation events (CREST-iMAP v2 coupling).
 
-Chain: nowcast risk tiers (tier 3 = next-6-h AI peak >= Q5) -> hotspot
+Chain: AI nowcasting tiers (tier 3 = next-6-h AI peak >= Q5) -> hotspot
 clusters pick trigger gauges -> EF5 nowcast-mode run over the basin with
 output_grids=streamflow|runoff|subrunoff -> crestimap well-balanced solver
 (3DEP DEM on demand) -> compact depth frames -> eventstore (one commit).
@@ -10,9 +10,9 @@ domain is the whole catchment contributing to the trigger gauge as a union
 of WBD HUC12 units (hf_data/hucdomain.py) — the solver integrates only those
 cells (the raster outside them is a sink) and the HUC12 units are the tiles
 the parallel tier spreads across devices. RESOLUTION IS FIXED at the DEM's
-native cell size. Workers get the full basin; the demoted CPU rung, when it
-must run, keeps only the HUC12 units nearest the gauge that fit
-EVENT_MAX_CELLS (hydrologic-unit trimming — still a basin, never a window).
+native cell size. Protocol 2 prepares the full HUC basin and defers a basin
+that exceeds native preparation/worker capacity; upstream units are never
+dropped merely to fit a memory budget.
 crestimap installs from the CREST-iMAP fork's v2 branch (Dockerfile);
 everything here degrades to a clear error if it's missing.
 """
@@ -39,6 +39,13 @@ CONT_TIER = int(os.environ.get("EVENT_CONT_TIER", "1"))
 # gauges that stop reporting mid-episode.
 CONT_OBS_MULT = float(os.environ.get("EVENT_CONT_OBS_MULT", "5.0"))
 MAX_EPISODE_H = int(os.environ.get("EVENT_MAX_EPISODE_H", "96"))
+# ONE FLOOD, ONE EPISODE: a gauge flagged again within EVENT_REOPEN_H of its
+# last episode's end REOPENS that episode (same id, same episode_started
+# anchor) instead of opening a new event id. A gauge hovering at the
+# continuation bar was ended one hour and re-triggered the next, splitting
+# one flood into a dozen 2-h episodes (09353800, 08353000; 2026-10-27..31).
+# 0 disables reopening.
+REOPEN_H = float(os.environ.get("EVENT_REOPEN_H", "12"))
 MAX_PER_TICK = int(os.environ.get("EVENT_MAX_PER_TICK", "2"))
 # V30: the CPU rung is a LAST resort, not a parallel engine — in queue mode
 # "on" a local solve runs only when an event has gone this long with no
@@ -65,12 +72,11 @@ WARMUP_D = int(os.environ.get("EVENT_WARMUP_D", "30"))
 # back 12 h from t0 to capture the rising limb from the beginning
 SIM_BACKSET_H = int(os.environ.get("EVENT_SIM_BACKSET_H", "12"))
 MAX_CELLS = int(os.environ.get("EVENT_MAX_CELLS", "400000"))
-# GPU-queue budget (bbox cells of the bundled domain; 0 = whole basin). Set
-# when no worker can take very large basins (HPC released 2026-10-16; the
-# ZeroGPU worker accepts <= ZERO_MAX_CELLS): the bundle keeps the HUC12 units
-# nearest the gauge that fit — whole units at native resolution, never a box
-# or a coarser grid; EF5's routed flow enters at the cut as inlet inflow.
+# Retained for configuration compatibility. Protocol 2 does not trim HUC
+# units to this budget: its full native domain must pass PREP_MAX_CELLS.
 QUEUE_MAX_CELLS = int(os.environ.get("EVENT_QUEUE_MAX_CELLS", "0"))
+PREP_MAX_CELLS = int(os.environ.get("EVENT_PREP_MAX_CELLS", "35000000"))
+PREP_COOLDOWN_H = float(os.environ.get("EVENT_PREP_COOLDOWN_H", "6"))
 DEM_RES = os.environ.get("EVENT_DEM_RES", "1")
 DEM_CACHE = os.environ.get("EVENT_DEM_CACHE",
                            os.path.join(tempfile.gettempdir(), "dem_cache"))
@@ -85,9 +91,26 @@ DEM_RES_DEG = {"1": 1.0 / 3600.0, "13": 1.0 / 10800.0}
 _running: dict = {"id": None, "status": None, "log": [], "last": None,
                   "started": None}
 _lock = threading.Lock()
+# A job is marked running only after its expensive setup. Guard the entire
+# hourly visit separately, including preflight and retention, so repeated
+# updater pings cannot start overlapping SDK reads before run_one begins.
+_tick_lock = threading.Lock()
+_tick_state_lock = threading.Lock()
+_tick_state = {"running": False, "started": None, "completed": None,
+               "last_attempt": None, "last_success": None, "phase": "idle",
+               "phase_started": None, "last_progress": None, "outcome": None,
+               "error": None, "error_phase": None, "last_error_at": None,
+               "watchdog_dumped_at": None, "watchdog_phase": None}
+_tick_started_mono = None
+_tick_phase_mono = None
+_tick_watchdog_marker = None
+TICK_PREFLIGHT_STALL_S = 15 * 60
 # event ids whose local CPU solve blew CPU_MAX_H -> when it happened; the
 # tick's CPU-rung sweep skips them for CPU_COOLDOWN_H
 _cpu_timeout: dict = {}
+_capacity_lock = threading.Lock()
+_capacity_skips: dict = {}
+_capacity_retry: dict = {}
 
 
 def _busy_h() -> float | None:
@@ -109,8 +132,178 @@ def note_tick_attempt() -> None:
     endpoint's busy short-circuit, so `tick.last` means "the hourly ping is
     arriving" and the separate busy_h field carries the wedge alarm — before
     this, a wedged runner made the two indistinguishable."""
-    _running["last_tick"] = datetime.datetime.utcnow().strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
+    stamp = _tick_stamp()
+    _running["last_tick"] = stamp
+    with _tick_state_lock:
+        _tick_state["last_attempt"] = stamp
+
+
+def _tick_stamp():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def tick_status() -> dict:
+    """Pure process-memory progress; never reads the dataset or waits for work."""
+    with _tick_state_lock:
+        out = dict(_tick_state)
+        now = time.monotonic()
+        out["busy_h"] = (round(max(0, now - _tick_started_mono) / 3600, 3)
+                         if out["running"] and _tick_started_mono is not None else None)
+        out["phase_age_s"] = (round(max(0, now - _tick_phase_mono), 1)
+                              if out["running"] and _tick_phase_mono is not None else None)
+        out["preflight"] = out["running"] and out["phase"].startswith("preflight.")
+        out["watched_wait"] = out["running"] and _tick_wait_phase(out["phase"])
+        out["stalled"] = bool(out["watched_wait"] and out["phase_age_s"] is not None
+                               and out["phase_age_s"] >= TICK_PREFLIGHT_STALL_S)
+    blocked = capacity_status()
+    out["capacity_blocked"] = sum(1 for row in blocked if row.get("relevant", True))
+    out["capacity_skips"] = blocked
+    return out
+
+
+def capacity_status():
+    """Memory-only capacity deferrals; published maps are never edited here."""
+    with _capacity_lock:
+        return [dict(row) for row in _capacity_skips.values()]
+
+
+def _capacity_suppressed(gid):
+    gid = str(gid)
+    key = (gid, "1", PREP_MAX_CELLS, "protocol2-full-huc-chain")
+    with _capacity_lock:
+        if time.monotonic() < _capacity_retry.get(key, 0):
+            row = _capacity_skips.get(gid)
+            if row:
+                row["relevant"] = True
+                return dict(row)
+    return None
+
+
+def _capacity_reconcile(relevant):
+    with _capacity_lock:
+        for gid, row in _capacity_skips.items():
+            row["relevant"] = gid in relevant
+
+
+def _capacity_clear(gid):
+    with _capacity_lock:
+        _capacity_skips.pop(str(gid), None)
+        for key in list(_capacity_retry):
+            if key[0] == str(gid):
+                _capacity_retry.pop(key, None)
+
+
+def _capacity_skip(gid, event_id, details, retry_h=None):
+    now = datetime.datetime.utcnow()
+    retry_h = PREP_COOLDOWN_H if retry_h is None else retry_h
+    record = {"gauge": str(gid), "event_id": event_id, "skipped": "native_capacity",
+              "published": False, "dem_res": "1", "native_resolution": "1 arc-second (~30 m)",
+              "limit_cells": PREP_MAX_CELLS, "recorded": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "retry_after": (now + datetime.timedelta(hours=retry_h)).strftime(
+                  "%Y-%m-%dT%H:%M:%SZ"), "relevant": True,
+              "existing_result_preserved": True, **details}
+    key = (str(gid), "1", PREP_MAX_CELLS, "protocol2-full-huc-chain")
+    with _capacity_lock:
+        _capacity_skips[str(gid)] = record
+        _capacity_retry[key] = time.monotonic() + retry_h * 3600
+    _running["last"] = {"event": event_id, "ok": False,
+                        "skipped": "native_capacity", "native_capacity": record}
+    return {"event_id": event_id, "gauge": str(gid), "published": False,
+            "skipped": "native_capacity", "native_capacity": dict(record)}
+
+
+def _native_bbox_estimate(bounds):
+    """Native 1-arc-second lattice envelope, including the builder's 2-cell pad."""
+    w, s, e, n = map(float, bounds)
+    if not all(math.isfinite(v) for v in (w, s, e, n)) or w >= e or s >= n:
+        raise ValueError("invalid native basin extent")
+    res = DEM_RES_DEG["1"]
+    west, south = math.floor(w / res) - 2, math.floor(s / res) - 2
+    east, north = math.ceil(e / res) + 2, math.ceil(n / res) + 2
+    nx, ny = east - west, north - south
+    return {"bbox": [west * res, south * res, east * res, north * res],
+            "nx": nx, "ny": ny, "n_bbox": nx * ny, "pad_cells": 2, "dem_res": "1"}
+
+
+def _native_preflight(g, ext, hucdomain):
+    """Metadata-only full-chain estimates, before EF5 allocates its raster arrays.
+    ext: the gauge's basinextent.ef5_extent — EF5's raster extent is the basin
+    outline's, so the EF5 estimate covers it unioned with the HUC12 chain."""
+    if str(DEM_RES) != "1" or PREP_MAX_CELLS <= 0:
+        raise ValueError("protocol 2 requires nominal 30 m and a positive preparation cell limit")
+    h0 = hucdomain.gauge_huc12(float(g["lat"]), float(g["lon"]))
+    chain = hucdomain.upstream_chain(h0)
+    ids = {str(row["huc12"]) for row in chain}
+    if not ids or str(h0) not in ids:
+        raise ValueError("full HUC chain unavailable")
+    index = hucdomain.index()
+    for hid in ids:
+        # upstream_chain has a traversal ceiling: require closure so a
+        # partial chain can never masquerade as a safe, smaller full basin.
+        if any(str(index["huc12"][i]) not in ids for i in index["_up"].get(hid, [])):
+            raise ValueError("HUC chain traversal is incomplete")
+    ii = [index["_pos"][hid] for hid in ids]
+    hb = (float(index["minx"][ii].min()), float(index["miny"][ii].min()),
+          float(index["maxx"][ii].max()), float(index["maxy"][ii].max()))
+    eb = tuple(map(float, ext["bounds"]))
+    ef5_union = (min(hb[0], eb[0]), min(hb[1], eb[1]),
+                 max(hb[2], eb[2]), max(hb[3], eb[3]))
+    estimates = {"huc_native": _native_bbox_estimate(hb),
+                 "ef5_union_native": _native_bbox_estimate(ef5_union),
+                 "full_huc_count": len(ids)}
+    return estimates, ids
+
+
+def _tick_wait_phase(phase):
+    return phase.startswith("preflight.") or phase == "retention"
+
+
+def _tick_phase(phase):
+    global _tick_phase_mono
+    stamp = _tick_stamp()
+    with _tick_state_lock:
+        _tick_state.update(phase=phase, phase_started=stamp, last_progress=stamp)
+        _tick_phase_mono = time.monotonic()
+
+
+def _tick_note_error(exc):
+    with _tick_state_lock:
+        _tick_state.update(error=type(exc).__name__, error_phase=_tick_state["phase"],
+                           last_error_at=_tick_stamp())
+
+
+def _tick_watchdog_check() -> bool:
+    """Dump each stalled network-wait phase once, to authenticated runtime logs.
+
+    faulthandler prints code paths and stack frames, never frame locals or
+    configuration. No stack data is exposed through an HTTP endpoint.
+    """
+    global _tick_watchdog_marker
+    with _tick_state_lock:
+        marker = (_tick_started_mono, _tick_phase_mono)
+        phase = _tick_state["phase"]
+        if (not _tick_state["running"] or not _tick_wait_phase(phase)
+                or _tick_phase_mono is None
+                or time.monotonic() - _tick_phase_mono < TICK_PREFLIGHT_STALL_S
+                or marker == _tick_watchdog_marker):
+            return False
+        _tick_watchdog_marker = marker
+        _tick_state.update(watchdog_dumped_at=_tick_stamp(), watchdog_phase=phase)
+    import faulthandler
+    import sys
+    print(f"event tick watchdog: wait phase {phase} unchanged for at least "
+          f"{TICK_PREFLIGHT_STALL_S}s; private thread stacks follow", file=sys.stderr, flush=True)
+    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    return True
+
+
+def _tick_watchdog(stop):
+    while not stop.wait(30):
+        try:
+            _tick_watchdog_check()
+        except Exception as exc:
+            # Keep only the exception class in runtime diagnostics as well.
+            print(f"event tick watchdog: {type(exc).__name__}", flush=True)
 
 
 def status(full: bool = False) -> dict:
@@ -118,18 +311,14 @@ def status(full: bool = False) -> dict:
             "started": _running.get("started"), "busy_h": _busy_h(),
             "log": _running["log"][-(400 if full else 30):],
             "last": _running["last"],
-            "missed": _running.get("missed", [])[-20:]}
+            "missed": _running.get("missed", [])[-20:], "tick": tick_status(),
+            "capacity_skips": capacity_status()}
 
 
 OBS_GATE_FRAC = float(os.environ.get("EVENT_OBS_GATE", "0.3"))   # of Q2
 OBS_WINDOW_H = int(os.environ.get("EVENT_OBS_WINDOW_H", "6"))
-# CREST-miss guard (user 2026-09-23): the event list is decided by the nowcast
-# trigger + the USGS observation, but the 2-D solver only has the water EF5
-# delivers (routed flow is a boundary condition, runoff routes inside). When
-# EF5's peak at the trigger gauge over the anchored window is below this
-# fraction of the observed peak, the map would be a dry basin beside a
-# flooding gauge — publish nothing, record the miss. No runoff scaling: a
-# bias-corrected forcing is not a simulation. 0 disables the guard.
+# Outlet-discharge disagreement is advisory, not a distributed-runoff volume check.
+# The same severe ratio selects observed fallback only at safe upstream cuts.
 MIN_SIM_FRAC = float(os.environ.get("EVENT_MIN_SIM_FRAC", "0.3"))
 
 
@@ -163,7 +352,7 @@ def _crest_missed(hydro: dict, trigger: dict | None, gid: str,
                   t_from: datetime.datetime, log=print) -> dict | None:
     """EF5 peak at the trigger gauge from t_from on vs the observed peak
     (hydro obs rows, else the trigger's observation, else NWIS now). A dict
-    describing the miss when sim < MIN_SIM_FRAC x obs, else None."""
+    describing severe under/overprediction, used only as an advisory."""
     if MIN_SIM_FRAC <= 0:
         return None
     key = t_from.strftime("%Y-%m-%d %H:%M")
@@ -190,11 +379,12 @@ def _crest_missed(hydro: dict, trigger: dict | None, gid: str,
     frac = sim_pk / obs_pk
     log(f"CREST check: EF5 peak {sim_pk:.1f} m3/s vs observed peak "
         f"{obs_pk:.1f} m3/s ({src}) = {100 * frac:.0f}% "
-        f"(guard {100 * MIN_SIM_FRAC:.0f}%)")
-    if frac >= MIN_SIM_FRAC:
+        f"(advisory range {MIN_SIM_FRAC:.2f}..{1 / MIN_SIM_FRAC:.2f}x)")
+    if MIN_SIM_FRAC <= frac <= 1 / MIN_SIM_FRAC:
         return None
     return {"sim_peak_m3s": round(sim_pk, 2), "obs_peak_m3s": round(obs_pk, 2),
-            "frac": round(frac, 3), "obs_source": src}
+            "frac": round(frac, 3), "obs_source": src,
+            "reason": "severe_underprediction" if frac < MIN_SIM_FRAC else "severe_overprediction"}
 
 
 def _age_days_started(s: dict) -> float | None:
@@ -205,6 +395,45 @@ def _age_days_started(s: dict) -> float | None:
         return (datetime.datetime.utcnow() - t).total_seconds() / 86400.0
     except ValueError:
         return None
+
+
+def _reopen_candidate(idx: dict, gid: str, now: datetime.datetime,
+                      skip=()) -> str | None:
+    """The gauge's most recent episode if it ENDED within REOPEN_H hours —
+    measured from final.ended, else t_end, else the entry's generated time —
+    and is still inside MAX_EPISODE_H (an over-age episode would just end
+    again next tick; a new episode starts instead). None otherwise, and for
+    ids in `skip`: episodes ended in THIS tick, whose finalize thread is
+    running. A fragment absorbed into another episode (merged_into, from the
+    merge script) is never a candidate nor the gauge's most recent episode.
+    Pinned events are refused by eventstore.reopen_episodes."""
+    if REOPEN_H <= 0:
+        return None
+    mine = [e for e, s in idx.items() if not s.get("merged_into")
+            and str(((s.get("trigger") or {}).get("gauge")) or s.get("gauge") or "") == gid]
+    if not mine:
+        return None
+    eid = max(mine)                   # YYYYMMDDHH_<gauge>: the latest start
+    s = idx[eid]
+    if eid in skip or s.get("status") != "ended":
+        return None
+    end = None
+    for t in ((s.get("final") or {}).get("ended"), s.get("t_end"), s.get("generated")):
+        try:
+            end = datetime.datetime.strptime(str(t or "")[:16], "%Y-%m-%dT%H:%M")
+            break
+        except ValueError:
+            continue
+    try:
+        age_h = (now - datetime.datetime.strptime(
+            s.get("episode_started") or s.get("t0") or "", "%Y-%m-%dT%H:%MZ")
+        ).total_seconds() / 3600.0
+    except ValueError:
+        return None
+    if (end is None or (now - end).total_seconds() / 3600.0 > REOPEN_H
+            or age_h > MAX_EPISODE_H):
+        return None
+    return eid
 
 
 def detect(max_events: int = 1) -> list[dict]:
@@ -228,6 +457,8 @@ def detect(max_events: int = 1) -> list[dict]:
         reds = [m for m in cluster.get("top_gauges", []) if m.get("tier") == 3]
         cands = []
         for m in reds:
+            if _capacity_suppressed(m["id"]):
+                continue
             g = pipeline.gauge_info(m["id"])
             if not g or g["id"] in seen:
                 continue
@@ -353,16 +584,19 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     published folder is replaced with the fresh window).
     defer: enqueue for a worker WITHOUT the CPU fallback (manual refills —
     the runner stays free and the worker publishes whenever it gets there).
-    force_cpu: solve locally even in queue mode "on" — the tick passes this
-    when an event has sat unclaimed/unpublished past EVENT_CPU_FALLBACK_H
-    (V30: the CPU rung is demoted to that last resort; a fresh enqueue no
-    longer burns hours of runner CPU on a solve a worker replaces anyway).
+    force_cpu: retained for older callers; boundary protocol 2 always waits
+    for a compatible Jetstream2 worker, because CPU images retain old code.
     cold: do NOT carry the episode's previous depth frame into the bundle as
     a warm start — the workers re-solve the whole anchored span from the
     channel pre-wet, and publish replaces every frame (a full re-run, e.g.
     after the engine/domain changed; the box-era frames must not survive)."""
-    from crestimap import EventConfig, run_event   # needs the v2 package
     from . import eventqueue, eventstore, nowcaststore, pipeline
+
+    suppressed = _capacity_suppressed(gid)
+    if suppressed:
+        return {"event_id": suppressed.get("event_id"), "gauge": str(gid),
+                "published": False, "skipped": "native_capacity",
+                "native_capacity": suppressed, "suppressed": True}
 
     g = pipeline.gauge_info(gid)
     if g is None:
@@ -399,13 +633,13 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
     t_start = min(t0 - datetime.timedelta(hours=HINDCAST_H), sim_anchor)
     t_end = t0 + datetime.timedelta(hours=HORIZON_H)
     ev_id = episode_id or f"{t0:%Y%m%d%H}_{gid}"
-    work = tempfile.mkdtemp(prefix=f"event_{gid}_")
+    work = None
 
     def log(s):
         _running["log"].append(s)
 
     with _lock:
-        _running.update(id=ev_id, status="ef5", log=[],
+        _running.update(id=ev_id, status="native_capacity", log=[],
                         started=datetime.datetime.utcnow().strftime(
                             "%Y-%m-%dT%H:%M:%SZ"))
     try:
@@ -413,10 +647,34 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         # outline (basinextent: GAGES-II polygon ∪ the carved catchment, on
         # the HydroSHEDS lattice) — the same extent as the dashboard's runs,
         # so they share clip and forcing stores. No basin -> no event.
-        from . import basinextent
+        from . import basinextent, hucdomain
         ext = basinextent.ef5_extent(g)
         log(f"EF5 extent from the basin outline ({ext['source']}, "
             f"{ext['carved_km2']:,.0f} km² catchment, {ext['cells']:,} cells)")
+        if _tick_state.get("running"):
+            _tick_phase(f"preflight.native_capacity:{gid}")
+        try:
+            estimates, full_huc_ids = _native_preflight(g, ext, hucdomain)
+        except Exception as e:
+            log(f"native preparation deferred: full basin extent/chain unavailable ({type(e).__name__})")
+            return _capacity_skip(gid, ev_id, {
+                "reason": "native_domain_incomplete", "error": type(e).__name__,
+                "needs": "verified_full_basin_extent_and_huc_chain"}, retry_h=.25)
+        if max(estimates["huc_native"]["n_bbox"], estimates["ef5_union_native"]["n_bbox"]) > PREP_MAX_CELLS:
+            log(f"native preparation deferred: full HUC bbox {estimates['huc_native']['n_bbox']:,} "
+                f"cells; EF5 union {estimates['ef5_union_native']['n_bbox']:,} cells; limit "
+                f"{PREP_MAX_CELLS:,}; a larger native-grid worker/preparation host is required")
+            return _capacity_skip(gid, ev_id, {
+                "reason": "full_basin_exceeds_native_capacity", "estimates": estimates,
+                "needs": "larger_native_grid_worker_and_preparation_capacity"})
+        _capacity_clear(gid)
+        log(f"native preparation capacity: full HUC bbox {estimates['huc_native']['n_bbox']:,}; "
+            f"EF5 union {estimates['ef5_union_native']['n_bbox']:,}; limit {PREP_MAX_CELLS:,}")
+        work = tempfile.mkdtemp(prefix=f"event_{gid}_")
+        with _lock:
+            _running["status"] = "ef5"
+        if _tick_state.get("running"):
+            _tick_phase(f"run:{gid}")
         log(f"EF5 nowcast-mode run {t_start:%m-%d %H}Z -> {t_end:%m-%d %H}Z "
             f"with gridded runoff output")
         meta = {}
@@ -456,38 +714,16 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         model = (meta.get("model") or "crest").lower()
         wb_model = "crest" if model in ("crest", "hp") else "crestphys"
 
-        # CREST-miss guard: no map when EF5 missed the flood the gauge saw
+        # Outlet Q is evaluation/advisory data, never an injected boundary.
+        # User policy 2026-10-27: use observed Q only at safe upstream cuts;
+        # otherwise let the runoff-driven 2-D solve assess the water supplied.
         miss = _crest_missed(hydro, trigger, gid, sim_anchor, log)
         if miss:
-            rec = {"event": ev_id, "gauge": gid, "t0": t0.strftime("%Y-%m-%dT%H:%MZ"),
-                   "episode": bool(episode_id),
-                   "at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   **miss}
-            log(f"CREST MISSED IT: EF5 peak {miss['sim_peak_m3s']} m3/s is "
-                f"{100 * miss['frac']:.0f}% of the observed {miss['obs_peak_m3s']} "
-                f"m3/s — no inundation map published for {ev_id}")
-            if episode_id:
-                # the listed map came from the same EF5 water — just as
-                # wrong; take it down rather than leave a dry basin listed
-                # (pinned demo events are never dropped: drop_events refuses)
-                try:
-                    dropped = eventstore.drop_events([episode_id], purge=True,
-                                                     why="CREST missed it")
-                    log("listed map disowned: dropped from the list" if dropped
-                        else "listed map kept (pinned demo event or nothing to drop)")
-                except Exception as e:
-                    log(f"drop failed ({type(e).__name__})")
-            with _lock:
-                _running.setdefault("missed", []).append(rec)
-                del _running["missed"][:-50]
-            try:
-                eventstore.note_missed(rec)
-            except Exception as e:
-                log(f"missed.json not updated ({type(e).__name__})")
-            _running["last"] = {"event": ev_id, "ok": True,
-                                "skipped": "crest_missed", **miss}
-            return {"event_id": ev_id, "published": False,
-                    "skipped": "crest_missed", **miss}
+            trigger = {**(trigger or {}), "outlet_q_advisory": {
+                **miss, "action": "continue_runoff_driven_2d",
+                "note": "Outlet Q mismatch is not a distributed-runoff volume check"}}
+            log(f"outlet Q advisory: EF5 peak is {100 * miss['frac']:.0f}% of "
+                "observed; continuing 2-D preparation with explicit boundary policy")
 
         # diagnostics: what did EF5 actually write, and what did we ask for?
         ctl = os.path.join(work, "control.txt")
@@ -513,12 +749,20 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         with _lock:
             _running["status"] = "domain"
         dom = hucdomain.build_domain(g, out_dir, dem_res=DEM_RES,
-                                     max_cells=QUEUE_MAX_CELLS or None, log=log)
-        if dom.get("trimmed"):
-            log(f"GPU budget: kept {dom['n_hucs']} of {dom.get('of_n_hucs')} HUC12 "
-                f"units nearest the gauge ({dom.get('area_km2')} of "
-                f"{dom.get('of_area_km2')} km2) to fit EVENT_QUEUE_MAX_CELLS="
-                f"{QUEUE_MAX_CELLS / 1e6:.1f}M")
+                                     max_cells=0, log=log)
+        built_huc_ids = {str(row["huc12"]) for row in dom.get("hucs", [])}
+        if dom.get("trimmed") or built_huc_ids != full_huc_ids:
+            log("native domain incomplete: generation must retain the full preflight HUC chain")
+            return _capacity_skip(gid, ev_id, {
+                "reason": "native_domain_incomplete", "estimates": estimates,
+                "full_huc_count": len(full_huc_ids), "built_huc_count": len(built_huc_ids),
+                "trimmed": bool(dom.get("trimmed")),
+                "needs": "verified_full_basin_domain_without_upstream_trimming"}, retry_h=.25)
+        if int(dom.get("n_bbox") or 0) > PREP_MAX_CELLS:
+            return _capacity_skip(gid, ev_id, {
+                "reason": "full_basin_exceeds_native_capacity", "estimates": estimates,
+                "actual_domain_bbox_cells": dom["n_bbox"],
+                "needs": "larger_native_grid_worker_and_preparation_capacity"})
         basin_ring = dom["basin"]
         dom_extent = tuple(dom["bbox"])        # raster extent of the HUC12 union
         # worker spec = full anchored span (fixed episode window); the local
@@ -527,6 +771,19 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         sim_start = sim_anchor
         sim_start_local = max(sim_anchor,
                               t0 - datetime.timedelta(hours=SIM_BACKSET_H))
+
+        from . import boundary_fallback
+        coupling, dom = boundary_fallback.prepare(
+            g, out_dir, dom, sim_start, t_end, dem_res=DEM_RES,
+            min_ratio=(MIN_SIM_FRAC if 0 < MIN_SIM_FRAC < 1 else 0.3),
+            model=wb_model, log=log)
+        trigger = {**(trigger or {}), "boundary_policy": {
+            "version": coupling["version"], "mode": coupling["mode"],
+            "implementation": coupling["implementation"],
+            "fingerprint": coupling["fingerprint"],
+            "sources": [{k: i[k] for k in ("gauge_id", "source", "reason")}
+                        for i in coupling["inlets"]],
+            "excluded_gauges": coupling["excluded_gauges"]}}
 
         # warm continuation (user directive 2026-08-14): the hourly update
         # inherits the previous run's water state. The episode's latest
@@ -537,9 +794,17 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         if episode_id and cold:
             log("cold re-run: no warm-start frame — the whole anchored span "
                 "is re-solved and every published frame replaced")
+        elif episode_id and coupling["subsurface_routing"]["mode"] == "kw":
+            log("KW interflow requires its full water/IR checkpoint; no depth-only "
+                "warm start is copied (worker resumes its complete local session or reconstructs from anchor)")
         elif episode_id:
             try:
                 pm = eventstore._prior_manifest(ev_id) or {}
+                prior_fingerprint = ((pm.get("coupling") or {}).get("fingerprint")
+                                     or pm.get("forcing_fingerprint")
+                                     or ((pm.get("trigger") or {}).get("boundary_policy") or {}).get("fingerprint"))
+                if prior_fingerprint != coupling["fingerprint"]:
+                    raise ValueError("boundary policy/domain changed; prior depth cannot initialize this solve")
                 js = sim_start_local.strftime("%Y-%m-%dT%H:%MZ")
                 cand = [f for f in pm.get("frames", [])
                         if f.get("t", "") <= js and f.get("file")]
@@ -563,13 +828,19 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
             except Exception as e:
                 log(f"no warm-start IC ({type(e).__name__}) — cold pre-wet")
 
-        # V27 P1: offer the solve to a GPU worker — full basin at native
-        # resolution, everything it needs in one bundle. The worker pool is
-        # a ladder (HPC GPU -> ZeroGPU Space -> nobody); the local CPU
-        # window below remains the unconditional fallback.
+        # Offer the native-resolution basin and its versioned forcing
+        # contract to the compatible Jetstream2 worker.
         queued = False
         if eventqueue.mode() != "off":
             spec = {"event_id": ev_id, "episode": bool(episode_id),
+                    "worker_protocol": 2,
+                    "required_engine_prefix": "jetstream2:",
+                    "coupling": {k: coupling[k] for k in
+                                 ("version", "policy", "mode", "fingerprint", "implementation",
+                                  "domain_mask_sha256", "subsurface_routing")},
+                    "boundary_content_sha256": coupling["content_sha256"],
+                    "forcing_fingerprint": coupling["fingerprint"],
+                    "interflow": "kw",
                     "gauge": {"id": gid, "lat": g["lat"], "lon": g["lon"],
                               "area_km2": g.get("area")},
                     "bbox_basin": list(dom_extent),
@@ -621,100 +892,24 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                     # the bundle queued; the tick re-checks and only falls
                     # back to a local solve after EVENT_CPU_FALLBACK_H with
                     # no claim and no publish progress
-                    log(f"no worker claim — bundle stays queued (CPU "
-                        f"fallback only after {CPU_FALLBACK_H:g} h "
-                        f"without progress)")
+                    log("no worker claim — bundle stays queued for a compatible "
+                        "Jetstream2 worker (CPU fallback disabled for boundary protocol 2)")
                     _running["last"] = {"event": ev_id, "ok": True,
                                         "queued": True}
                     return {"event_id": ev_id, "published": False,
                             "queued": True}
 
-        with _lock:
-            _running["status"] = "solver"
-        # wall-clock budget for the demoted CPU rung (see CPU_MAX_H): the
-        # solver calls progress once per output frame, so raising from the
-        # callback aborts mid-integration instead of holding the tick for
-        # days. Only armed when a worker can pick the bundle up instead.
-        solve_log = log
-        if queued and CPU_MAX_H > 0:
-            deadline = time.monotonic() + CPU_MAX_H * 3600.0
+        # CPU images retain the previous solver pin. Only the compatible
+        # Jetstream2 worker may consume this versioned forcing contract.
+        if queued:
+            log("boundary protocol 2: waiting for a compatible Jetstream2 worker; "
+                "CPU fallback is disabled for this policy")
+            _running["last"] = {"event": ev_id, "ok": True, "queued": True,
+                                "worker_protocol": 2}
+            return {"event_id": ev_id, "published": False, "queued": True,
+                    "worker_protocol": 2}
+        raise RuntimeError("boundary protocol 2 requires a successfully queued compatible worker job")
 
-            def solve_log(s):                       # noqa: F811
-                log(s)
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"local CPU solve exceeded EVENT_CPU_MAX_H="
-                        f"{CPU_MAX_H:g} h ({s})")
-
-        # CPU rung domain: the HUC12 units nearest the gauge that fit the CPU
-        # cell budget at native resolution — hydrologic units, never a
-        # window. Written to its own dir so the full-basin domain already
-        # bundled for the workers is untouched.
-        cpu_dom_dir = os.path.join(work, "cpu_domain")
-        cpu_dom = hucdomain.build_domain(g, out_dir, dem_res=DEM_RES,
-                                         out_dir=cpu_dom_dir,
-                                         max_cells=MAX_CELLS, log=log)
-        cfg = EventConfig(
-            event_id=ev_id, bbox=tuple(cpu_dom["bbox"]),
-            t0=t0, t_end=t_end, ef5_output_dir=out_dir,
-            out_dir=os.path.join(work, "event_out"), model=wb_model,
-            sim_start=sim_start_local,
-            dem_res=DEM_RES, dem_cache=DEM_CACHE, max_cells=MAX_CELLS,
-            domain_path=os.path.join(cpu_dom_dir, "domain_huc.tif"),
-            trigger={**(trigger or {}), "gauge": gid}, progress=solve_log)
-        try:
-            manifest = run_event(cfg)
-        except TimeoutError as e:
-            # not a failure — the designed give-up. The bundle is already in
-            # the queue, so the work is not lost; only this runner is freed.
-            with _lock:
-                _cpu_timeout[ev_id] = datetime.datetime.utcnow()
-            log(f"{e} — aborted, bundle stays queued for a worker "
-                f"(no CPU retry for {CPU_COOLDOWN_H:g} h)")
-            _running["last"] = {"event": ev_id, "ok": True,
-                                "cpu_timeout": True, "queued": True}
-            return {"event_id": ev_id, "published": False,
-                    "cpu_timeout": True, "queued": True}
-        manifest["gauge"] = gid
-        manifest["hydro"] = [hydro[k] for k in sorted(hydro)]
-        manifest["status"] = "active"
-        manifest["basin"] = basin_ring     # HUC12 union outline (whole basin)
-        manifest["huc12s"] = [h["huc12"] for h in dom["hucs"]]
-        # domain summary = builder facts (units, area) + solver facts (cells)
-        manifest["domain"] = {**{k: v for k, v in dom.items()
-                                 if k not in ("basin", "hucs")},
-                              **(manifest.get("domain") or {})}
-        if cpu_dom.get("trimmed"):
-            manifest["cpu_trimmed"] = {"n_hucs": cpu_dom["n_hucs"],
-                                       "area_km2": cpu_dom["area_km2"],
-                                       "of_n_hucs": dom.get("of_n_hucs") or dom["n_hucs"]}
-
-        with _lock:
-            _running["status"] = "archive"
-        try:
-            _update_archive(cfg.out_dir, manifest, log)
-        except Exception as e:
-            log(f"archive update failed ({type(e).__name__}: {e}) — "
-                f"continuing without it")
-        if not manifest.get("archive_frames"):
-            # bone-dry simulation: nothing to show, nothing to re-run — end
-            # the episode so the hourly tick stops burning compute on it
-            manifest["status"] = "ended"
-            manifest["dry"] = True
-            log("simulated dry (no wet cells in any frame) — episode ended")
-
-        with _lock:
-            _running["status"] = "render"
-        _make_pngs(cfg.out_dir, manifest)
-        log(f"rendered {len(manifest['frames'])} PNG overlays")
-
-        with _lock:
-            _running["status"] = "publish"
-        ok = eventstore.publish_event(cfg.out_dir, manifest)
-        log("published" if ok else "publish FAILED (kept locally)")
-        manifest["published"] = ok
-        _running["last"] = {"event": ev_id, "ok": True, "published": ok}
-        return manifest
     except Exception as e:
         import traceback
         tb = traceback.format_exc().strip().splitlines()
@@ -923,29 +1118,84 @@ def run_detected(max_events: int = 1) -> list[dict]:
 
 
 def hourly_tick() -> dict:
+    """Run one complete hourly visit; overlapping pings return immediately."""
+    global _tick_started_mono
+    note_tick_attempt()
+    if not _tick_lock.acquire(blocking=False):
+        return {"skipped": "runner busy", "tick": tick_status()}
+    stop = threading.Event()
+    result = None
+    try:
+        stamp = _tick_stamp()
+        with _tick_state_lock:
+            _tick_started_mono = time.monotonic()
+            _tick_state.update(running=True, started=stamp, error=None, error_phase=None,
+                               outcome=None)
+        _tick_phase("preflight.runner")
+        threading.Thread(target=_tick_watchdog, args=(stop,), daemon=True,
+                         name="event-tick-watchdog").start()
+        if _running["id"]:
+            result = {"skipped": "runner busy"}
+        else:
+            result = _hourly_tick_body()
+        return result
+    except BaseException as exc:
+        _tick_note_error(exc)
+        raise
+    finally:
+        stop.set()
+        stamp = _tick_stamp()
+        with _tick_state_lock:
+            outcome = ("error" if _tick_state["error"] else
+                       "skipped" if result and result.get("skipped") else "ok")
+            _tick_state.update(running=False, completed=stamp, outcome=outcome,
+                               phase="failed" if outcome == "error" else "idle",
+                               phase_started=stamp, last_progress=stamp)
+            if outcome == "ok":
+                _tick_state["last_success"] = stamp
+        _tick_lock.release()
+
+
+def _hourly_tick_body() -> dict:
     """Called by the updater after each hourly data refresh.
 
-    1. Every ACTIVE episode whose gauge is still at/above EVENT_CONT_TIER is
-       re-simulated at the fresh t0 (same event id; folder replaced).
+    1. Every ACTIVE episode whose gauge is still at/above EVENT_CONT_TIER, or
+       is flagged again by this hour's detection, is re-simulated at the
+       fresh t0 (same event id; folder replaced).
     2. Episodes whose gauge receded below the tier (flow back to normal) or
        older than EVENT_MAX_EPISODE_H are marked ended — precipitation going
        to zero does NOT end an episode while the hydrograph is still high.
-    3. Newly flagged tier-3 gauges start new episodes.
+    3. Newly flagged tier-3 gauges start new episodes — or reopen their
+       gauge's episode that ended within EVENT_REOPEN_H (same id + anchor).
     Runs at most EVENT_MAX_PER_TICK simulations, sequentially.
     """
     from . import eventstore, nowcaststore
-    note_tick_attempt()                            # health: tick liveness
+    _tick_phase("preflight.conus_state")
     try:                       # CONUS state mosaic: index the fleet's new bundles
         from . import conusstate
         conusstate.maybe_refresh()
-    except Exception:
-        pass
-    if _running["id"]:
-        return {"skipped": "runner busy"}
+    except Exception as exc:
+        _tick_note_error(exc)
+    _tick_phase("preflight.nowcast_risk")
     risk = nowcaststore.all_risk()
     tiers = (risk or {}).get("tiers") or {}
+    _capacity_reconcile({str(gid) for gid, tier in tiers.items() if int(tier or 0) >= CONT_TIER})
+    _tick_phase("preflight.event_index")
     idx = eventstore.load_index()
     now = datetime.datetime.utcnow()
+
+    # detection runs BEFORE the end check: a gauge flagged again this hour is
+    # still flooding, so its episode is not ended in this tick (ending it and
+    # opening a new id for the same detection is what fragmented floods).
+    # The budget covers every active gauge plus EVENT_MAX_PER_TICK new ones.
+    _tick_phase("preflight.detect")
+    try:
+        picks = detect(MAX_PER_TICK + sum(
+            1 for s in idx.values() if s.get("status", "active") == "active"))
+    except Exception as exc:
+        _tick_note_error(exc)
+        picks = []
+    detected = {p["gauge"] for p in picks}
 
     jobs, ended = [], []
     for eid, s in idx.items():
@@ -961,65 +1211,138 @@ def hourly_tick() -> dict:
         tier = int(tiers.get(gid, 0))
         # observed flow decides the end: episode continues while the gauge's
         # recent USGS max is >= CONT_OBS_MULT x baseflow. AI tier only backs
-        # up a gauge that went silent (obs None).
-        obs = _recent_obs_max(gid) if gid else None
+        # up a gauge that went silent (obs None). A re-detected gauge goes on
+        # regardless (detect() just read its observations).
+        _tick_phase(f"preflight.episode_observations:{gid}")
+        obs = _recent_obs_max(gid) if gid and gid not in detected else None
         qbase = None
         try:
-            qbase = float((nowcaststore._thresholds().get(gid) or {}
-                           ).get("qbase") or 0) or None
+            _tick_phase(f"preflight.episode_thresholds:{gid}")
+            threshold = nowcaststore._thresholds().get(gid)
+            # Live threshold rows are (qbase, q2, q5, q10); older callers
+            # and fixtures provide a dictionary. Preserve observation-led
+            # episode continuation for both representations.
+            value = (threshold[0] if isinstance(threshold, (tuple, list)) and threshold
+                     else (threshold or {}).get("qbase"))
+            qbase = float(value or 0)
+            if not math.isfinite(qbase) or qbase <= 0:
+                qbase = None
         except Exception:
             pass
         if obs is not None and qbase:
             still_high = obs >= max(CONT_OBS_MULT * qbase, 1.0)
         else:
             still_high = tier >= CONT_TIER
-        if gid and still_high and age_h <= MAX_EPISODE_H:
+        if gid and (still_high or gid in detected) and age_h <= MAX_EPISODE_H:
+            if _capacity_suppressed(gid):
+                continue  # keep the episode intact; capacity is not recession.
             # publish progress stale + nobody claiming -> this re-sim runs
-            # on the CPU rung (V30 demotion: last resort, not default)
-            try:
-                pub_age_h = (now - datetime.datetime.strptime(
-                    s.get("generated") or "", "%Y-%m-%dT%H:%M:%SZ")
-                ).total_seconds() / 3600.0
-            except ValueError:
-                pub_age_h = float("inf")
+            # on the CPU rung (V30 demotion: last resort, not default). A
+            # reopened episode's clock starts at the reopen: its last publish
+            # predates the end, and the CPU rung must not engage an hour later
+            pub = []
+            for k in ("generated", "reopened"):
+                try:
+                    pub.append(datetime.datetime.strptime(
+                        s.get(k) or "", "%Y-%m-%dT%H:%M:%SZ"))
+                except ValueError:
+                    pass
+            pub_age_h = ((now - max(pub)).total_seconds() / 3600.0
+                         if pub else float("inf"))
             jobs.append({"gauge": gid, "episode": eid,
                          "force_cpu": pub_age_h > CPU_FALLBACK_H,
                          "trigger": {**(s.get("trigger") or {}), "tier": tier}})
         else:
             ended.append(eid)
     if ended:
+        _tick_phase("preflight.mark_ended")
         eventstore.mark_ended(ended)     # fast: stops re-sims immediately
+
+    from . import eventqueue as _eq
+    active_gauges = {j["gauge"] for j in jobs}
+    new_picks, fresh = [], []
+    for pick in picks:
+        if len(fresh) >= MAX_PER_TICK:
+            break
+        if _capacity_suppressed(pick["gauge"]):
+            continue
+        if pick["gauge"] in active_gauges:
+            continue
+        _tick_phase(f"preflight.queue_gauge:{pick['gauge']}")
+        if _eq.mode() == "on" and _eq.gauge_pending(pick["gauge"]):
+            continue           # already in the worker queue (index lags it)
+        # never an id ended in this tick: its finalize thread starts below
+        prev = _reopen_candidate(idx, pick["gauge"], now, skip=ended)
+        # a worker is mid-solve on it, or its spec waits in the queue
+        # unclaimed (a cold re-run: gauge_pending ignores those) — run_one
+        # would replace that spec; the queued job's publish reactivates it.
+        # An unreadable queue counts as queued: the next tick retries.
+        if prev and _eq.mode() == "on":
+            try:
+                queued = _eq.claim_fresh_for(prev) or _eq._spec(prev, strict=True)
+            except Exception:
+                queued = True
+            if queued:
+                continue
+        fresh.append((pick, prev))
+    reopened, superseded, refused, failed = set(), set(), set(), set()
+    if any(prev for _, prev in fresh):
+        _tick_phase("preflight.reopen")
+        want = [p for _, p in fresh if p]
+        got = eventstore.reopen_episodes(want, superseded=superseded,
+                                         refused=refused)
+        if got is None:                  # failed: index unreadable / commit raised
+            # ids it refused (pinned, gone from the index) start a new id as ever
+            failed = set(want) - superseded - refused
+        reopened = set(got or ())
+    for pick, prev in fresh:
+        if prev in reopened:
+            print(f"event tick: {pick['gauge']} flagged again — episode {prev} "
+                  f"reopened (ended < {REOPEN_H:g} h ago)")
+            new_picks.append({"gauge": pick["gauge"], "episode": prev,
+                              "trigger": {**(idx[prev].get("trigger") or {}),
+                                          "tier": int(tiers.get(pick["gauge"], 0))}})
+        elif prev in superseded:
+            # the fresh index has a newer or active episode at this gauge (or
+            # merged prev into one) since this tick read it: that episode is
+            # the flood now. A new id would fragment it again, so nothing
+            # starts for the gauge this tick; the next tick's index decides.
+            print(f"event tick: {pick['gauge']} flagged again — episode {prev} "
+                  f"superseded in the index; nothing started this tick")
+        elif prev in failed:
+            # the reopen itself failed (not refused): a new id would fragment
+            # the flood just the same, so nothing starts for the gauge this
+            # tick; the next tick retries the reopen
+            print(f"event tick: {pick['gauge']} flagged again — reopening "
+                  f"episode {prev} failed; nothing started this tick")
+        else:
+            new_picks.append({"gauge": pick["gauge"], "episode": None,
+                              "trigger": pick})
     # V30 episode final products: consolidate ended episodes (stats + the
     # episode-scoped nowcast verification) in a background thread — scoring
     # downloads ~1 archived nowcast per episode-hour and must not delay the
     # tick. Also self-heals: recently-ended episodes still missing "final"
-    # (e.g. a worker publish raced the index commit) get another pass.
+    # (e.g. a worker publish raced the index commit) get another pass —
+    # except the ones just reopened (dispatched after the reopen for that).
     heal = [e for e, s in idx.items()
             if s.get("status") == "ended" and not s.get("final")
-            and (_age_days_started(s) or 99.0) < 3.0]
+            and (_age_days_started(s) or 99.0) < 3.0 and e not in reopened]
     to_final = ended + [e for e in heal if e not in ended]
     if to_final:
+        _tick_phase("preflight.finalize_dispatch")
         threading.Thread(target=eventstore.finalize_episodes,
                          args=(to_final, print), daemon=True).start()
-
-    from . import eventqueue as _eq
-    active_gauges = {j["gauge"] for j in jobs}
-    new_picks = []
-    for pick in detect(MAX_PER_TICK):
-        if pick["gauge"] in active_gauges:
-            continue
-        if _eq.mode() == "on" and _eq.gauge_pending(pick["gauge"]):
-            continue           # already in the worker queue (index lags it)
-        new_picks.append({"gauge": pick["gauge"], "episode": None,
-                          "trigger": pick})
     # V30 CPU-rung last resort: queued bundles that were never published
     # (not in the index) and sat unclaimed past CPU_FALLBACK_H get a local
     # solve — enqueue-only detections and deferred refills must not strand
     # when every worker is dead or busy. t0 comes from the event id so a
     # backdated refill keeps its window.
     if _eq.mode() == "on":
+        _tick_phase("preflight.queue_status")
         for row in _eq.queue_status():
             rid, rgid = str(row.get("id") or ""), str(row.get("gauge") or "")
+            if _capacity_suppressed(rgid):
+                continue
             if (not rgid or row.get("worker") or rid in idx
                     or rgid in active_gauges
                     or any(p["gauge"] == rgid for p in new_picks)):
@@ -1046,25 +1369,29 @@ def hourly_tick() -> dict:
     # starved every new trigger — Indiana flooded for two days unmapped
     # while the runner refreshed two known basins.)
     jobs = (new_picks[:1] + jobs + new_picks[1:])
-    if len(jobs) > MAX_PER_TICK:
-        starved = jobs[MAX_PER_TICK:]
-        print(f"event tick: {len(starved)} job(s) wait for a slot: "
-              f"{[j['gauge'] for j in starved]}")
-
     results = []
-    for j in jobs[:MAX_PER_TICK]:
+    for j in jobs:
+        if len(results) >= MAX_PER_TICK:
+            break
         try:
+            _tick_phase(f"run:{j['gauge']}")
             m = run_one(j["gauge"], t0=j.get("t0"), trigger=j["trigger"],
                         episode_id=j["episode"],
                         force_cpu=bool(j.get("force_cpu")))
+            if m.get("skipped") == "native_capacity":
+                continue  # a deferred map does not consume a simulation slot.
             results.append({"event_id": m.get("event_id"),
                             "published": m.get("published")})
         except Exception as e:
+            _tick_note_error(e)
             results.append({"gauge": j["gauge"],
                             "error": f"{type(e).__name__}: {e}"})
     try:                       # age out old events (no-op most hours)
+        _tick_phase("retention")
         swept = eventstore.retention_sweep()
-    except Exception:
+    except Exception as exc:
+        _tick_note_error(exc)
         swept = 0
+    blocked = [row for row in capacity_status() if row.get("relevant", True)]
     return {"ran": len(results), "ended": ended, "swept": swept,
-            "results": results}
+            "results": results, "capacity_blocked": len(blocked), "capacity_skips": blocked}

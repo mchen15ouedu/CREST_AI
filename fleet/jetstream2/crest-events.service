@@ -1,0 +1,77 @@
+# crest-events.service - the hourly 2-D event tick on the Jetstream2 VM
+# (scripts/event_tick_daemon.py -> eventsim.hourly_tick; PI 2026-11-05: the
+# tick moves here from the HF CREST_runner Space). README "2-D event tick".
+# events-setup.sh installs it and never starts it: the cutover order is
+# CREST_runner EVENT_TICK=0 first, then `systemctl enable --now crest-events`.
+#
+# Its own user, not crest-fleet: the fleet deletes a gauge's forcing clip
+# stores after each upload (FLEET_PRUNE_FORCING) and its housekeeper prunes
+# and restarts on the fleet's cache; a shared cache would lose files under a
+# running event EF5. The two tokens also differ (this one writes CREST_data;
+# the fleet's must not), and a systemd credential follows the unit.
+#
+# Priority (PI ranking: user > nowcast > 2-D inundation > data update >
+# fleet > autocal): system.slice at the default weight 100 against
+# crest-fleet.slice's 20; Nice 5 (fleet 10); OOM victim after the fleet (500)
+# and before the GPU worker (0).
+[Unit]
+Description=CREST hourly 2-D event tick (eventsim.hourly_tick -> vincewin/CREST_data events/)
+Documentation=https://github.com/mchen15ouedu/CREST_AI/blob/main/fleet/jetstream2/README.md
+Wants=network-online.target
+After=network-online.target crest-worker.service
+RequiresMountsFor=/media/volume/crest-data
+AssertFileNotEmpty=/etc/crest-fleet/events_hf_token
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=crest-events
+Group=crest-events
+EnvironmentFile=/etc/crest-fleet/events.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=EVENTS_HOME=/opt/crest-events
+Environment=EF5_DIR=/opt/crest-events/EF5
+# EF5 (fork) is built with OpenMP; one event EF5 at a time; events.env may override
+Environment=OMP_NUM_THREADS=6
+LoadCredential=hf_token:/etc/crest-fleet/events_hf_token
+UnsetEnvironment=HF_TOKEN HUGGING_FACE_HUB_TOKEN
+WorkingDirectory=/opt/crest-events/src
+ExecStart=/opt/crest-events/bin/run-events.sh
+# Restart=always; run-events.sh adds the backoff (systemd 249: no RestartSteps=).
+# Also after a wedged tick: past EVENT_TICK_MAX_BUSY_H the daemon publishes
+# "wedged" and exits 3, and the restart ticks again at once (the max gap)
+Restart=always
+RestartSec=60
+# the main loop pings every 5 s (WATCHDOG=1): a loop hung for an hour is
+# aborted (SIGABRT; faulthandler dumps every thread's stack to the journal)
+# and restarted. Longer than run-events.sh's longest restart backoff (30 min),
+# during which bash, not the daemon, is the main process (exec, same PID)
+WatchdogSec=3600
+NotifyAccess=main
+# SIGTERM to the daemon only: a running tick (and its EF5 child) gets
+# EVENT_TICK_STOP_GRACE_S (600, from the signal) to finish, then the
+# "stopped" status commit (an attempt and one retry, <= 60 s); 600 + 60 +
+# 60 s for the exit = TimeoutStopSec. The daemon cuts a larger grace to fit
+# EVENT_TICK_TIMEOUT_STOP_S: keep it equal to TimeoutStopSec. Whatever is
+# left is SIGKILLed once the daemon exits.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=720
+Environment=EVENT_TICK_TIMEOUT_STOP_S=720
+SyslogIdentifier=crest-events
+CPUWeight=100
+IOWeight=100
+Nice=5
+# the largest admissible basin (35M native cells) peaks at a few GB in the
+# HUC12 domain build + EF5; the fleet slice holds 28G, the worker the rest
+MemoryHigh=12G
+MemoryMax=16G
+OOMScoreAdjust=200
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

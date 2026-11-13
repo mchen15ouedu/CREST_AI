@@ -83,6 +83,11 @@ class Recorder:
                 "proposal": proposal, "candidates": candidates,
                 "best_nse_before": best_before, "best_nse_after": best_after})))
 
+    def discard(self):
+        """Never upload this calibration (finish() then does nothing): one
+        that stopped before any round had reasoning worth reviewing."""
+        self.done = True
+
     def finish(self, done=None, status=None):
         """Upload once in the background. Safe to call more than once."""
         if not self.on or self.done:

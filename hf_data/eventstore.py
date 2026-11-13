@@ -184,16 +184,18 @@ def _api():
 INDEX_FILE = f"{PREFIX}/index.json"
 
 
-def _read_index() -> hubdata.Read:
-    """The index as a Read: writers must not mistake an outage for an empty
-    list (they would commit an index holding only their own change)."""
-    r = DATASET.read_json(INDEX_FILE, kind=dict)
+def _read_index(revision: str | None = None) -> hubdata.Read:
+    """The index as a Read (at `revision` when given): writers must not
+    mistake an outage for an empty list (they would commit an index holding
+    only their own change)."""
+    r = DATASET.read_json(INDEX_FILE, kind=dict, revision=revision)
     return hubdata.Read(hubdata.DATA, {}) if r.missing else r
 
 
-def load_index() -> dict:
-    """{event_id: summary} newest-first insertion order; {} on any failure."""
-    r = _read_index()
+def load_index(revision: str | None = None) -> dict:
+    """{event_id: summary} newest-first insertion order (at `revision` when
+    given); {} on any failure."""
+    r = _read_index(revision)
     return r.value if r.ok else {}
 
 
@@ -207,8 +209,11 @@ def _read_missed() -> hubdata.Read:
 
 
 def load_missed() -> list:
-    """Recorded CREST misses (newest last): events the trigger opened but
-    EF5 did not reproduce, so no map was published. [] on any failure."""
+    """Recorded CREST outlet-Q misses (newest last): events whose EF5 peak
+    fell far short of the observed one. Historic rows: the live runner no
+    longer writes them (an outlet-Q miss is advisory, the 2-D run goes on)
+    and CREST_autocal no longer reads them; the dashboard still lists recent
+    ones. [] on any failure."""
     r = _read_missed()
     return r.value if r.ok else []
 
@@ -216,8 +221,9 @@ def load_missed() -> list:
 def note_missed(rec: dict) -> bool:
     """Record one miss. One row per event id: the row carries the latest
     check's numbers plus `checks` (every hourly check so far: at, t0, frac,
-    sim/obs peaks), `n_checks` and `first_at` — the auto-calibration
-    trigger reads 'missed every hour for the whole event' from that history."""
+    sim/obs peaks), `n_checks` and `first_at`. No caller left: the outlet-Q
+    check is advisory now, and the auto-calibration trigger is a low CREST
+    1-D NSE over the episode (autocal/autocal_run.py), not a miss streak."""
     if not DATASET.can_write:
         return False
     with _lock:
@@ -246,18 +252,21 @@ def note_missed(rec: dict) -> bool:
 
 AUTOCAL_FILE = f"{PREFIX}/autocal.json"
 AUTOCAL_KEEP = 500
-# permanent calibrate-once ledger: autocal.json keeps only the last
-# AUTOCAL_KEEP rows, so a gauge calibrated long ago would roll off it and be
-# picked again. {gauge: {first, last, n}} of ran=True records, never truncated
-# (one small entry per calibrated gauge), committed with the record itself.
+# permanent calibration ledger: autocal.json keeps only the last
+# AUTOCAL_KEEP rows, so a gauge calibrated long ago would roll off it and lose
+# its last calibration time (autocal's cooldown and stale-episode rule; the
+# retired backlog read it as calibrate-once). {gauge: {first, last, n}} of
+# ran=True records, never truncated (one small entry per calibrated gauge),
+# committed with the record itself.
 AUTOCAL_DONE_FILE = f"{PREFIX}/autocal_done.json"
 
 
-def _load_hub_json(path: str, kind: type):
-    """`path` from the dataset (fresh), or kind() when the file does not exist
-    yet, or None when it could not be read (network, auth, corrupt JSON,
-    wrong type). Only a real 404 counts as missing (hubdata decides)."""
-    r = DATASET.read_json(path, kind=kind, fresh=True)
+def _load_hub_json(path: str, kind: type, revision: str | None = None):
+    """`path` from the dataset (fresh; at `revision` when given), or kind()
+    when the file does not exist yet, or None when it could not be read
+    (network, auth, corrupt JSON, wrong type). Only a real 404 counts as
+    missing (hubdata decides: an offline cache miss is an outage)."""
+    r = DATASET.read_json(path, kind=kind, fresh=True, revision=revision)
     if r.missing:
         return kind()
     return r.value if r.ok else None
@@ -266,9 +275,10 @@ def _load_hub_json(path: str, kind: type):
 def load_autocal() -> list | None:
     """Auto-calibration records (newest last): one per (event, gauge) the
     CREST_autocal Space looked at — ran (with before/after NSE and whether
-    the winner was saved) or skipped with a reason. `kind` is "miss",
-    "oversim" or "backlog" (older rows: no kind = miss); western-backlog
-    skips arrive only in periodic kind "backlog_skips" summaries (gauge None).
+    the winner was saved) or skipped with a reason. `kind` is "low_nse" (an
+    episode's CREST 1-D NSE below the threshold: nse, n_pairs, nse_max);
+    older rows keep the retired kinds "miss" (no kind = miss), "oversim",
+    "backlog" and the "backlog_skips" summaries (gauge None).
     [] only when the file does not exist yet; None when it could not be read —
     an outage must never look like "no history" (the autocal loop would
     re-calibrate, note_autocal would overwrite the log with one row)."""
@@ -276,7 +286,7 @@ def load_autocal() -> list | None:
 
 
 def load_autocal_done() -> dict | None:
-    """The calibrate-once ledger {gauge: {first, last, n}} (ran=True records
+    """The calibration ledger {gauge: {first, last, n}} (ran=True records
     only, never truncated). {} when it does not exist yet, None when it could
     not be read."""
     return _load_hub_json(AUTOCAL_DONE_FILE, dict)
@@ -284,19 +294,23 @@ def load_autocal_done() -> dict | None:
 
 def _ledger_add(ledger: dict, rec: dict) -> None:
     """Fold one ran=True record into the ledger (in place). `at` strings are
-    %Y-%m-%dT%H:%M:%SZ, so plain comparison orders them."""
+    %Y-%m-%dT%H:%M:%SZ, so plain comparison orders them. `finished` (the
+    latest calibration end, kept when records carry one) keeps autocal's
+    stale-episode rule exact after the row rolls off autocal.json."""
     g = rec.get("gauge")
     if not rec.get("ran") or not g:
         return
     e = ledger.get(str(g)) or {}
     ats = [str(t) for t in (e.get("first"), e.get("last"), rec.get("at")) if t]
+    fins = [str(t) for t in (e.get("finished"), rec.get("finished")) if t]
     ledger[str(g)] = {"first": min(ats, default=None), "last": max(ats, default=None),
-                      "n": int(e.get("n") or 0) + 1}
+                      "n": int(e.get("n") or 0) + 1,
+                      **({"finished": max(fins)} if fins else {})}
 
 
 def note_autocal(rec: dict) -> bool:
     """Append one auto-calibration record and commit — together with its
-    calibrate-once ledger entry (autocal_done.json) when it ran, in the same
+    calibration ledger entry (autocal_done.json) when it ran, in the same
     commit. False, with nothing committed, when either file could not be read
     (never [rec] over the whole log) or the commit failed: the caller keeps
     the record and retries."""
@@ -328,7 +342,8 @@ def note_autocal(rec: dict) -> bool:
 
 def drop_events(event_ids, purge: bool = True, why: str = "") -> bool:
     """Remove events from the list (and, with purge, delete their result
-    folders) — e.g. an episode whose map the CREST-miss guard disowned."""
+    folders). No automatic caller any more: the outlet-Q check that once
+    disowned an episode's map this way is advisory now and drops nothing."""
     pins = pinned_ids(force=True)
     if pins is None:
         return False
@@ -392,6 +407,12 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
         # the episode keeps its first trigger time across hourly re-publishes
         summary["episode_started"] = ((prior or {}).get("episode_started")
                                       or manifest.get("t0"))
+        # ... and the record of the fragments merged into it
+        # (scripts/merge_episodes.py), so a reopened merged episode keeps it
+        if (prior or {}).get("merged"):
+            m = dict(prior["merged"])            # its span grows with the episode
+            m["last_end"] = max(m.get("last_end") or "", manifest.get("t_end") or "")
+            summary["merged"] = m
         summary["archive_frames"] = manifest.get("archive_frames")
         # newest first
         idx = {ev: summary, **idx}
@@ -505,7 +526,7 @@ def _prior_manifest(ev: str) -> dict | None:
 def load_manifest(ev: str) -> dict | None:
     """A published event's manifest, HF-cached (re-downloaded only when it
     changed on the Hub) — for readers that scan many events, e.g. the
-    autocal over-prediction trigger. None on any failure."""
+    autocal low-NSE trigger. None on any failure."""
     return DATASET.read_json(f"{PREFIX}/{ev}/manifest.json").value
 
 
@@ -529,6 +550,77 @@ def mark_ended(event_ids) -> bool:
                                    f"episodes ended: {', '.join(changed)}"))
 
 
+def reopen_episodes(event_ids, superseded: set | None = None,
+                    refused: set | None = None) -> list | None:
+    """Flip ended episodes back to 'active' in the index (single small
+    commit): their gauge was flagged again soon after they ended, so the
+    flood continues under the original id and episode_started anchor instead
+    of a new event. The stale "final" product is dropped from the entry — the
+    tick's finalize/heal pass recomputes it when the episode ends again — and
+    the entry is stamped "reopened" (UTC), which restarts the tick's CPU
+    fallback clock.
+    Pinned demo events are never reopened, nor an episode gone from the FRESH
+    index: those ids are added to `refused` (when given) — pinned ones before
+    the index is read, so a failed reopen still tells them apart (a pinned
+    episode's gauge starts a new id). Neither is an episode the FRESH
+    index shows superseded since the caller read it: absorbed into another
+    (merged_into), or its gauge now has a newer episode or an active one —
+    that one carries the flood. Those ids are added to `superseded` (when
+    given). Returns the ids that are active afterwards (reopened now or
+    already active); [] when nothing was done (refused); None when the reopen
+    FAILED — the fresh index unreadable or the commit raised — so the caller
+    retries rather than open a new id beside the episode (the ids in
+    `superseded` and `refused` aside)."""
+    if not DATASET.can_write:
+        return []
+    pins = pinned_ids(force=True)
+    if pins is None:
+        return []                       # can't tell demo events apart
+    event_ids = list(event_ids)
+    if refused is not None:
+        refused.update(e for e in event_ids if e in pins)
+    event_ids = [e for e in event_ids if e not in pins]
+    if not event_ids:
+        return []
+    with _lock:
+        got = _read_index()
+        if not got.ok:
+            return None                 # an outage is not an empty index
+        idx = got.value
+
+        def gauge(s):
+            return str(((s.get("trigger") or {}).get("gauge")) or s.get("gauge") or "")
+
+        ids = []
+        for e in event_ids:
+            s = idx.get(e)
+            if s is None:
+                if refused is not None:
+                    refused.add(e)
+                continue
+            g = gauge(s)
+            if s.get("merged_into") or (g and any(
+                    o != e and not t.get("merged_into") and gauge(t) == g
+                    and (o > e or t.get("status", "active") == "active")
+                    for o, t in idx.items())):
+                if superseded is not None:
+                    superseded.add(e)
+                continue
+            ids.append(e)
+        changed = [e for e in ids if idx[e].get("status") != "active"]
+        if not changed:
+            return ids
+        stamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        for e in changed:
+            idx[e]["status"] = "active"
+            idx[e]["reopened"] = stamp
+            idx[e].pop("final", None)
+        if not DATASET.commit([Put(INDEX_FILE, idx)],
+                              f"episodes reopened: {', '.join(changed)}"):
+            return None
+        return ids
+
+
 def _parse_hydro_t(t):
     """Hydro row time ("2026-09-29 13:00" or "2026-09-29T13:00Z") -> naive
     UTC datetime, or None if unparseable (row is then kept)."""
@@ -537,6 +629,35 @@ def _parse_hydro_t(t):
         return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M")
     except ValueError:
         return None
+
+
+def _final_stale(s: dict | None, began: datetime.datetime, was: dict) -> str | None:
+    """Why a final computed by a finalize_episodes call that began at `began`
+    (UTC, whole seconds) from the entry `was` must not be written onto the
+    FRESH index entry `s`; None = write it. A reopen landing mid-finalize
+    leaves the entry active, or ended again — stamped "reopened" at/after
+    `began`, or re-published (a publish drops the stamp) — and that end's own
+    finalize scores the episode. The merge script's contract: never final or
+    status on an absorbed member (merged_into); a merge since ('merged'
+    changed) is scored by the script's own finalize of the merged window."""
+    if s is None:
+        return "left the index"
+    if s.get("merged_into"):
+        return f"absorbed into {s['merged_into']}"
+    if s.get("status") != "ended":
+        return f"{s.get('status') or 'active'} again"
+    try:
+        reopened = datetime.datetime.strptime(s.get("reopened") or "",
+                                              "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        reopened = None
+    if reopened is not None and reopened >= began:
+        return f"reopened {s['reopened']}"
+    if s.get("merged") != was.get("merged"):
+        return "merged"
+    if s.get("generated") != was.get("generated"):
+        return "re-published"
+    return None
 
 
 def finalize_episodes(event_ids, log=print) -> int:
@@ -551,20 +672,27 @@ def finalize_episodes(event_ids, log=print) -> int:
                                  card the dashboard shows instead of the
                                  live-event presentation)
       events/scorecard.json      per-gauge running list of episode scores
-                                 (the model's track record where it counts)
+                                 (the model's track record where it counts;
+                                 left out of a pass that cannot read it)
 
     Idempotent: episodes already carrying "final" are skipped, so the
     hourly tick can re-call it to heal a lost index race (a worker publish
-    that snapshotted the index mid-finalize). Returns episodes finalized."""
+    that snapshotted the index mid-finalize). Scoring takes minutes, so the
+    commit writes only entries the FRESH index still shows ended as computed
+    (_final_stale): one reopened or re-published since this call began,
+    absorbed into another (merged_into: never written) or merged since is
+    skipped and logged. The entry's other fields ('merged' included) are
+    kept. Returns episodes finalized."""
     from . import eventscore
     if not DATASET.can_write:
         return 0
+    began = datetime.datetime.utcnow().replace(microsecond=0)
     done = 0
     fin_by_ev = {}
     for ev in event_ids:
         idx = load_index()
         s = idx.get(ev)
-        if not s or s.get("final"):
+        if not s or s.get("final") or s.get("merged_into"):
             continue
         man = _prior_manifest(ev) or {}
         gid = str(((s.get("trigger") or {}).get("gauge"))
@@ -648,27 +776,64 @@ def finalize_episodes(event_ids, log=print) -> int:
                  "peak_sim_m3s": peak_sim, **depth_stats,
                  "nse_h1": (score or {}).get("nse_h1"),
                  "nse_h6": (score or {}).get("nse_h6")}
-        fin_by_ev[ev] = {"final": final, "score": score, "gauge": gid}
+        fin_by_ev[ev] = {"final": final, "score": score, "gauge": gid, "was": s}
         done += 1
 
     if not fin_by_ev:
         return 0
+    # the commit is checked against the revision it read (parent_commit): the
+    # episode merger finalizes from its own process, so _lock alone does not
+    # keep two writers of index.json / scorecard.json from undoing each other
+    computed = dict(fin_by_ev)
+    for attempt in range(1, FINAL_COMMIT_TRIES + 1):
+        fin_by_ev = dict(computed)
+        sha, n = _finalize_commit(fin_by_ev, began, log)
+        if sha != "moved":
+            return n
+        log(f"finalize: the store moved under us (attempt {attempt}): re-reading")
+        time.sleep(3 * attempt)
+    log("finalize commit failed (the store kept moving)")
+    return 0
+
+
+FINAL_COMMIT_TRIES = 4
+
+
+def _finalize_commit(fin_by_ev: dict, began, log):
+    """One read-modify-commit of finalize_episodes' products against the
+    head revision. ("moved", 0) on a concurrent commit (the head moved past
+    the revision read: re-read and retry), else (sha or None, episodes
+    written)."""
     with _lock:
-        got = _read_index()
+        head = DATASET.head()
+        if not head.ok:
+            log(f"finalize: head revision unreadable ({head.error}) — nothing committed")
+            return None, 0
+        sha = head.value
+        got = _read_index(sha)
         if not got.ok:
-            log("finalize: index unreadable, retrying next tick")
-            return 0
+            log("finalize: index.json unreadable — nothing committed")
+            return None, 0
         idx = got.value
+        for ev in list(fin_by_ev):
+            why = _final_stale(idx.get(ev), began, fin_by_ev[ev]["was"])
+            if why:
+                log(f"finalize {ev}: not written — {why} since this pass began")
+                del fin_by_ev[ev]
+        if not fin_by_ev:
+            return None, 0
+        done = len(fin_by_ev)
         ops = []
-        # scorecard: the model's running track record, episodes only. An
-        # unreadable scorecard is left alone (rewriting it from {} would wipe
-        # every gauge's history); only a missing one starts fresh.
-        sc = DATASET.read_json(f"{PREFIX}/scorecard.json", kind=dict, fresh=True)
-        card = {} if sc.missing else sc.value
+        # scorecard: the model's running track record, episodes only. A fresh
+        # card only where none exists yet (a real 404): on any other read
+        # error it stays out of this commit — a card of this pass's gauges
+        # alone would wipe every other gauge's record (final.json keeps the
+        # episode's scores)
+        card = _load_hub_json(f"{PREFIX}/scorecard.json", dict, revision=sha)
+        if card is None:
+            log("finalize: scorecard.json unreadable — left out of this commit")
         for ev, d in fin_by_ev.items():
-            if ev in idx:
-                idx[ev]["status"] = "ended"
-                idx[ev]["final"] = d["final"]
+            idx[ev]["final"] = d["final"]        # ended, checked just above
             ops.append(Put(f"{PREFIX}/{ev}/final.json",
                            {"event_id": ev, **d["final"],
                             "nowcast_verification": d["score"]}))
@@ -684,15 +849,16 @@ def finalize_episodes(event_ids, log=print) -> int:
         if card is not None and any(d["gauge"] and d["score"]
                                     for d in fin_by_ev.values()):
             ops.append(Put(f"{PREFIX}/scorecard.json", card))
-        elif card is None:
-            log("finalize: scorecard unreadable, left unchanged")
         ops.append(Put(INDEX_FILE, idx))
-        res = DATASET.commit(ops, "episode final products: " + ", ".join(fin_by_ev))
+        res = DATASET.commit(ops, "episode final products: " + ", ".join(fin_by_ev),
+                             parent=sha)
+        if res.moved:
+            return "moved", 0
         if not res:
             log(f"finalize commit failed ({res.error})")
-            return 0
+            return None, 0
         log(f"finalized {done} episode(s): {', '.join(fin_by_ev)}")
-        return done
+        return sha, done
 
 
 def retention_sweep() -> int:

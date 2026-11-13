@@ -287,3 +287,67 @@ def test_batch_entries_group_ops_and_bound_the_queue_after_a_failure():
     batch.add([Put("s/a.pqf", b"3")], key="a")               # replaces the whole entry
     assert batch.flush(force=True) and batch.error is None
     assert hub.files == {"s/a.pqf": b"3"} and hub.commits[0]["message"] == "ckpts x1"
+
+
+def test_reads_at_a_revision_and_commits_checked_against_a_parent(tmp_path):
+    """A read-modify-write pinned to head(): reads see that revision, and a
+    commit whose parent is no longer the head answers moved (never lands,
+    never spends budget)."""
+    hub = MemoryHub({"index.json": {"a": 1}})
+    ds = Dataset("me/data", adapter=hub)
+    rev = ds.head().value
+    assert ds.commit([hubdata.Put("index.json", {"a": 2})], "other writer")
+    assert ds.read_json("index.json", revision=rev).value == {"a": 1}
+    assert ds.read_json("index.json").value == {"a": 2}
+    left = ds.budget.remaining()
+    res = ds.commit([hubdata.Put("index.json", {"a": 3})], "stale", parent=rev)
+    assert not res and res.moved and ds.budget.remaining() == left
+    assert ds.read_json("index.json").value == {"a": 2}
+    head = ds.head().value
+    assert head != rev
+    assert ds.commit([hubdata.Put("index.json", {"a": 3})], "fresh", parent=head)
+    hub.outage = True
+    assert ds.head().unreachable
+
+
+def test_local_path_into_a_private_dir(tmp_path):
+    ds = Dataset("me/data", adapter=MemoryHub({"events/e/manifest.json": b"{}"}))
+    got = ds.local_path("events/e/manifest.json", local_dir=str(tmp_path))
+    assert got.ok and got.value == str(tmp_path / "events" / "e" / "manifest.json")
+    assert ds.local_path("events/e/none.json", local_dir=str(tmp_path)).missing
+
+
+def _hub_http(code):
+    """An HfHubHTTPError carrying status `code`, on huggingface_hub 0.x and 1.x."""
+    from huggingface_hub.utils import HfHubHTTPError
+    try:
+        import httpx
+        return HfHubHTTPError(f"{code}", response=httpx.Response(
+            code, request=httpx.Request("POST", "https://huggingface.co/api/commit")))
+    except Exception:
+        import requests
+        resp = requests.Response()
+        resp.status_code = code
+        return HfHubHTTPError(f"{code}", response=resp)
+
+
+def test_hub_adapter_moved_parent_is_told_apart(monkeypatch):
+    """create_commit's 409/412 against a parent_commit = the head moved;
+    without a parent it is an ordinary failed commit."""
+    import huggingface_hub
+    monkeypatch.setenv("HF_TOKEN", "tok")
+    seen = []
+
+    class Api:
+        def __init__(self, token=None):
+            pass
+
+        def create_commit(self, **kw):
+            seen.append(kw)
+            raise _hub_http(412)
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+    ds = Dataset("me/data", adapter=hubdata.HubAdapter(), budget=hubdata.CommitBudget())
+    res = ds.commit([hubdata.Put("a.json", {})], "m", parent="abc")
+    assert not res and res.moved and seen[-1]["parent_commit"] == "abc"
+    res = ds.commit([hubdata.Put("a.json", {})], "m")
+    assert not res and not res.moved and "parent_commit" not in seen[-1]

@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-from hf_data import caljobs, crashlog, datamgr, gauges, persist, simjobs
+from hf_data import caljobs, crashlog, datamgr, eventmerger, gauges, persist, simjobs
 from hf_data.pipeline import parse_query
 from hf_data.statecache import CACHE_DIR
 
@@ -41,6 +41,8 @@ crashlog.install_thread_hook()     # record any thread that dies unwrapped
 datamgr.start_janitor()            # hourly cache cleanup + result compaction
 persist.start()                    # restore states/results/params/users from the
                                    # private dataset, then keep them synced
+eventmerger.start()                # EPISODE_MERGER=1 (runner Space only): the
+                                   # always-on episode merger, a supervised child
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FRONTEND = os.path.join(HERE, "frontend")
@@ -50,6 +52,14 @@ app = FastAPI(title="CREST_demo")
 app.add_middleware(SessionMiddleware,
                    secret_key=os.environ.get("SESSION_SECRET", secrets.token_hex(32)),
                    max_age=14 * 24 * 3600, same_site="lax", https_only=False)
+
+# basin-zoom inundation overlays: max-pooled PNGs (/api/evt_png); without it
+# the frontend falls back to the native overlay PNGs
+try:
+    from hf_data import evtpng
+    app.include_router(evtpng.router)
+except Exception as _e:
+    print(f"evt_png overlays disabled: {type(_e).__name__}: {_e}")
 
 # ---- HF OAuth (Space sets OAUTH_* env when README has hf_oauth: true) ------
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID")
@@ -771,38 +781,104 @@ def _remote_runner_status():
     return _runner_cache["status"]
 
 
+def _tick_host_runner():
+    """EVENT_TICK off and no job of this Space's own running: the runner state
+    the tick host publishes (events/tick_status.json; the Jetstream2 VM since
+    2026-11-05), else None. Blocking read, cached 60 s."""
+    if os.environ.get("EVENT_TICK", "1") == "1":
+        return None
+    from hf_data import eventsim, tickstatus
+    if eventsim._running.get("id"):              # a manual /api/event_run here
+        return None
+    try:
+        return tickstatus.remote_runner()
+    except Exception:
+        return None
+
+
 @app.get("/api/events")
 def api_events(full: int = 0):
     """V25: published 2-D inundation events (CREST-iMAP v2) + runner state.
-    Frame/manifest files resolve at {base}/<event_id>/<file>."""
+    Frame/manifest files resolve at {base}/<event_id>/<file>. The list is a
+    VIEW (hf_data/eventlist.py): fragments of one flood folded into one entry
+    (merged_into ones never listed), floods ended (retrospectives: requested)
+    > EVENT_LIST_MAX_AGE_D (30) days ago left off; the store and
+    /api/admin/archive keep everything."""
     from hf_data import eventqueue, eventsim, eventstore
     try:
         q = eventqueue.queue_status()
     except Exception:
         q = []
-    runner = _remote_runner_status() or eventsim.status(bool(full))
+    runner = (_remote_runner_status() or _tick_host_runner()
+              or eventsim.status(bool(full)))
     try:                       # CREST misses: trigger fired, EF5 did not
         missed = eventstore.load_missed()[-30:]
     except Exception:
         missed = []
-    try:                       # auto-calibrations those misses triggered
+    try:                       # auto-calibrations (low-NSE episodes; older: misses)
         autocal = eventstore.load_autocal()[-10:]
     except Exception:
         autocal = []
-    return {"events": eventstore.load_index(), "queue": q,
+    idx = eventstore.load_index()
+    try:                       # view only: on any error list the full index
+        from hf_data import eventlist
+        events, list_info = eventlist.list_view(
+            idx, pinned=eventstore.pinned_ids() if eventlist.KEEP_PINNED else frozenset())
+    except Exception as e:
+        crashlog.capture("eventlist", e)
+        events, list_info = idx, None
+    return {"events": events, "list_info": list_info, "queue": q,
             "runner": runner, "missed": missed, "autocal": autocal,
             "base": (f"https://huggingface.co/datasets/{eventstore.REPO}/"
                      f"resolve/main/{eventstore.PREFIX}")}
 
 
+@app.get("/api/runner_status")
+async def api_runner_status(full: int = 0):
+    """In-memory dispatch progress; remains readable during dataset outages.
+    EVENT_TICK off (the tick runs on another host, the Jetstream2 VM since
+    2026-11-05): runner + tick are that host's published status
+    (events/tick_status.json, read off the event loop, cached 60 s; both None
+    while it is unreadable, tick_status says why), tick_source "remote"; a
+    manual run of this Space's own shows as local_runner."""
+    from hf_data import eventqueue, eventsim
+    if os.environ.get("EVENT_TICK", "1") != "1":
+        from hf_data import tickstatus
+        out = await asyncio.to_thread(tickstatus.remote_status)
+        if eventsim._running.get("id"):
+            out["local_runner"] = eventsim.status(bool(full))
+        out["queue"] = eventqueue.queue_status_meta()
+        return out
+    return {"runner": eventsim.status(bool(full)), "tick": eventsim.tick_status(),
+            "queue": eventqueue.queue_status_meta(), "tick_source": "local"}
+
+
+@app.get("/api/merger_status")
+def api_merger_status():
+    """Always-on episode merger (hf_data/eventmerger.py; EPISODE_MERGER=1 on
+    the runner Space only): its status file (last pass, waiting groups,
+    recent merges, last error) + {enabled, alive, pid, restarts}."""
+    return eventmerger.status()
+
+
 @app.get("/api/admin/archive")
 def api_admin_archive(request: Request, refresh: int = 0):
     """Admin only: every stored 2-D inundation result — the listed events plus
-    those that rolled off the public list (results kept RESULTS_MAX_AGE_D)."""
+    those that rolled off the public list (results kept RESULTS_MAX_AGE_D).
+    `listed` = shown on the public list (eventlist view, same pins as
+    /api/events): rolled-off and folded episodes are off it."""
     if not _is_admin(request):
         return JSONResponse({"error": "admin only"}, status_code=403)
     from hf_data import eventstore
-    return eventstore.archive_index(force=bool(refresh))
+    snap = eventstore.archive_index(force=bool(refresh))
+    try:                       # on any error: the snapshot's flag (in the index)
+        from hf_data import eventlist
+        return eventlist.mark_listed(
+            snap, eventstore.load_index() if snap.get("events") else {},
+            pinned=eventstore.pinned_ids() if eventlist.KEEP_PINNED else frozenset())
+    except Exception as e:
+        crashlog.capture("eventlist:archive", e)
+        return snap
 
 
 @app.get("/api/riskprobe/{event_id}")
@@ -855,7 +931,18 @@ def api_event_tick():
         return JSONResponse({"ok": False, "reason":
                              "crestimap not installed on this Space build"},
                             status_code=501)
-    from hf_data import eventsim
+    from hf_data import eventsim, tickstatus
+    # ticks never run on two hosts (PI 2026-11-05): while another host (the
+    # Jetstream2 VM) publishes a fresh, not-stopped tick status, this Space
+    # does not tick - `systemctl stop crest-events` there publishes "stopped"
+    elsewhere = tickstatus.ticking_elsewhere()
+    if elsewhere:
+        return {"ok": False, "reason": f"event tick runs on {elsewhere['host']}",
+                "tick_status": elsewhere}
+    tick = eventsim.tick_status()
+    if tick["running"]:
+        eventsim.note_tick_attempt()
+        return {"ok": False, "reason": "tick busy", "tick": tick}
     if eventsim.status()["running"]:
         # stamp liveness even here: the ping IS arriving, we are just busy.
         # Without this a wedged runner looked identical to a dead tick loop.
@@ -877,13 +964,18 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0,
     poll /api/events for progress.
     t0: backdate the event window ("YYYY-MM-DDTHH:MM" UTC) — refill a flood
     the trigger pipeline missed; the window is [t0-backset, t0+horizon].
+    Explicit t0 values older than 24 hours are labeled retrospective.
     defer=1: enqueue for the GPU worker only (no CPU fallback) — the runner
     stays free and the result publishes whenever the worker gets to it.
     episode=<event id>: re-simulate an EXISTING listed episode under its own
     id (anchored at its recorded start; the folder is replaced in place) —
     e.g. re-running the whole list after an engine/domain change.
     cold=1 (with episode): no warm-start frame — the whole anchored span is
-    re-solved and every published frame replaced."""
+    re-solved and every published frame replaced.
+    EVENT_TICK off without EVENT_RUNNER_URL (the runner since the tick moved
+    to the Jetstream2 VM, 2026-11-05): while the tick host's fresh status
+    shows a tick or a run in progress, the gauge-less auto-detect and the
+    gauge it is running are refused; other gauges run here."""
     if os.environ.get("EVENT_TICK", "1") != "1" and EVENT_RUNNER_URL:
         try:                       # split dashboard: forward to the runner
             import requests
@@ -903,7 +995,25 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0,
                              "crestimap not installed on this Space build"},
                             status_code=501)
     from hf_data import eventsim
+    if os.environ.get("EVENT_TICK", "1") != "1":
+        # the tick runs on another host: its detection and its current gauge
+        # are its own. A sync handler runs in FastAPI's threadpool, so this
+        # bounded read (cached 60 s) stays off the event loop.
+        from hf_data import tickstatus
+        try:
+            remote = tickstatus.remote_status()
+        except Exception:
+            remote = {}
+        clash = tickstatus.run_conflict(
+            remote, gid or (episode.split("_", 1)[-1] if episode else ""))
+        if clash:
+            return {"ok": False, "reason": clash,
+                    "tick_status": remote.get("tick_status")}
     st = eventsim.status()
+    tick = eventsim.tick_status()
+    if tick["running"]:
+        return {"ok": False, "reason": "an hourly event tick is already running",
+                "tick": tick, **st}
     if st["running"]:
         return {"ok": False, "reason": "an event simulation is already running",
                 **st}
@@ -916,12 +1026,23 @@ def api_event_run(gid: str = "", t0: str = "", defer: int = 0,
             return JSONResponse({"ok": False,
                                  "reason": "t0 must be YYYY-MM-DDTHH:MM (UTC)"},
                                 status_code=422)
+    trigger = None
+    if t0_dt is not None:
+        requested_at = _dt.datetime.now(_dt.timezone.utc)
+        if requested_at - t0_dt.replace(tzinfo=_dt.timezone.utc) > _dt.timedelta(hours=24):
+            trigger = {"retrospective": {
+                "label": "Retrospective reconstruction",
+                "requested_at": requested_at.isoformat().replace("+00:00", "Z"),
+                "reason": "Recovery of missed event dispatch",
+                "data_caveat": ("Realized historical USGS observations may be used; "
+                                "this is not the original operational forecast."),
+            }}
     import threading
     if episode and not gid:
         gid = episode.split("_", 1)[-1]          # ids are <YYYYMMDDHH>_<gid>
     if gid:
         threading.Thread(target=eventsim.run_one, args=(gid, t0_dt),
-                         kwargs={"defer": bool(defer),
+                         kwargs={"trigger": trigger, "defer": bool(defer),
                                  "episode_id": episode or None,
                                  "cold": bool(cold and episode)},
                          daemon=True).start()

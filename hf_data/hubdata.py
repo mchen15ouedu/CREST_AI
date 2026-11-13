@@ -75,9 +75,12 @@ class Delete:
 
 @dataclass(frozen=True)
 class Committed:
-    """A commit's outcome; truthy on success."""
+    """A commit's outcome; truthy on success. `moved`: a commit checked
+    against a parent revision found the repo had moved on (another writer
+    committed since): re-read and retry."""
     ok: bool
     error: str | None = None
+    moved: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -89,6 +92,10 @@ class NotFound(Exception):
 
 class Unreachable(Exception):
     """Adapter signal: no trustworthy answer (network, auth, offline)."""
+
+
+class Moved(Exception):
+    """Adapter signal: a commit's parent revision is no longer the head."""
 
 
 # --------------------------------------------------------------------------- #
@@ -155,13 +162,15 @@ class HubAdapter:
     """The real Hub through huggingface_hub. The token is read per call, so a
     Space that receives HF_TOKEN late still writes."""
 
-    def download(self, repo: str, path: str, *, fresh: bool) -> str:
+    def download(self, repo: str, path: str, *, fresh: bool,
+                 revision: str | None = None, local_dir: str | None = None) -> str:
         import huggingface_hub
         from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
         try:
             return huggingface_hub.hf_hub_download(
                 repo, path, repo_type="dataset", token=token(),
-                force_download=fresh)
+                force_download=fresh, revision=revision,
+                **({"local_dir": local_dir} if local_dir else {}))
         except LocalEntryNotFoundError as e:   # offline: subclass of the 404 below
             raise Unreachable(str(e)) from e
         except EntryNotFoundError as e:        # the repo answered: no such file
@@ -177,6 +186,10 @@ class HubAdapter:
     def list_files(self, repo: str) -> list[str]:
         with _no_answer():
             return list(self._api().list_repo_files(repo, repo_type="dataset"))
+
+    def head(self, repo: str) -> str:
+        with _no_answer():
+            return self._api().repo_info(repo, repo_type="dataset").sha
 
     def exists(self, repo: str, path: str) -> bool:
         with _no_answer():
@@ -206,9 +219,11 @@ class HubAdapter:
         except FileNotFoundError as e:
             raise NotFound(path) from e
 
-    def commit(self, repo: str, ops: list, message: str) -> None:
+    def commit(self, repo: str, ops: list, message: str,
+               parent: str | None = None) -> None:
         import io
         from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+        from huggingface_hub.utils import HfHubHTTPError
         hub_ops = []
         for op in ops:
             if isinstance(op, Put):
@@ -217,8 +232,15 @@ class HubAdapter:
                     op.path, io.BytesIO(body) if isinstance(body, bytes) else body))
             else:
                 hub_ops.append(CommitOperationDelete(op.path, is_folder=op.folder))
-        self._api().create_commit(repo_id=repo, repo_type="dataset",
-                                  operations=hub_ops, commit_message=message)
+        try:
+            self._api().create_commit(repo_id=repo, repo_type="dataset",
+                                      operations=hub_ops, commit_message=message,
+                                      **({"parent_commit": parent} if parent else {}))
+        except HfHubHTTPError as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if parent and code in (409, 412):   # the head moved past `parent`
+                raise Moved(str(e)) from e
+            raise
 
 
 class MemoryHub:
@@ -226,7 +248,9 @@ class MemoryHub:
     The seed `files` belong to the first repo the hub is asked about (or to
     `repo`, if given), and `.files` is that repo's map; every other repo starts
     empty (`repo_files(repo)`). Set `outage = True` to make every call
-    unreachable."""
+    unreachable. Every commit makes a new head revision ("r1", "r2", ...;
+    `head(repo)`); reads at an older revision see that revision's files, and a
+    commit whose parent is not the head raises Moved, like the Hub's 412."""
 
     def __init__(self, files: dict | None = None, repo: str | None = None):
         self._home = repo
@@ -238,6 +262,8 @@ class MemoryHub:
         self.writable = True
         self.commits: list[dict] = []          # {"message", "ops", "repo"} per commit
         self._tmp = None
+        self._heads: dict[str, str] = {}       # repo -> head revision
+        self._history: dict[tuple, dict] = {}  # (repo, older revision) -> files
 
     @property
     def files(self) -> dict[str, bytes]:
@@ -252,6 +278,19 @@ class MemoryHub:
 
     def can_write(self) -> bool:
         return self.writable
+
+    def head(self, repo: str) -> str:
+        self._check()
+        self.repo_files(repo)
+        return self._heads.setdefault(repo, "r0")
+
+    def _files_at(self, repo: str, revision: str | None) -> dict[str, bytes]:
+        if revision is None or revision == self._heads.get(repo, "r0"):
+            return self.repo_files(repo)
+        try:
+            return self._history[(repo, revision)]
+        except KeyError:
+            raise NotFound(f"revision {revision}") from None
 
     def list_files(self, repo: str) -> list[str]:
         self._check()
@@ -288,9 +327,13 @@ class MemoryHub:
             raise NotFound(path)
         return io.BytesIO(files[path])
 
-    def commit(self, repo: str, ops: list, message: str) -> None:
+    def commit(self, repo: str, ops: list, message: str,
+               parent: str | None = None) -> None:
         self._check()
         live = self.repo_files(repo)
+        head = self._heads.setdefault(repo, "r0")
+        if parent is not None and parent != head:
+            raise Moved(f"parent {parent} is not the head {head}")
         files = dict(live)                     # all or nothing, like the Hub
         for op in ops:
             if isinstance(op, Put):
@@ -303,6 +346,8 @@ class MemoryHub:
                 files = {k: v for k, v in files.items() if not k.startswith(op.path)}
             else:
                 files.pop(op.path, None)
+        self._history[(repo, head)] = dict(live)
+        self._heads[repo] = f"r{int(head[1:]) + 1}"
         live.clear()                           # keep the map's identity
         live.update(files)
         self.commits.append({"message": message, "ops": list(ops), "repo": repo})
@@ -311,14 +356,19 @@ class MemoryHub:
         if self.outage:
             raise Unreachable("memory hub: outage")
 
-    def download(self, repo: str, path: str, *, fresh: bool) -> str:
+    def download(self, repo: str, path: str, *, fresh: bool,
+                 revision: str | None = None, local_dir: str | None = None) -> str:
         self._check()
-        files = self.repo_files(repo)
+        files = self._files_at(repo, revision)
         if path not in files:
             raise NotFound(path)
-        if self._tmp is None:
-            self._tmp = tempfile.mkdtemp(prefix="memhub_")
-        p = os.path.join(self._tmp, repo.replace("/", "__"), path.replace("/", "__"))
+        if local_dir:
+            p = os.path.join(local_dir, *path.split("/"))
+        else:
+            if self._tmp is None:
+                self._tmp = tempfile.mkdtemp(prefix="memhub_")
+            p = os.path.join(self._tmp, repo.replace("/", "__"),
+                             (f"{revision}__" if revision else "") + path.replace("/", "__"))
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as fp:
             fp.write(files[path])
@@ -405,25 +455,32 @@ class Dataset:
         """Public resolve URL of `path` (what the browser fetches)."""
         return f"https://huggingface.co/datasets/{self.repo}/resolve/main/{path}"
 
-    def local_path(self, path: str, fresh: bool = False) -> Read:
-        """A local copy of `path` (value = filesystem path)."""
+    def local_path(self, path: str, fresh: bool = False,
+                   revision: str | None = None, local_dir: str | None = None) -> Read:
+        """A local copy of `path` (value = filesystem path), at `revision`
+        (see head()) when given; into `local_dir` (repo paths kept) instead of
+        the shared download cache when given — for a caller that removes it."""
+        kw = {"revision": revision} if revision is not None else {}
+        if local_dir:
+            kw["local_dir"] = local_dir
         try:
-            return Read(DATA, self.adapter.download(self.repo, path, fresh=fresh))
+            return Read(DATA, self.adapter.download(self.repo, path, fresh=fresh, **kw))
         except NotFound:
             return Read(MISSING)
         except Exception as e:
             return _unreachable(e)
 
     def read_json(self, path: str, kind: type | None = None,
-                  fresh: bool = False) -> Read:
+                  fresh: bool = False, revision: str | None = None) -> Read:
         """Parsed JSON. Content that does not parse, or is not a `kind`, is
         no trustworthy answer: UNREACHABLE, never MISSING."""
-        return self.read(path, _json_loader(kind), fresh=fresh)
+        return self.read(path, _json_loader(kind), fresh=fresh, revision=revision)
 
-    def read(self, path: str, load, fresh: bool = False) -> Read:
+    def read(self, path: str, load, fresh: bool = False,
+             revision: str | None = None) -> Read:
         """`load(local_path)` of `path`. A loader that raises (corrupt file,
         wrong type) makes the read UNREACHABLE, never MISSING."""
-        r = self.local_path(path, fresh=fresh)
+        r = self.local_path(path, fresh=fresh, revision=revision)
         if not r.ok:
             return r
         try:
@@ -439,6 +496,15 @@ class Dataset:
         load = load or _json_loader(kind)
         return cached(lambda: self.read(path, load, fresh=fresh), ttl_s,
                       retry_s=retry_s, clock=clock)
+
+    def head(self) -> Read:
+        """The repo's current revision (value = commit sha): read files at it
+        and commit with parent=it for a read-modify-write that cannot undo
+        another process's commit (see commit)."""
+        try:
+            return Read(DATA, self.adapter.head(self.repo))
+        except Exception as e:
+            return _unreachable(e)
 
     def exists(self, path: str) -> Read:
         """Whether `path` is in the repo, without downloading it (value =
@@ -495,16 +561,23 @@ class Dataset:
             return _unreachable(e)
         return Read(DATA, sorted(f for f in files if f.startswith(prefix)))
 
-    def commit(self, ops: list, message: str) -> Committed:
-        """ONE commit of `ops` (Put / Delete). Never raises."""
+    def commit(self, ops: list, message: str,
+               parent: str | None = None) -> Committed:
+        """ONE commit of `ops` (Put / Delete). Never raises. With `parent` (a
+        head() revision) the commit lands only if the repo is still at it;
+        otherwise the answer is Committed(False, moved=True)."""
         if not self.can_write:
             return Committed(False, "no HF token: read-only")
         stamp = self.budget.take()
         if stamp is None:
             return Committed(False, f"commit budget spent ({self.budget.limit}"
                                     f" per {self.budget.window_s:g} s)")
+        kw = {"parent": parent} if parent is not None else {}
         try:
-            self.adapter.commit(self.repo, list(ops), message)
+            self.adapter.commit(self.repo, list(ops), message, **kw)
+        except Moved as e:
+            self.budget.give_back(stamp)
+            return Committed(False, f"moved: {e}", moved=True)
         except Exception as e:
             self.budget.give_back(stamp)       # only commits that land count
             return Committed(False, f"{type(e).__name__}: {e}")

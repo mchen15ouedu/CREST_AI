@@ -367,9 +367,21 @@ def test_save_record_failure_keeps_the_old_record(tmp_path, monkeypatch):
 def test_only_atomicfile_moves_files_into_place():
     """Ticket 11: shared-store writers (and the offline prep scripts) go
     through hf_data.atomicfile; nobody else calls os.replace / os.rename or
-    builds per-process temp names."""
+    builds per-process temp names (os.getpid inside a name being built: an
+    f-string, a + / % expression, a .format() or os.path.join call). A pid
+    reported as data (a status document's "pid") is no temp name."""
     import ast
     import pathlib
+
+    def is_os(node, *attrs):
+        return (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id == "os" and node.attr in attrs)
+
+    def builds_name(node):
+        return (isinstance(node, (ast.JoinedStr, ast.BinOp))
+                or (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("format", "join")))
+
     root = pathlib.Path(ROOT)
     offenders = []
     for d in ("hf_data", "scripts", "fleet"):
@@ -377,12 +389,14 @@ def test_only_atomicfile_moves_files_into_place():
             rel = p.relative_to(root).as_posix()
             if rel == "hf_data/atomicfile.py":
                 continue
-            for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"))):
-                if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-                        and node.value.id == "os"
-                        and node.attr in ("replace", "rename", "getpid")):
+            tree = ast.parse(p.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if is_os(node, "replace", "rename"):
                     offenders.append(f"{rel}:{node.lineno} os.{node.attr}")
-    assert offenders == []
+                elif builds_name(node):
+                    offenders += [f"{rel}:{n.lineno} os.getpid in a name"
+                                  for n in ast.walk(node) if is_os(n, "getpid")]
+    assert sorted(set(offenders)) == []
 
 
 # --- ungauged runner: workers are spawned, never forked -----------------------
