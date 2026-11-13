@@ -317,6 +317,26 @@ def _claim_fresh(claim) -> bool:
     return (datetime.datetime.utcnow() - hb).total_seconds() < STALE_S
 
 
+def incompatible_job(spec: dict, ident: str) -> str | None:
+    """Why this worker must leave a queued job alone, or None if it may claim it.
+
+    This backup image implements only the original forcing contract (worker
+    protocol 1). Newer coupling jobs (observed-boundary / KW, protocol >= 2)
+    and jobs pinned to another engine (required_engine_prefix, e.g.
+    "jetstream2:") must stay unclaimed for a compatible HPC worker.
+    Ported from the CREST_gpu_worker Space (3271f17, 2026-10-27)."""
+    try:
+        protocol = int(spec.get("worker_protocol", spec.get("coupling_protocol", 1)))
+    except (TypeError, ValueError):
+        return "unsupported_protocol"
+    if protocol > 1:
+        return "unsupported_protocol"
+    required = spec.get("required_engine_prefix")
+    if required and not ident.startswith(required):
+        return "engine_mismatch"
+    return None
+
+
 def _scan():
     """Oldest BACKUP-eligible job: bundle present, 30 m, inside cell budget,
     unclaimed (or stale), and queued more than ZERO_DELAY_S ago (the HPC gets
@@ -352,6 +372,10 @@ def _scan():
         spec = _read_json(f"{QPREFIX}/{ev}.json")
         if not spec:
             _skip("spec_unreadable")
+            continue
+        why = incompatible_job(spec, IDENT)
+        if why:
+            _skip(why)
             continue
         if (ev, spec.get("queued", "")) in W["done"]:
             _skip("done")
