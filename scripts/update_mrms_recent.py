@@ -37,7 +37,7 @@ truststore.inject_into_ssl()
 
 from forcing_update_common import HF_REPO, hf_token                             # noqa: E402
 from update_mrms import MRMS_GRID                                               # noqa: E402
-from hf_data.forcing import _read_pqf, _write_pqf                               # noqa: E402
+from hf_data.forcing_archive import read_pqf, store_bytes                     # noqa: E402
 
 PRODUCT = "MultiSensor_QPE_01H_Pass1"
 NCEP_URL = ("https://mrms.ncep.noaa.gov/2D/{prod}/"
@@ -125,17 +125,7 @@ def fetch_hour(t: datetime) -> bytes | None:
     xll, yll, cell, nr, nc, nod = MRMS_GRID
     if a.shape != (nr, nc):
         return None                                   # unexpected grid -> skip
-    fd, buf = tempfile.mkstemp(suffix=".pqf")
-    os.close(fd)
-    try:
-        _write_pqf(buf, a, xll, yll, cell, nod)
-        with open(buf, "rb") as fh:
-            return fh.read()
-    finally:
-        try:
-            os.remove(buf)
-        except OSError:
-            pass
+    return store_bytes("mrms", a, xll, yll, cell, nod, name=t.strftime(MEMBER_FMT))
 
 
 def main() -> int:
@@ -191,7 +181,7 @@ def main() -> int:
                                     repo_type="dataset", token=hf_token())
                 with open(p, "rb") as fh:
                     data = fh.read()
-            a, _, _, _, nod = _read_pqf(data)
+            a, _, _, _, nod = read_pqf(data)
             ops.append(CommitOperationAdd(FRAME_PREFIX + t.strftime(FRAME_FMT),
                                           render_frame(a, nod)))
             n_frames += 1

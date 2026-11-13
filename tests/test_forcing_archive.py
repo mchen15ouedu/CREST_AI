@@ -175,3 +175,57 @@ def test_prepare_forcing_fails_readably_on_an_archive_gap(tmp_path):
     with pytest.raises(RuntimeError, match="not available for 2024-01"):
         forcing.prepare_forcing("temp", BBOX, T, T, str(tmp_path / "TEMP"),
                                 archive=ForcingArchive(fetch=FakeStore({})))
+
+
+# --- write side: update scripts store grids through the archive ------------ #
+WHOLE = (-100.0, 40.0, -95.0, 44.0)             # the full 4x5 domain
+
+
+def test_stored_grid_reads_back_identical():
+    from hf_data.forcing_archive import ForcingArchive, store_bytes
+    member = store_bytes("temp", DEGC, XLL, YLL, CELL, NODATA, name=TEMP_MEMBER)
+    arc = ForcingArchive(fetch=FakeStore({TEMP_MONTH_TAR: tar_bytes({TEMP_MEMBER: member})}))
+    g = arc.read("temp", T, WHOLE)
+    np.testing.assert_array_equal(g.values, DEGC)
+    assert (g.xll, g.yll, g.cell, g.nodata) == (XLL, YLL, CELL, NODATA)
+    assert g.was_kelvin is False
+
+
+def test_storing_a_kelvin_temperature_grid_is_refused(tmp_path):
+    from hf_data.forcing_archive import TempUnitsError, store_bytes, store_file
+    kelvin = DEGC + 273.15
+    with pytest.raises(TempUnitsError):
+        store_bytes("temp", kelvin, XLL, YLL, CELL, NODATA, name=TEMP_MEMBER)
+    out = tmp_path / "temp_2024011506.pqf"
+    with pytest.raises(TempUnitsError):
+        store_file(str(out), "temp", kelvin, XLL, YLL, CELL, NODATA)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_store_file_reads_back_identical(tmp_path):
+    from hf_data.forcing_archive import ForcingArchive, store_file
+    out = tmp_path / TEMP_MEMBER
+    store_file(str(out), "temp", DEGC, XLL, YLL, CELL, NODATA)
+    arc = ForcingArchive(fetch=FakeStore({TEMP_MONTH_TAR: tar_bytes({TEMP_MEMBER: out.read_bytes()})}))
+    np.testing.assert_array_equal(arc.read("temp", T, WHOLE).values, DEGC)
+
+
+def test_kelvin_to_degc_is_the_archive_conversion():
+    """Writers holding a Kelvin source (NARR) convert with the archive's own offset."""
+    from hf_data.forcing_archive import kelvin_to_degc
+    np.testing.assert_allclose(kelvin_to_degc(np.array([273.15, 300.0])), [0.0, 26.85])
+
+
+def test_update_scripts_import_no_private_forcing_helpers():
+    """Forcing writers go through the archive's public store operation."""
+    import ast
+    import pathlib
+    scripts = pathlib.Path(__file__).resolve().parents[1] / "scripts"
+    offenders = []
+    for p in sorted(scripts.glob("*.py")):
+        for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"))):
+            if (isinstance(node, ast.ImportFrom) and node.module
+                    and node.module.startswith("hf_data.forcing")):
+                offenders += [f"{p.name}: {a.name}" for a in node.names
+                              if a.name.startswith("_")]
+    assert offenders == []

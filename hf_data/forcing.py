@@ -16,53 +16,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import numpy as np
-import pyarrow.parquet as pq
 import truststore
 truststore.inject_into_ssl()  # local corporate-MITM fix; harmless on HF runners
 from huggingface_hub import hf_hub_download
 
-from hf_data.atomicfile import atomic_path
-
-# Layout, PQF decoding, clipping and the per-variable value rules live in the
-# forcing archive module; re-exported here so existing importers keep working.
+# Layout, PQF encoding/decoding, clipping, the canonical temp grid and the
+# per-variable value rules live in the forcing archive module; re-exported here
+# so existing importers keep working.
 from hf_data.forcing_archive import (  # noqa: F401,E402
-    HF_REPO, K_OFFSET, TEMP_K_MEDIAN, VARS, ArchiveGap, ForcingArchive,
-    TempUnitsError, VarCfg, _clip, _read_pqf, check_temp_units, clip_window,
+    HF_REPO, K_OFFSET, TEMP_GRID, TEMP_K_MEDIAN, VARS, ArchiveGap, ForcingArchive,
+    TempUnitsError, VarCfg, _clip, _read_pqf, _write_pqf, check_temp_units,
+    clip_window, store_file, temp_clip_geometry,
 )
-
-# Canonical temperature grid: the geometry of every full-domain temp PQF in the
-# store (NLDAS-heritage 0.125-deg CONUS). NARR-derived members (scripts/
-# update_temp_narr.py) are resampled onto this same grid so ALL temp timesteps
-# — and the temperature-extrapolation DEM built against them — share one
-# geometry. (xll, yll, cellsize, nrows, ncols, nodata)
-TEMP_GRID = (-124.9375, 25.0625, 0.12473060344827586, 224, 464, -9999.0)
-
-
-def temp_clip_geometry(bbox):
-    """Geometry of the basin-clipped temp grid: (xll, yll_top?, ...) ->
-    (nxll, nyll, cell, nrows, ncols) or None if bbox is outside the grid."""
-    xll, yll, cell, nr, nc = TEMP_GRID[:5]
-    win = clip_window(bbox, xll, yll, cell, nr, nc)
-    if win is None:
-        return None
-    r0, r1, c0, c1 = win
-    top = yll + nr * cell
-    return xll + c0 * cell, top - r1 * cell, cell, r1 - r0, c1 - c0
-
-
-def _write_pqf(path: str, a: np.ndarray, xll: float, yll: float, cell: float, nodata: float):
-    import pyarrow as pa
-    nr, nc = a.shape
-    meta = {b"ncols": str(nc).encode(), b"nrows": str(nr).encode(),
-            b"xllcorner": repr(float(xll)).encode(), b"yllcorner": repr(float(yll)).encode(),
-            b"cellsize": repr(float(cell)).encode(), b"nodata": repr(float(nodata)).encode()}
-    schema = pa.schema([pa.field("v", pa.float32())]).with_metadata(meta)
-    # atomic, temp name unique per call: the shared store may have concurrent
-    # readers (EF5), and two writers - fleet workers or dashboard threads - may
-    # clip the same hour (nested basins share a store)
-    with atomic_path(path) as tmp:
-        pq.write_table(pa.table({"v": a.reshape(-1).astype("float32")}, schema=schema),
-                       tmp, compression="zstd")
 
 
 def _timesteps(t0: datetime, t1: datetime, freq: str):
@@ -189,7 +154,7 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
                 out_name = t.strftime(cfg.out_fmt)
                 if g.was_kelvin:
                     res.converted.append(out_name)
-                _write_pqf(os.path.join(out_dir, out_name), g.values, g.xll, g.yll,
+                store_file(os.path.join(out_dir, out_name), var, g.values, g.xll, g.yll,
                            g.cell, g.nodata)
                 res.written.append(out_name)
     finally:
@@ -223,7 +188,7 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
                     continue
                 sub, nxll, nyll = clip
                 out_name = t.strftime(cfg.out_fmt)
-                _write_pqf(os.path.join(out_dir, out_name), sub, nxll, nyll,
+                store_file(os.path.join(out_dir, out_name), var, sub, nxll, nyll,
                            cell, nod)
                 res.written.append(out_name)
                 res.recent += 1
