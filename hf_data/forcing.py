@@ -29,6 +29,7 @@ from hf_data.forcing_archive import (  # noqa: F401,E402
     HF_REPO, K_OFFSET, TEMP_K_MEDIAN, VARS, ArchiveGap, ForcingArchive,
     TempUnitsError, VarCfg, _clip, _read_pqf, check_temp_units, clip_window,
 )
+from hf_data.forcing_archive import store_key  # noqa: E402
 
 # Canonical temperature grid: the geometry of every full-domain temp PQF in the
 # store (NLDAS-heritage 0.125-deg CONUS). NARR-derived members (scripts/
@@ -103,8 +104,7 @@ def store_dir(var: str, bbox) -> str:
     reuse each other's clipped timesteps — overlapping windows are MERGED here
     instead of re-downloaded and re-clipped into per-run temp dirs."""
     from hf_data.statecache import CACHE_DIR
-    key = "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p")
-    d = os.path.join(CACHE_DIR, "forcing", var, key)
+    d = os.path.join(CACHE_DIR, "forcing", var, store_key(bbox))
     os.makedirs(d, exist_ok=True)
     return d
 

@@ -100,11 +100,10 @@ _SHARED_KEYS = None            # per worker process
 
 
 def _keys(bbox) -> tuple[str, str]:
-    """(terrain clip key, forcing store key) of an extent: basic.store_key and
-    the formula forcing.store_dir uses (without their mkdir)."""
-    from hf_data import basic
-    return (basic.store_key(bbox),
-            "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p"))
+    """(terrain clip key, forcing store key) of an extent: the keys
+    basic.store_dir and forcing.store_dir use (without their mkdir)."""
+    from hf_data import basic, forcing_archive
+    return basic.store_key(bbox), forcing_archive.store_key(bbox)
 
 
 def _shared_store_keys() -> set:

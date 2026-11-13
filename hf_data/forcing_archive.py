@@ -59,6 +59,12 @@ VARS = {
 }
 
 
+def store_key(bbox) -> str:
+    """Key of the per-(variable, basin box) clipped-forcing store
+    (forcing.store_dir): the box at three decimals, '-' -> 'm', '.' -> 'p'."""
+    return "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p")
+
+
 # --------------------------------------------------------------------------- #
 # per-variable value rules
 # --------------------------------------------------------------------------- #
@@ -186,6 +192,16 @@ class Grid:
     was_kelvin: bool = False  # temperature stored in K, converted to degC on read
 
 
+def decode(var: str, data: bytes, name: str = "") -> Grid:
+    """PQF bytes of one `var` timestep -> full-domain Grid, validated for its
+    variable (THE RULE above). For grids that do not come out of a forcing tar
+    (e.g. the mrms_recent Pass1 files); tar members go through
+    ForcingArchive.read."""
+    a, xll, yll, cell, nod = _read_pqf(data)
+    a, was_k = validate(var, a, nod, name)
+    return Grid(a, xll, yll, cell, nod, name, was_k)
+
+
 class ArchiveGap(LookupError):
     """The archive has no tar (month or year) for this variable and month."""
     def __init__(self, var: str, year: int, month: int):
@@ -193,20 +209,22 @@ class ArchiveGap(LookupError):
         self.var, self.year, self.month = var, year, month
 
 
-def _hub_fetch(repo: str, cache_dir: str | None):
+def _hub_fetch(repo: str, cache_dir: str | None, token: str | None = None):
     def fetch(path: str) -> str:
         from huggingface_hub import hf_hub_download
         from huggingface_hub.errors import EntryNotFoundError
         try:
-            return hf_hub_download(repo, path, repo_type="dataset", cache_dir=cache_dir)
+            return hf_hub_download(repo, path, repo_type="dataset", cache_dir=cache_dir,
+                                   token=token)
         except EntryNotFoundError as e:          # permanent 404 -> "not there"
             raise FileNotFoundError(path) from e
     return fetch
 
 
 class ForcingArchive:
-    def __init__(self, repo: str = HF_REPO, cache_dir: str | None = None, fetch=None):
-        self._fetch = fetch or _hub_fetch(repo, cache_dir)
+    def __init__(self, repo: str = HF_REPO, cache_dir: str | None = None, fetch=None,
+                 token: str | None = None):
+        self._fetch = fetch or _hub_fetch(repo, cache_dir, token)
         self._open: dict[tuple[str, int, int], tuple[tarfile.TarFile, set[str]]] = {}
 
     def _tar(self, var: str, t: datetime) -> tuple[tarfile.TarFile, set[str]]:
@@ -227,7 +245,9 @@ class ForcingArchive:
             self._open[key] = (tf, set(tf.getnames()))
         return self._open[key]
 
-    def read(self, var: str, t: datetime, bbox) -> Grid | None:
+    def read(self, var: str, t: datetime, bbox=None) -> Grid | None:
+        """Grid of `var` at `t` clipped to bbox (W,S,E,N); bbox None -> the
+        full domain. None when the month's tar has no member for `t`."""
         cfg = VARS[var]
         tf, names = self._tar(var, t)
         member = t.strftime(cfg.member_fmt)
@@ -235,13 +255,14 @@ class ForcingArchive:
             member = t.strftime(cfg.out_fmt)    # the generic name
         if member not in names:
             return None
-        a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())
-        a, was_k = validate(var, a, nod, member)     # full grid, before clipping
-        clip = _clip(a, xll, yll, cell, nod, bbox)
+        g = decode(var, tf.extractfile(member).read(), member)  # validated whole
+        if bbox is None:
+            return g
+        clip = _clip(g.values, g.xll, g.yll, g.cell, g.nodata, bbox)
         if clip is None:                        # box outside the archive grid
             return None
         sub, nxll, nyll = clip
-        return Grid(sub, nxll, nyll, cell, nod, member, was_k)
+        return Grid(sub, nxll, nyll, g.cell, g.nodata, member, g.was_kelvin)
 
     def close(self):
         for tf, _ in self._open.values():
