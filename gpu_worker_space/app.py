@@ -53,6 +53,11 @@ def _git(*args, cwd=None):
                           capture_output=True, text=True).stdout.strip()
 
 
+# Not spaceruntime.boot_sources: the other runners shallow-clone the whole
+# CREST_AI repo from GitHub and link the image's EF5 build; this worker needs
+# sparse checkouts from two other sources (the crestimap fork at a pinned ref,
+# hf_data from the CREST_demo Space) and no EF5 — and it must have hf_data
+# before spaceruntime is even importable.
 def _bootstrap():
     """Blobless sparse clones: crestimap/ from the fork at FORK_REF, hf_data/
     from the CREST_demo Space (eventsim/eventstore reuse — nothing

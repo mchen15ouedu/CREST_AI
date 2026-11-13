@@ -18,7 +18,7 @@ long-term store):
   * routednow.compute -> statecache.prune_states keeps the newest state (next
     hour's warm start) + one checkpoint per 10 days locally, deletes the rest;
   * when a NEW 10-day checkpoint is minted, this uploads the point's state
-    bundle + record to vincewin/CREST_fleet as states/<key>.pqf +
+    bundle + record to the fleet repo (CREST_fleet) as states/<key>.pqf +
     results/<key>.json (key "V..._crestphys-spd") — right beside the gauge keys.
 
 t0 is the issue time of the current gauged DI-LSTM nowcast (nowcaststore), so
@@ -44,7 +44,6 @@ from datetime import datetime, timezone
 SRC = "/app/src"
 CACHE = "/tmp/crest_cache"
 LOG = "/tmp/ungauged.log"
-REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")   # nowcast parquet + no-upstream list
 CONUS = (-125.5, 24.0, -66.5, 50.0)          # (w, s, e, n)
 CREST_AI_GIT = "https://github.com/mchen15ouedu/CREST_AI.git"
 state = {"phase": "booting", "passes": 0, "t0": None, "ok": 0, "fail": 0,
@@ -176,6 +175,9 @@ def _flush_fleet() -> int:
     successful commit. Returns the number of checkpoints committed."""
     if _fleet_batch is None or not _fleet_batch.pending:
         return 0
+    from hf_data import fleetstore
+    if not fleetstore.DATASET.can_write:       # no HF_TOKEN: nothing to retry
+        return 0
     n = _fleet_batch.pending
     keys = _fleet_batch.flush()
     if not keys:
@@ -236,11 +238,11 @@ def _seed_carry():
     """Rebuild the carry ledger from this shard's last published parquet so a
     container restart doesn't collapse the served coverage to zero."""
     try:
-        import pyarrow.parquet as pq
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, f"nowcast/ungauged_latest{_shard_tag()}.parquet",
-                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
-        t = pq.read_table(p)
+        from hf_data import ungaugednow_store
+        r = ungaugednow_store.load_shard(_shard_tag())
+        if not r.ok:
+            raise LookupError(r.status)
+        t = r.value
         meta = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()}
         default_t0 = meta.get("t0", "").replace(" UTC", "")
         cols = {n: t.column(n).to_pylist() for n in t.schema.names}
@@ -263,38 +265,25 @@ def _shard_tag() -> str:
     return ("__" + sh.replace("/", "of")) if sh else ""    # "0/3" -> "__0of3"
 
 
-def _no_upstream_path() -> str:
-    return f"nowcast/ungauged_no_upstream{_shard_tag()}.json"
-
-
 def _seed_ineligible():
-    """Load this shard's known headwater (no-upstream) ids from CREST_data so
-    they're skipped from the start — the routed-injection design can't serve
-    them, so they're nowcast-ineligible (they remain valid on the hindcast
-    side, which is served on demand, not here)."""
-    try:
-        import json
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, _no_upstream_path(), repo_type="dataset",
-                            token=os.environ.get("HF_TOKEN"))
-        _ineligible.update(json.load(open(p)))
+    """Load this shard's known headwater (no-upstream) ids from the feedback
+    dataset so they're skipped from the start — the routed-injection design
+    can't serve them, so they're nowcast-ineligible (they remain valid on the
+    hindcast side, which is served on demand, not here)."""
+    from hf_data import ungaugednow_store
+    r = ungaugednow_store.load_no_upstream(_shard_tag())
+    if r.ok:
+        _ineligible.update(r.value)
         _log(f"seeded {len(_ineligible)} nowcast-ineligible (no-upstream) points")
-    except Exception:
-        _log("no prior no-upstream list (first run)")
+    else:
+        _log(f"no prior no-upstream list ({r.status})")
 
 
 def _save_ineligible():
-    try:
-        import io
-        import json
-        from huggingface_hub import CommitOperationAdd, HfApi
-        buf = io.BytesIO(json.dumps(sorted(_ineligible)).encode())
-        HfApi(token=os.environ["HF_TOKEN"]).create_commit(
-            repo_id=REPO, repo_type="dataset",
-            operations=[CommitOperationAdd(_no_upstream_path(), buf)],
-            commit_message=f"no-upstream list {_shard_tag() or 'all'} ({len(_ineligible)})")
-    except Exception as e:
-        _log(f"could not save no-upstream list: {type(e).__name__}: {e}")
+    from hf_data import ungaugednow_store
+    c = ungaugednow_store.save_no_upstream(_ineligible, _shard_tag())
+    if not c:
+        _log(f"could not save no-upstream list: {c.error}")
 
 
 def _keys_for(vp, lon):

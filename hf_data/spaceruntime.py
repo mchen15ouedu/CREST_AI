@@ -163,12 +163,6 @@ def start_thread(target, *args) -> threading.Thread:
 # --------------------------------------------------------------------------- #
 # boot
 # --------------------------------------------------------------------------- #
-def clone_command(src: str, repo: str = CREST_AI_GIT) -> list:
-    """The shallow clone every runner.py runs before it can import this module
-    (kept here as the reference; runner.py repeats it by necessity)."""
-    return ["git", "clone", "--depth", "1", repo, src]
-
-
 def boot_sources(src: str, ef5: str = "/EF5", *, symlink=os.symlink):
     """Finish booting freshly cloned sources: link the image's EF5 build to
     <src>/EF5 (pipelines run ./EF5/bin/ef5 relative to the sources) and put the

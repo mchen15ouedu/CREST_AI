@@ -28,14 +28,9 @@ TTL_S = 240
 RISK_H = 6           # tier window: pins/heatmap use the first 6 forecast hours
 
 
-def _qcols(cols) -> list:
-    """Ordered 6-h-model columns q1..qN (risk basis) in latest.parquet."""
-    return nowcastfeed.qcols(cols, "q")
-
-
-def _q12cols(cols) -> list:
-    """Ordered 12-h-model columns q12_1..q12_N (hydrograph-only, own trace)."""
-    return nowcastfeed.qcols(cols, "q12_")
+# latest.parquet columns: q1..qN = the 6-h model (risk basis),
+# q12_1..q12_N = the 12-h model (hydrograph-only, own trace) — read with
+# nowcastfeed.qcols(cols, "q") / nowcastfeed.qcols(cols, "q12_").
 
 _lock = threading.Lock()
 THR_TTL_S = 3600
@@ -163,7 +158,7 @@ def all_risk() -> dict:
     thr = _thresholds()
     if not thr:
         return {"ok": False, "reason": "no flood thresholds computed yet"}
-    qmax = np.max(np.stack([cols[n] for n in _qcols(cols)[:RISK_H]], 1), 1)
+    qmax = np.max(np.stack([cols[n] for n in nowcastfeed.qcols(cols, "q")[:RISK_H]], 1), 1)
     has_obs = "obs_age_h" in cols and "obs_last_q" in cols
     has_skill = "val_nse_gauge" in cols
     tiers, flagged = {}, []
@@ -271,8 +266,7 @@ def hotspots(max_n: int | None = None) -> dict:
 
 def issue_t0() -> datetime | None:
     """Issue time of the current precomputed nowcast (UTC), or None."""
-    meta, cols = _fresh()
-    return None if cols is None else nowcastfeed.issue_time(meta)
+    return nowcastfeed.feed_t0(_fresh())
 
 
 def nowcast_series(gid: str) -> list[tuple[datetime, float]]:
@@ -282,9 +276,7 @@ def nowcast_series(gid: str) -> list[tuple[datetime, float]]:
     (q12_1..q12_N); falls back to the 6-h columns. Empty if the gauge has no
     precomputed nowcast (e.g. outside CONUS radar coverage)."""
     meta, cols = _fresh()
-    if cols is None:
-        return []
-    t0 = issue_t0()
+    t0 = nowcastfeed.feed_t0((meta, cols))
     if t0 is None:
         return []
     sid = str(gid).zfill(8)
@@ -292,7 +284,7 @@ def nowcast_series(gid: str) -> list[tuple[datetime, float]]:
     if len(idx) == 0:
         return []
     i = int(idx[0])
-    qn = _q12cols(cols) or _qcols(cols)
+    qn = nowcastfeed.qcols(cols, "q12_") or nowcastfeed.qcols(cols, "q")
     out = []
     for k, name in enumerate(qn):
         v = float(cols[name][i])
@@ -321,8 +313,8 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
     total = int(len(idx))
     idx = idx[:max(1, limit)]
     from hf_data.gaugetz import tz_of as _tz
-    qs = _qcols(cols)
-    q12s = _q12cols(cols)
+    qs = nowcastfeed.qcols(cols, "q")
+    q12s = nowcastfeed.qcols(cols, "q12_")
     t0 = nowcastfeed.issue_time(meta)
     times = ([(t0 + timedelta(hours=k + 1)).strftime("%Y-%m-%d %H:%M")
               for k in range(max(len(qs), len(q12s)))] if t0 else [])

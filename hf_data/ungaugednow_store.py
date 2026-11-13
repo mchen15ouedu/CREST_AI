@@ -52,7 +52,6 @@ TTL_S = 240
 HORIZON_H = 12
 TS_FMT = "%Y-%m-%d %H:%M"
 MAX_ROW_AGE_H = 26.0                # = ungauged_space CARRY_TTL_H
-META_T0_FMT = nowcastfeed.T0_FMT
 
 
 # --------------------------------------------------------------------------- #
@@ -112,8 +111,8 @@ def build_table(records: list[dict], t0: datetime, horizon: int = HORIZON_H):
 
     tbl = pa.table(arrays)
     meta = {
-        "t0": t0.strftime(META_T0_FMT),
-        "generated": datetime.utcnow().strftime(META_T0_FMT),
+        "t0": t0.strftime(nowcastfeed.T0_FMT),
+        "generated": datetime.utcnow().strftime(nowcastfeed.T0_FMT),
         "horizon": str(horizon),
         "n_points": str(len(vp)),
     }
@@ -231,13 +230,8 @@ def _fresh():
     return nowcastfeed.table(nowcastfeed.read(DATASET, "ungauged", _read_feed, TTL_S))
 
 
-def _qkeys(cols) -> list[str]:
-    return nowcastfeed.qcols(cols, "q")
-
-
 def issue_t0() -> datetime | None:
-    meta, cols = _fresh()
-    return None if cols is None else nowcastfeed.issue_time(meta)
+    return nowcastfeed.feed_t0(_fresh())
 
 
 def _pack(cols, i, qk, t0):
@@ -267,7 +261,7 @@ def _pack(cols, i, qk, t0):
 
 
 def _select(cols, idx, t0):
-    qk = _qkeys(cols)
+    qk = nowcastfeed.qcols(cols, "q")
     return [_pack(cols, int(i), qk, t0) for i in idx]
 
 
@@ -279,7 +273,7 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 200) -> dict:
     idx = nowcastfeed.in_bbox(cols, w, s, e, n)
     total = int(len(idx))
     idx = idx[:max(1, limit)]
-    t0 = issue_t0()
+    t0 = nowcastfeed.issue_time(meta)
     return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
             "source": meta.get("source"), "model_file": meta.get("model_file"),
             "n_in_view": total, "truncated": total > len(idx),
@@ -309,6 +303,29 @@ def _read_no_upstream(ds: hubdata.Dataset) -> hubdata.Read:
     return hubdata.Read(hubdata.DATA, ids)
 
 
+def no_upstream_path(tag: str = "") -> str:
+    """One writer's (shard's) no-upstream list."""
+    return f"{NO_UPSTREAM_PREFIX}{tag}.json"
+
+
+def load_no_upstream(tag: str = "") -> hubdata.Read:
+    """WRITE side: this writer's own no-upstream list (a set), as last saved."""
+    return DATASET.read(no_upstream_path(tag), _load_ids)
+
+
+def save_no_upstream(ids, tag: str = "") -> hubdata.Committed:
+    """WRITE side: replace this writer's no-upstream list. Never raises."""
+    ids = sorted(ids)
+    return DATASET.commit([Put(no_upstream_path(tag), ids)],
+                          f"no-upstream list {tag or 'all'} ({len(ids)})")
+
+
+def load_shard(tag: str = "") -> hubdata.Read:
+    """WRITE side: this writer's last published shard, as a pyarrow table."""
+    import pyarrow.parquet as pq
+    return DATASET.read(f"{LATEST_PREFIX}{tag}.parquet", pq.read_table)
+
+
 def _no_upstream_ids() -> set:
     """Points the keep-warm fleet has confirmed have NO upstream USGS gauge
     (union of the per-shard nowcast/ungauged_no_upstream*.json lists); the
@@ -330,7 +347,7 @@ def by_ids(ids) -> dict:
     want = ([s.strip() for s in ids.split(",") if s.strip()]
             if isinstance(ids, str) else [str(i) for i in ids])
     idx = np.nonzero(np.isin(cols["vp"], want))[0]
-    t0 = issue_t0()
+    t0 = nowcastfeed.issue_time(meta)
     pts = _select(cols, idx, t0)
     have = {p["id"] for p in pts}
     # "no_upstream" is only a reason under the EF5 routed feed; v3 needs no

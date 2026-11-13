@@ -327,9 +327,3 @@ def test_spaces_use_the_shared_runtime_not_copies(space):
     for copied in ("def keepalive_loop", "def _keep_awake", "def self_ping",
                    "def boot_sources", "class Status(", "def _own_host"):
         assert copied not in src, f"{space} still defines {copied}"
-
-
-def test_clone_command_is_a_shallow_clone_of_crest_ai():
-    assert rt.clone_command("/app/src") == [
-        "git", "clone", "--depth", "1",
-        "https://github.com/mchen15ouedu/CREST_AI.git", "/app/src"]
