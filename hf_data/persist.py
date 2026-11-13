@@ -2,7 +2,7 @@
 
 The Space container's disk is wiped on every restart/rebuild, which throws away
 exactly the data that makes repeat runs fast. This module mirrors those stores
-to a PRIVATE HF dataset (CREST_STATE_REPO, default vincewin/CREST_state):
+to a PRIVATE HF dataset (hubdata.state(): env CREST_STATE_REPO):
 
   states/   EF5 state grids (PRIORITY — skip the 90-day warm-up on repeats);
             uploaded as .pqf (zstd parquet + grid metadata, same format as the
@@ -36,6 +36,9 @@ import shutil
 import threading
 import time
 
+from hf_data import hubdata
+from hf_data.hubdata import Delete, Put
+
 CACHE_DIR = None  # set on first use (import-order safety)
 
 
@@ -47,7 +50,7 @@ def _cache_dir() -> str:
     return CACHE_DIR
 
 
-REPO = os.environ.get("CREST_STATE_REPO", "vincewin/CREST_state")
+DATASET = hubdata.state()
 EVERY_S = float(os.environ.get("CREST_PERSIST_EVERY_S", "600"))
 SYNC_DIRS = ("states", "results", "params", "users", "reports_saved", "obs")
 
@@ -58,17 +61,8 @@ _manifest: dict[str, tuple] = {}  # relpath -> (size, int mtime) at last sync
 _last: dict = {}                  # last restore/backup reports (for /api/persist)
 
 
-def _token():
-    return os.environ.get("HF_TOKEN")
-
-
 def enabled() -> bool:
-    return bool(_token())
-
-
-def _api():
-    from huggingface_hub import HfApi
-    return HfApi(token=_token())
+    return DATASET.can_write
 
 
 # ---- state grid <-> pqf (zstd parquet raster, forcing-store format) ---------
@@ -143,11 +137,12 @@ def restore() -> dict:
     """Pull the repo snapshot into CACHE_DIR (existing local files win)."""
     if not enabled():
         return {"enabled": False}
-    from huggingface_hub import snapshot_download
     tmp = os.path.join(_cache_dir(), "_restore_tmp")
     shutil.rmtree(tmp, ignore_errors=True)
-    snapshot_download(repo_id=REPO, repo_type="dataset", token=_token(),
-                      local_dir=tmp, allow_patterns=[d + "/**" for d in SYNC_DIRS])
+    got = DATASET.snapshot(tmp, [d + "/**" for d in SYNC_DIRS])
+    if not got.ok:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"restore: {got.error}")
     n = skipped = failed = 0
     for src in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
         if not os.path.isfile(src):
@@ -181,7 +176,6 @@ def backup() -> dict:
     """Incremental push: changed/new files up, locally-evicted files deleted."""
     if not enabled():
         return {"enabled": False}
-    from huggingface_hub import CommitOperationAdd, CommitOperationDelete
     with _lock:
         local = _scan()
         ops, added = [], []
@@ -206,16 +200,12 @@ def backup() -> dict:
                         data = fh.read()
             except Exception:
                 continue                         # mid-write (EF5 running) -> next pass
-            ops.append(CommitOperationAdd(
-                path_in_repo=_repo_name(rel, as_pqf=rel not in raw_states),
-                path_or_fileobj=data))
+            ops.append(Put(_repo_name(rel, as_pqf=rel not in raw_states), data))
             added.append((rel, sig))
-        # deletions: repo truth vs local truth (mirrors the janitor's LRU caps)
-        api = _api()
-        try:
-            in_repo = set(api.list_repo_files(REPO, repo_type="dataset"))
-        except Exception:
-            in_repo = set()
+        # deletions: repo truth vs local truth (mirrors the janitor's LRU caps);
+        # an unreachable listing deletes nothing
+        listed = DATASET.list_files()
+        in_repo = set(listed.value) if listed.ok else set()
         # a state may exist remotely under either name (.pqf or raw .tif) —
         # protect both spellings of every local file from deletion
         expected = set(local)
@@ -227,13 +217,14 @@ def backup() -> dict:
         gone = [f for f in in_repo
                 if f.split("/")[0] in SYNC_DIRS and f not in expected
                 and not f.startswith("params/")]
-        ops += [CommitOperationDelete(path_in_repo=f) for f in gone]
+        ops += [Delete(f) for f in gone]
         if not ops:
             rep = {"changed": 0, "deleted": 0}
             _last["backup"] = rep
             return rep
-        api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
-                          commit_message=f"cache sync: +{len(added)} -{len(gone)}")
+        res = DATASET.commit(ops, f"cache sync: +{len(added)} -{len(gone)}")
+        if not res:
+            raise RuntimeError(f"cache sync: {res.error}")
         for rel, sig in added:
             _manifest[rel] = sig
         rep = {"changed": len(added), "deleted": len(gone)}
@@ -242,7 +233,7 @@ def backup() -> dict:
 
 
 def status() -> dict:
-    return {"enabled": enabled(), "repo": REPO, "every_s": EVERY_S,
+    return {"enabled": enabled(), "repo": DATASET.repo, "every_s": EVERY_S,
             "tracked": len(_manifest), **_last}
 
 
@@ -254,7 +245,9 @@ def poke():
 # ---- lifecycle ----------------------------------------------------------------
 def _loop():
     try:
-        _api().create_repo(REPO, repo_type="dataset", private=True, exist_ok=True)
+        made = DATASET.create(private=True)
+        if not made:
+            raise RuntimeError(f"create repo: {made.error}")
         restore()
     except Exception as e:
         try:

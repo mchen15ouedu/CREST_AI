@@ -183,6 +183,18 @@ class HubAdapter:
             raise Unreachable(f"{type(e).__name__}: {e}") from e
         return {s.rfilename: (s.blob_id, s.size) for s in info.siblings}
 
+    def snapshot(self, repo: str, local_dir: str, patterns: list[str]) -> None:
+        from huggingface_hub import snapshot_download
+        try:
+            snapshot_download(repo_id=repo, repo_type="dataset", token=token(),
+                              local_dir=local_dir, allow_patterns=patterns)
+        except Exception as e:
+            raise Unreachable(f"{type(e).__name__}: {e}") from e
+
+    def create(self, repo: str, private: bool) -> None:
+        self._api().create_repo(repo, repo_type="dataset", private=private,
+                                exist_ok=True)
+
     def open(self, repo: str, path: str):
         from huggingface_hub import HfFileSystem
         try:
@@ -234,6 +246,19 @@ class MemoryHub:
         import hashlib
         self._check()
         return {k: (hashlib.sha1(v).hexdigest(), len(v)) for k, v in self.files.items()}
+
+    def snapshot(self, repo: str, local_dir: str, patterns: list[str]) -> None:
+        from fnmatch import fnmatch
+        self._check()
+        for k, v in self.files.items():
+            if any(fnmatch(k, p) for p in patterns):
+                p = os.path.join(local_dir, *k.split("/"))
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as fp:
+                    fp.write(v)
+
+    def create(self, repo: str, private: bool) -> None:
+        self._check()
 
     def open(self, repo: str, path: str):
         import io
@@ -391,6 +416,25 @@ class Dataset:
         except Exception as e:
             return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
         return Read(DATA, {k: v for k, v in info.items() if k.startswith(prefix)})
+
+    def snapshot(self, local_dir: str, patterns: list[str]) -> Read:
+        """Download every file matching one of the glob `patterns` (e.g.
+        "params/**") into `local_dir`, keeping repo paths (value = local_dir)."""
+        try:
+            self.adapter.snapshot(self.repo, local_dir, list(patterns))
+        except Exception as e:
+            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+        return Read(DATA, local_dir)
+
+    def create(self, private: bool = True) -> Committed:
+        """Create the repo if it does not exist yet. Never raises."""
+        if not self.can_write:
+            return Committed(False, "no HF token: read-only")
+        try:
+            self.adapter.create(self.repo, private)
+        except Exception as e:
+            return Committed(False, f"{type(e).__name__}: {e}")
+        return Committed(True)
 
     def open(self, path: str) -> Read:
         """A binary file object over the remote file, read by range requests
