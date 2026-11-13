@@ -18,17 +18,13 @@ from datetime import datetime, timedelta
 import numpy as np
 import truststore
 truststore.inject_into_ssl()  # local corporate-MITM fix; harmless on HF runners
-from huggingface_hub import hf_hub_download
 
-# Layout, PQF encoding/decoding, clipping, the canonical temp grid and the
-# per-variable value rules live in the forcing archive module; re-exported here
-# so existing importers keep working.
-from hf_data.forcing_archive import (  # noqa: F401,E402
-    HF_REPO, K_OFFSET, TEMP_GRID, TEMP_K_MEDIAN, VARS, ArchiveGap, ForcingArchive,
-    TempUnitsError, VarCfg, _clip, _read_pqf, _write_pqf, check_temp_units,
-    clip_window, store_file, temp_clip_geometry,
+# Layout (tars and the near-real-time store), PQF encoding/decoding, clipping
+# and the per-variable value rules live in the forcing archive module.
+from hf_data.forcing_archive import (  # noqa: E402
+    RECENT_STORES, TEMP_K_MEDIAN, VARS, ArchiveGap, ForcingArchive, read_pqf,
+    store_file, store_key,
 )
-from hf_data.forcing_archive import store_key  # noqa: E402
 
 
 def _timesteps(t0: datetime, t1: datetime, freq: str):
@@ -52,16 +48,6 @@ class ForcingResult:
     converted: list[str] = field(default_factory=list)   # temp members stored in K
     purged: int = 0                 # pre-guard Kelvin clips dropped from the store
     control_block: str = ""
-
-
-# Near-real-time fallback stores: the month tars archive FINAL products on a
-# slow cadence (MRMS Pass2 is batched every few days — seen live: the freshest
-# ~2 days absent), which is exactly the window every nowcast/event run needs.
-# Loose per-hour members uploaded hourly by scripts/update_mrms_recent.py fill
-# tar-missing hours. var -> (HF path strftime fmt, retention days).
-RECENT_STORES = {
-    "mrms": ("mrms_recent/mrms1h_pass1_%Y%m%d%H.pqf", 21),
-}
 
 
 def store_dir(var: str, bbox) -> str:
@@ -91,7 +77,7 @@ def _purge_kelvin_clips(out_dir: str) -> int:
             continue
         p = os.path.join(out_dir, f)
         with open(p, "rb") as fh:
-            a, _, _, _, nod = _read_pqf(fh.read())
+            a, _, _, _, nod = read_pqf(fh.read())
         v = a[np.isfinite(a) & (a != nod) & (a > -9000)]
         if v.size and float(np.median(v)) > TEMP_K_MEDIAN:
             os.remove(p)
@@ -101,11 +87,12 @@ def _purge_kelvin_clips(out_dir: str) -> int:
 
 
 def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir: str,
-                    repo: str = HF_REPO, cache_dir: str | None = None,
+                    repo: str | None = None, cache_dir: str | None = None,
                     cancel=None, archive: ForcingArchive | None = None) -> ForcingResult:
     """`cancel` (threading.Event) aborts between tar downloads / member clips —
-    a Stop must not sit behind a year of forcing downloads. Archive grids are
-    read through `archive` (default: a ForcingArchive on `repo`/`cache_dir`)."""
+    a Stop must not sit behind a year of forcing downloads. Archive grids (and
+    near-real-time hours) are read through `archive` (default: a
+    ForcingArchive on `repo`/`cache_dir`; repo None = the data repo)."""
     cfg = VARS[var]
     os.makedirs(out_dir, exist_ok=True)
     res = ForcingResult(var=var, out_dir=out_dir)
@@ -157,44 +144,40 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
                 store_file(os.path.join(out_dir, out_name), var, g.values, g.xll, g.yll,
                            g.cell, g.nodata)
                 res.written.append(out_name)
+
+        # ---- near-real-time fill (tar-missing hours) ----------------------- #
+        # The archive tar batches the final product days behind real time;
+        # every hour it lacks is read from the loose hourly store instead. A
+        # filled hour lands in the shared per-basin store and is reused by
+        # later runs even after the tar catches up — acceptable: both are
+        # gauge-corrected MRMS (Pass1 vs Pass2), and the store is ephemeral on
+        # Space restarts.
+        if recent and missing_ts:
+            keep_days = recent[1]
+            unfilled = []
+            for i, t in enumerate(sorted(missing_ts)):
+                if cancel is not None and cancel.is_set():
+                    unfilled.extend(sorted(missing_ts)[i:])
+                    break
+                if t > now or (now - t) > timedelta(days=keep_days):
+                    unfilled.append(t)
+                    continue
+                try:
+                    g = arc.read_recent(var, t, bbox)
+                except Exception:                # hiccup / implausible grid
+                    g = None
+                if g is None:                    # not posted / aged out / off-grid
+                    unfilled.append(t)
+                    continue
+                out_name = t.strftime(cfg.out_fmt)
+                store_file(os.path.join(out_dir, out_name), var, g.values, g.xll,
+                           g.yll, g.cell, g.nodata)
+                res.written.append(out_name)
+                res.recent += 1
+            missing_ts = unfilled
     finally:
         if archive is None:
             arc.close()
-
-    # ---- near-real-time fill (tar-missing hours) --------------------------- #
-    # The archive tar batches the final product days behind real time; every
-    # hour it lacks is fetched from the loose hourly store instead. A filled
-    # hour lands in the shared per-basin store and is reused by later runs
-    # even after the tar catches up — acceptable: both are gauge-corrected
-    # MRMS (Pass1 vs Pass2), and the store is ephemeral on Space restarts.
-    if recent and missing_ts:
-        fmt, keep_days = recent
-        unfilled = []
-        for i, t in enumerate(sorted(missing_ts)):
-            if cancel is not None and cancel.is_set():
-                unfilled.extend(sorted(missing_ts)[i:])
-                break
-            if t > now or (now - t) > timedelta(days=keep_days):
-                unfilled.append(t)
-                continue
-            try:
-                p = hf_hub_download(repo, t.strftime(fmt), repo_type="dataset",
-                                    cache_dir=cache_dir)
-                with open(p, "rb") as fh:
-                    a, xll, yll, cell, nod = _read_pqf(fh.read())
-                clip = _clip(a, xll, yll, cell, nod, bbox)
-                if clip is None:
-                    unfilled.append(t)
-                    continue
-                sub, nxll, nyll = clip
-                out_name = t.strftime(cfg.out_fmt)
-                store_file(os.path.join(out_dir, out_name), var, sub, nxll, nyll,
-                           cell, nod)
-                res.written.append(out_name)
-                res.recent += 1
-            except Exception:                    # not posted / aged out / hiccup
-                unfilled.append(t)
-        missing_ts = unfilled
     res.missing = [t.strftime(cfg.member_fmt) for t in sorted(missing_ts)]
 
     res.control_block = (
@@ -215,7 +198,7 @@ if __name__ == "__main__":
         print(f"[{var}] wrote {len(r.written)} files, {len(r.missing)} missing in {time.time()-t:.1f}s")
         for f in r.written:
             with open(os.path.join(r.out_dir, f), "rb") as fh:
-                a, xll, yll, cell, nod = _read_pqf(fh.read())
+                a, xll, yll, cell, nod = read_pqf(fh.read())
             print(f"    {f}: {a.shape} cell={cell} range[{np.nanmin(a):.2f},{np.nanmax(a):.2f}]")
         print("  --- control block ---")
         print("  " + r.control_block.replace("\n", "\n  ").rstrip())

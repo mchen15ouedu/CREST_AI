@@ -75,7 +75,7 @@ def test_atomic_path_failure_keeps_old_file(tmp_path):
 # --- forcing + param clips: threads of one process share the store ------------
 def test_write_pqf_threads_same_hour(tmp_path, monkeypatch, serial_replace):
     import pyarrow.parquet as pq
-    from hf_data import forcing
+    from hf_data import forcing_archive
     path = str(tmp_path / "p.pqf")
     gate, temps, write = threading.Barrier(8), [], pq.write_table
 
@@ -86,10 +86,10 @@ def test_write_pqf_threads_same_hour(tmp_path, monkeypatch, serial_replace):
     monkeypatch.setattr(pq, "write_table", overlapping_write)
 
     def w(i):
-        forcing._write_pqf(path, np.full((4, 5), float(i), "float32"),
-                           -90.0, 40.0, 0.01, -9999.0)
+        forcing_archive.store_file(path, "mrms", np.full((4, 5), float(i), "float32"),
+                                   -90.0, 40.0, 0.01, -9999.0)
     assert _threads(w) == [] and len(set(temps)) == 8 and _tmp_left(tmp_path) == []
-    a, xll, yll, cell, nod = forcing._read_pqf(open(path, "rb").read())
+    a, xll, yll, cell, nod = forcing_archive.read_pqf(open(path, "rb").read())
     assert a.shape == (4, 5) and len(set(a.ravel().tolist())) == 1   # one whole write
 
 
@@ -298,9 +298,10 @@ def test_conus_states_threads(tmp_path, monkeypatch):
 
 
 def test_persist_restore_tif_threads(tmp_path, monkeypatch):
-    from hf_data import forcing, persist
+    from hf_data import forcing_archive, persist
     pqf = str(tmp_path / "x.pqf")
-    forcing._write_pqf(pqf, np.full((4, 5), 2.0, "float32"), -90.0, 40.0, 0.01, -9999.0)
+    forcing_archive.store_file(pqf, "mrms", np.full((4, 5), 2.0, "float32"),
+                               -90.0, 40.0, 0.01, -9999.0)
     out = tmp_path / "tif"
     srcs = _overlap(monkeypatch)
     assert _threads(lambda i: persist._pqf_to_tif(pqf, str(out / "x.tif")), N) == []

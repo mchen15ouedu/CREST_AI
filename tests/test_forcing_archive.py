@@ -229,3 +229,102 @@ def test_update_scripts_import_no_private_forcing_helpers():
                 offenders += [f"{p.name}: {a.name}" for a in node.names
                               if a.name.startswith("_")]
     assert offenders == []
+
+
+def test_no_module_reaches_into_private_forcing_helpers():
+    """Ticket 04 contract: outside forcing_archive nobody imports or touches a
+    private forcing helper (scripts, tests, Spaces, nowcast_eval included)."""
+    import ast
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    mods = {"forcing", "forcing_archive", "hf_data.forcing", "hf_data.forcing_archive"}
+    offenders = []
+    for p in sorted(root.rglob("*.py")):
+        rel = p.relative_to(root).as_posix()
+        if rel == "hf_data/forcing_archive.py" or rel.startswith(".") or "/." in rel:
+            continue
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in mods:
+                offenders += [f"{rel}: {a.name}" for a in node.names
+                              if a.name.startswith("_")]
+            elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                  and node.value.id in mods and node.attr.startswith("_")
+                  and not node.attr.startswith("__")):
+                offenders.append(f"{rel}: {node.value.id}.{node.attr}")
+    assert offenders == []
+
+
+def test_archive_reads_the_data_repo_named_by_the_environment(monkeypatch):
+    import huggingface_hub
+    from huggingface_hub.errors import EntryNotFoundError
+    from hf_data.forcing_archive import ArchiveGap, ForcingArchive
+    asked = []
+
+    def dl(repo, path, **kw):
+        asked.append(repo)
+        raise EntryNotFoundError(path)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", dl)
+    monkeypatch.setenv("CREST_DATA_REPO", "me/data")
+    with pytest.raises(ArchiveGap):
+        ForcingArchive().read("temp", T, BBOX)
+    assert asked and set(asked) == {"me/data"}
+
+
+def test_transient_error_on_the_month_tar_propagates_without_the_year_fallback():
+    """Only a month tar that is not there falls back to the year tar."""
+    from hf_data.forcing_archive import ForcingArchive
+    store = FakeStore({TEMP_YEAR_TAR: tar_bytes({TEMP_MEMBER: pqf_bytes(DEGC)})})
+
+    def flaky_month(path):
+        if path == TEMP_MONTH_TAR:
+            store.asked.append(path)
+            raise ConnectionError(path)
+        return store(path)
+    with pytest.raises(ConnectionError):
+        ForcingArchive(fetch=flaky_month).read("temp", T, BBOX)
+    assert store.asked == [TEMP_MONTH_TAR]
+
+
+def _recent_hour():
+    from datetime import timedelta
+    return (datetime.utcnow() - timedelta(hours=3)).replace(minute=0, second=0,
+                                                           microsecond=0)
+
+
+def test_prepare_forcing_fills_tar_missing_hours_from_the_recent_store(tmp_path,
+                                                                       monkeypatch):
+    """The near-real-time fallback reads through the archive's fetch seam."""
+    import huggingface_hub
+    from hf_data import forcing
+    from hf_data.forcing_archive import ForcingArchive
+
+    def no_hub(*a, **kw):
+        raise AssertionError("the recent store must be read through the archive")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", no_hub)
+    monkeypatch.setattr(forcing, "hf_hub_download", no_hub, raising=False)
+    t = _recent_hour()
+    recent = t.strftime("mrms_recent/mrms1h_pass1_%Y%m%d%H.pqf")
+    rain = np.arange(20, dtype="float32").reshape(4, 5)
+    store = FakeStore({recent: pqf_bytes(rain)})              # no month/year tar yet
+    res = forcing.prepare_forcing("mrms", BBOX, t, t, str(tmp_path / "MRMS"),
+                                  archive=ForcingArchive(fetch=store))
+    assert res.recent == 1 and res.missing == []
+    assert recent in store.asked
+    a, xll, yll, cell = read_back(tmp_path / "MRMS" / t.strftime("mrms_%Y%m%d%H.pqf"))
+    np.testing.assert_array_equal(a, [[6.0, 7.0], [11.0, 12.0]])
+    assert (xll, yll, cell) == (-99.0, 41.0, 1.0)
+
+
+def test_archive_reads_a_loose_recent_member():
+    from hf_data.forcing_archive import ForcingArchive
+    t = _recent_hour()
+    recent = t.strftime("mrms_recent/mrms1h_pass1_%Y%m%d%H.pqf")
+    arc = ForcingArchive(fetch=FakeStore({recent: pqf_bytes(DEGC)}))
+    g = arc.read_recent("mrms", t, BBOX)
+    np.testing.assert_array_equal(g.values, [[1.0, 2.0], [6.0, 7.0]])
+    assert arc.read_recent("mrms", t.replace(year=t.year - 1), BBOX) is None
+    assert arc.read_recent("temp", t, BBOX) is None           # no recent store

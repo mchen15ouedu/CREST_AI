@@ -46,7 +46,6 @@ SNOW_GRID_COGS = {
     for p in ("uadj", "mbase", "mfmax", "mfmin", "tipm", "nmf", "plwhc", "scf",
               "pxtemp")
 }
-_RESOLVE = "https://huggingface.co/datasets/vincewin/CREST_data/resolve/main"
 
 
 def snow_params(overrides: dict | None = None, gridded=None) -> dict:
@@ -73,11 +72,13 @@ def clip_snow_grids(bbox, out_dir: str, unsafe_ssl: bool | None = None) -> dict:
     if unsafe_ssl:
         os.environ.setdefault("GDAL_HTTP_UNSAFESSL", "YES")
     os.makedirs(out_dir, exist_ok=True)
+    from hf_data import hubdata
+    data = hubdata.data()                         # the repo named by CREST_DATA_REPO
     W, S, E, N = bbox
     out = {}
     for key, cog in SNOW_GRID_COGS.items():
         try:
-            with rasterio.open(f"/vsicurl/{_RESOLVE}/{cog}") as src:
+            with rasterio.open(f"/vsicurl/{data.url(cog)}") as src:
                 win = from_bounds(W, S, E, N, src.transform).round_offsets().round_lengths()
                 data = src.read(1, window=win, boundless=True, fill_value=src.nodata)
                 if data.size == 0 or 0 in data.shape:
@@ -107,8 +108,8 @@ def build_temp_dem(bbox, dem_path: str, out_path: str) -> str | None:
     EF5's [TEMPForcing] DEM= temperature extrapolation. EF5 matches it to the
     temp grid by shape and indexes it with the temp grid's own row/col
     (TempReader.cpp), so the geometry must be cell-identical to the clipped
-    temp PQFs — guaranteed by sharing forcing.clip_window's arithmetic."""
-    from hf_data.forcing import temp_clip_geometry
+    temp PQFs — guaranteed by sharing forcing_archive.clip_window's arithmetic."""
+    from hf_data.forcing_archive import temp_clip_geometry
     geom = temp_clip_geometry(bbox)
     if geom is None or not dem_path or not os.path.exists(dem_path):
         return None

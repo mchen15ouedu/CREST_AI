@@ -44,7 +44,7 @@ HF_REPO = "vincewin/CREST_data"
 TOKEN_PATH = r"C:\Users\chenm\Documents\EF5\CREST_token.txt"
 
 # member-name -> timestamp patterns (NLDAS-heritage names AND generic ones the
-# updaters write); mirrors hf_data.forcing.VARS member/out formats
+# updaters write); mirrors hf_data.forcing_archive.VARS member/out formats
 _MEMBER_PATS = {
     "mrms": [r"mrms_corr_(\d{10})\.pqf$", r"mrms_(\d{10})\.pqf$"],
     "pet":  [r"et(\d{8})\.bil\.pqf$", r"et(\d{8})\.pqf$"],

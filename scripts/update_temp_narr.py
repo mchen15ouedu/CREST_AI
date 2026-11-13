@@ -11,7 +11,7 @@ because the GDEX form is 0.5–1 GB multi-variable GRIB tars per ~8 days, i.e.
 ~2.6 GB of download per month to extract a single band.
 
 Each 3-hourly Lambert field is bilinearly resampled onto the canonical
-NLDAS-heritage 0.125° temp grid (forcing.TEMP_GRID — so every temp PQF in the
+NLDAS-heritage 0.125° temp grid (forcing_archive.TEMP_GRID — so every temp PQF in the
 store shares one geometry, which the [TEMPForcing] DEM= extrapolation grid is
 built against), converted K→°C, and linearly interpolated to HOURLY members
 (EF5 zero-fills missing hourly files, which would freeze SNOW17 at 0 °C).
