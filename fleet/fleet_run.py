@@ -44,6 +44,8 @@ try:
 except Exception:
     pass
 
+from hf_data.runresult import Outcome  # noqa: E402  (stdlib only)
+
 DEF_START, DEF_END = "2021-07-01", "2026-06-30"      # last 5 y of MRMS coverage
 PROGRESS = "fleet_progress.jsonl"
 # size split (PI 2026-10-23): basins at/above this drainage area run on the
@@ -195,7 +197,7 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
         # M3: one cut set for the whole period, so no chunk re-keys the record
         cuts = pipeline.plan_cut_set(gid, t0, t1)
     except basinextent.BasinExtentError as e:
-        return {"gauge": gid, "ok": False, "outcome": "no_basin",
+        return {"gauge": gid, "ok": False, "outcome": Outcome.NO_BASIN.value,
                 "last": str(e)[-300:]}
     res = None
     cur = t0
@@ -211,7 +213,7 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
                 res = payload
         if res is None or not res.ok:
             return {"gauge": gid, "ok": False, "at": cur.strftime("%Y-%m-%d"),
-                    "outcome": res.outcome.value if res else "failed",
+                    "outcome": (res.outcome if res else Outcome.FAILED).value,
                     "last": ((res and res.reason) or last_status)[-300:]}
         cur = ce
 
@@ -220,7 +222,8 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
     # pipeline already stamped the record's provenance (extent, cut_ids, lakes)
     rec_path = res.record_path if res else None
     if not rec_path or not os.path.exists(rec_path):
-        return {"gauge": gid, "ok": False, "outcome": "failed", "last": "no result record"}
+        return {"gauge": gid, "ok": False, "outcome": Outcome.FAILED.value,
+                "last": "no result record"}
     with open(rec_path) as fh:
         rec = json.load(fh)
     n_states = len(rec.get("state_times", []))
@@ -229,7 +232,7 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
     # point's hindcast under vp/); the bundle is streamed to a temp file
     pub = fleetstore.publish_run(res, kind=fleetstore.HINDCAST)
     if not pub:
-        return {"gauge": gid, "ok": False, "outcome": "failed",
+        return {"gauge": gid, "ok": False, "outcome": Outcome.FAILED.value,
                 "last": (pub.error or "upload failed")[-300:]}
     key, mb = pub.key, pub.bytes / 1e6
 
@@ -351,7 +354,7 @@ def main():
             try:
                 r = fu.result()
             except Exception as e:
-                r = {"gauge": futs[fu], "ok": False, "outcome": "failed",
+                r = {"gauge": futs[fu], "ok": False, "outcome": Outcome.FAILED.value,
                      "last": f"{type(e).__name__}: {e}"}
             r["when"] = datetime.now().strftime("%Y-%m-%d %H:%M")
             prog.write(json.dumps(r) + "\n")

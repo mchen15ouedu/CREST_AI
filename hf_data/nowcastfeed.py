@@ -69,6 +69,12 @@ def issue_time(meta) -> datetime | None:
         return None
 
 
+def feed_t0(feed) -> datetime | None:
+    """Issue time of a (meta, cols) feed, or None when there is no feed."""
+    meta, cols = feed
+    return None if cols is None else issue_time(meta)
+
+
 def in_bbox(cols, w: float, s: float, e: float, n: float):
     """Row indices inside the bbox, largest basins first, and their count."""
     m = ((cols["lon"] >= w) & (cols["lon"] <= e)

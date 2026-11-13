@@ -143,3 +143,48 @@ def test_failed_batch_stays_queued_until_the_hub_is_back(hub, tmp_path):
     hub.outage = False
     assert batch.flush() == ["V70520944_m"]
     assert hub.files["states/V70520944_m.pqf"] == b"bundle"
+
+
+def test_ungauged_runner_without_a_token_skips_the_flush_quietly(hub, tmp_path,
+                                                                monkeypatch):
+    runner = _ungauged_runner(tmp_path, monkeypatch)
+    hub.writable = False                                 # no HF_TOKEN: read-only
+    runner._queue_fleet(fs.Publication("V70520944", "m", "m", b"bundle"))
+    assert runner._flush_fleet() == 0
+    assert hub.commits == [] and runner._fleet_batch.pending == 1
+    log = tmp_path / "ungauged.log"
+    assert not log.exists() or "failed" not in log.read_text()
+
+
+def test_ungauged_runner_reads_and_writes_the_feed_through_the_store(hub, tmp_path,
+                                                                     monkeypatch):
+    """Carry ledger and no-upstream list go through ungaugednow_store's
+    dataset (the feedback repo), never straight to the Hub."""
+    import io
+    from datetime import datetime
+
+    import pyarrow.parquet as pq
+    from hf_data import ungaugednow_store as us
+    feed = MemoryHub()
+    monkeypatch.setattr(us, "DATASET", Dataset("me/feedback", adapter=feed))
+    monkeypatch.setenv("UNGAUGED_SHARD", "0/2")
+    t0 = datetime(2026, 11, 13, 12)
+    buf = io.BytesIO()
+    pq.write_table(us.build_table([{"vp": "V7", "lat": 35.0, "lon": -97.0,
+                                    "area_km2": 10.0, "q": [1.0] * us.HORIZON_H,
+                                    "history": []}], t0), buf)
+    feed.files["nowcast/ungauged_latest__0of2.parquet"] = buf.getvalue()
+    feed.files["nowcast/ungauged_no_upstream__0of2.json"] = b'["V9"]'
+
+    runner = _ungauged_runner(tmp_path, monkeypatch)
+    runner._seed_ineligible()
+    runner._seed_carry()
+    assert runner._ineligible == {"V9"}
+    assert runner._carry["V7"]["t0"] == "2026-11-13 12:00" and runner._carry["V7"]["q"][0] == 1.0
+
+    runner._ineligible.add("V10")
+    runner._save_ineligible()
+    assert json.loads(feed.files["nowcast/ungauged_no_upstream__0of2.json"]) == ["V10", "V9"]
+
+    src = open(runner.__file__, encoding="utf-8").read()
+    assert "huggingface_hub" not in src and "vincewin/" not in src

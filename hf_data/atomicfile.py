@@ -14,6 +14,13 @@ import tempfile
 from contextlib import contextmanager
 
 
+def move_into_place(src: str, dst: str) -> None:
+    """Atomically move the finished file `src` onto `dst` (same filesystem;
+    raises OSError otherwise, or when Windows has `dst` open). The one
+    os.replace of the shared stores besides atomic_path's own."""
+    os.replace(src, dst)
+
+
 @contextmanager
 def atomic_path(path: str):
     """Yield a fresh temp path beside `path`. On a clean exit it replaces

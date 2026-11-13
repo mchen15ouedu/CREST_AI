@@ -28,7 +28,7 @@ from datetime import datetime
 import numpy as np
 import pyarrow.parquet as pq
 
-HF_REPO = "vincewin/CREST_data"
+from hf_data import hubdata       # stdlib-only at import: keeps numpy+pyarrow importers light
 
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +56,15 @@ VARS = {
     "temp": VarCfg("temp/%Y/temp_%Y_%m.tar", "temp/temp_%Y.tar",
                    "NLDAS_FORA0125_H.A%Y%m%d.%H00.002.grb.SUB_T.pqf", "temp_%Y%m%d%H.pqf",
                    "h", "TEMPForcing TEMP", "temp_YYYYMMDDHH.pqf", "C", "1h"),
+}
+
+# Near-real-time fallback stores: the month tars archive FINAL products on a
+# slow cadence (MRMS Pass2 is batched every few days — seen live: the freshest
+# ~2 days absent), which is exactly the window every nowcast/event run needs.
+# Loose per-hour members uploaded hourly by scripts/update_mrms_recent.py fill
+# tar-missing hours. var -> (HF path strftime fmt, retention days).
+RECENT_STORES = {
+    "mrms": ("mrms_recent/mrms1h_pass1_%Y%m%d%H.pqf", 21),
 }
 
 # Canonical temperature grid: the geometry of every full-domain temp PQF in the
@@ -140,17 +149,28 @@ def kelvin_to_degc(a: np.ndarray) -> np.ndarray:
     return np.asarray(a, dtype="float64") - K_OFFSET
 
 
+def _range_rule(var: str):
+    """Rule for a variable checked by plausible range only (nothing to convert)."""
+    def rule(a, nodata, name, convert):
+        rng = PLAUSIBLE.get(var)
+        if rng is not None:
+            v = a[_valid(a, nodata)]
+            if v.size and (v.min() < rng[0] or v.max() > rng[1]):
+                raise ForcingRangeError(f"{var} {name}: values {v.min():.1f}..{v.max():.1f} "
+                                        f"outside plausible {rng[0]}..{rng[1]}")
+        return a, False
+    return rule
+
+
+# var -> rule(a, nodata, name, convert) -> (grid in EF5 unit, was_converted).
+# Readers call with convert=True, writers with convert=False (store only
+# grids that already need no conversion).
+RULES = {"temp": check_temp_units, "mrms": _range_rule("mrms"), "pet": _range_rule("pet")}
+
+
 def validate(var: str, a: np.ndarray, nodata: float, name: str) -> tuple[np.ndarray, bool]:
     """Apply THE RULE above to a full-domain grid -> (grid in EF5 unit, was_kelvin)."""
-    if var == "temp":
-        return check_temp_units(a, nodata, name, convert=True)
-    rng = PLAUSIBLE.get(var)
-    if rng is not None:
-        v = a[_valid(a, nodata)]
-        if v.size and (v.min() < rng[0] or v.max() > rng[1]):
-            raise ForcingRangeError(f"{var} {name}: values {v.min():.1f}..{v.max():.1f} "
-                                    f"outside plausible {rng[0]}..{rng[1]}")
-    return a, False
+    return RULES[var](a, nodata, name, True)
 
 
 # --------------------------------------------------------------------------- #
@@ -233,10 +253,7 @@ def check_for_store(var: str, a: np.ndarray, nodata: float, name: str) -> None:
     """The per-variable rules a stored grid must pass — the same rules `read`
     applies, except nothing is converted: a temperature grid must already be
     degC (a Kelvin grid raises TempUnitsError), never stored to be undone later."""
-    if var == "temp":
-        check_temp_units(a, nodata, name, convert=False)
-    else:
-        validate(var, a, nodata, name)
+    RULES[var](a, nodata, name, False)
 
 
 def store_bytes(var: str, a: np.ndarray, xll: float, yll: float, cell: float,
@@ -279,6 +296,19 @@ class ArchiveGap(LookupError):
         self.var, self.year, self.month = var, year, month
 
 
+def _grid(var: str, data: bytes, member: str, bbox) -> Grid | None:
+    """Decode, validate (full grid, before clipping) and clip one member."""
+    a, xll, yll, cell, nod = _read_pqf(data)
+    a, was_k = validate(var, a, nod, member)
+    if bbox is None:
+        return Grid(a, xll, yll, cell, nod, member, was_k)
+    clip = _clip(a, xll, yll, cell, nod, bbox)
+    if clip is None:                            # box outside the archive grid
+        return None
+    sub, nxll, nyll = clip
+    return Grid(sub, nxll, nyll, cell, nod, member, was_k)
+
+
 def _hub_fetch(repo: str, cache_dir: str | None, token: str | None = None):
     def fetch(path: str) -> str:
         from huggingface_hub import hf_hub_download
@@ -292,9 +322,11 @@ def _hub_fetch(repo: str, cache_dir: str | None, token: str | None = None):
 
 
 class ForcingArchive:
-    def __init__(self, repo: str = HF_REPO, cache_dir: str | None = None, fetch=None,
+    def __init__(self, repo: str | None = None, cache_dir: str | None = None, fetch=None,
                  token: str | None = None):
-        self._fetch = fetch or _hub_fetch(repo, cache_dir, token)
+        """`repo` defaults to the data repo (hubdata.data_repo(): env
+        CREST_DATA_REPO)."""
+        self._fetch = fetch or _hub_fetch(repo or hubdata.data_repo(), cache_dir, token)
         self._open: dict[tuple[str, int, int], tuple[tarfile.TarFile, set[str]]] = {}
 
     def _tar(self, var: str, t: datetime) -> tuple[tarfile.TarFile, set[str]]:
@@ -304,12 +336,12 @@ class ForcingArchive:
             cfg = VARS[var]                      # of reads must not pile up fds)
             try:                                 # prefer the small month-tar
                 src = self._fetch(t.strftime(cfg.month_fmt))
-            except Exception:                    # fallback to year-tar (pre-reshard)
+            except FileNotFoundError:            # no month tar: the year tar (pre-reshard)
                 try:
                     src = self._fetch(t.strftime(cfg.year_fmt))
                 except FileNotFoundError:        # genuine data gap (permanent 404);
                     raise ArchiveGap(var, t.year, t.month) from None
-                # (transient network errors raise other types and propagate)
+            # transient network errors raise other types and propagate
             tf = (tarfile.open(fileobj=io.BytesIO(src))
                   if isinstance(src, (bytes, bytearray)) else tarfile.open(src))
             self._open[key] = (tf, set(tf.getnames()))
@@ -325,15 +357,25 @@ class ForcingArchive:
             member = t.strftime(cfg.out_fmt)    # the generic name
         if member not in names:
             return None
-        a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())
-        a, was_k = validate(var, a, nod, member)     # full grid, before clipping
-        if bbox is None:
-            return Grid(a, xll, yll, cell, nod, member, was_k)
-        clip = _clip(a, xll, yll, cell, nod, bbox)
-        if clip is None:                        # box outside the archive grid
+        return _grid(var, tf.extractfile(member).read(), member, bbox)
+
+    def read_recent(self, var: str, t: datetime, bbox=None) -> Grid | None:
+        """Like `read`, from the variable's near-real-time store of loose
+        hourly members (RECENT_STORES) instead of the month tar. None when the
+        variable has no such store or the hour is not (or no longer) there;
+        transient errors propagate."""
+        recent = RECENT_STORES.get(var)
+        if recent is None:
             return None
-        sub, nxll, nyll = clip
-        return Grid(sub, nxll, nyll, cell, nod, member, was_k)
+        path = t.strftime(recent[0])
+        try:
+            src = self._fetch(path)
+        except FileNotFoundError:
+            return None
+        if not isinstance(src, (bytes, bytearray)):
+            with open(src, "rb") as fh:
+                src = fh.read()
+        return _grid(var, src, path.rsplit("/", 1)[-1], bbox)
 
     def close(self):
         for tf, _ in self._open.values():

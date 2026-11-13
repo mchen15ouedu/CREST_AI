@@ -75,7 +75,7 @@ def test_atomic_path_failure_keeps_old_file(tmp_path):
 # --- forcing + param clips: threads of one process share the store ------------
 def test_write_pqf_threads_same_hour(tmp_path, monkeypatch, serial_replace):
     import pyarrow.parquet as pq
-    from hf_data import forcing
+    from hf_data import forcing_archive
     path = str(tmp_path / "p.pqf")
     gate, temps, write = threading.Barrier(8), [], pq.write_table
 
@@ -86,10 +86,10 @@ def test_write_pqf_threads_same_hour(tmp_path, monkeypatch, serial_replace):
     monkeypatch.setattr(pq, "write_table", overlapping_write)
 
     def w(i):
-        forcing._write_pqf(path, np.full((4, 5), float(i), "float32"),
-                           -90.0, 40.0, 0.01, -9999.0)
+        forcing_archive.store_file(path, "mrms", np.full((4, 5), float(i), "float32"),
+                                   -90.0, 40.0, 0.01, -9999.0)
     assert _threads(w) == [] and len(set(temps)) == 8 and _tmp_left(tmp_path) == []
-    a, xll, yll, cell, nod = forcing._read_pqf(open(path, "rb").read())
+    a, xll, yll, cell, nod = forcing_archive.read_pqf(open(path, "rb").read())
     assert a.shape == (4, 5) and len(set(a.ravel().tolist())) == 1   # one whole write
 
 
@@ -298,9 +298,10 @@ def test_conus_states_threads(tmp_path, monkeypatch):
 
 
 def test_persist_restore_tif_threads(tmp_path, monkeypatch):
-    from hf_data import forcing, persist
+    from hf_data import forcing_archive, persist
     pqf = str(tmp_path / "x.pqf")
-    forcing._write_pqf(pqf, np.full((4, 5), 2.0, "float32"), -90.0, 40.0, 0.01, -9999.0)
+    forcing_archive.store_file(pqf, "mrms", np.full((4, 5), 2.0, "float32"),
+                               -90.0, 40.0, 0.01, -9999.0)
     out = tmp_path / "tif"
     srcs = _overlap(monkeypatch)
     assert _threads(lambda i: persist._pqf_to_tif(pqf, str(out / "x.tif")), N) == []
@@ -343,6 +344,45 @@ def test_population_band_download_threads(tmp_path, monkeypatch):
         N) == []
     _one_temp_per_call(srcs, rv)
     assert (rv / "band_1km.tif").read_bytes() == body
+
+
+# --- results records + the one place that moves files into place --------------
+def test_save_record_failure_keeps_the_old_record(tmp_path, monkeypatch):
+    from hf_data import statecache
+    monkeypatch.setattr(statecache, "CACHE_DIR", str(tmp_path))
+    row = {"time": "2026-10-20 16:00", "sim_q": 1.0}
+    statecache.save_record("01234567", "m", [row], [])
+
+    def half(obj, fh, **kw):
+        fh.write('{"rows": [')
+        raise OSError("disk full")
+    with monkeypatch.context() as m:
+        m.setattr(statecache.json, "dump", half)
+        with pytest.raises(OSError):
+            statecache.save_record("01234567", "m", [dict(row, sim_q=9.0)], [])
+    assert statecache.load_record("01234567", "m")["rows"] == [row]
+    assert _tmp_left(tmp_path / "results") == []
+
+
+def test_only_atomicfile_moves_files_into_place():
+    """Ticket 11: shared-store writers (and the offline prep scripts) go
+    through hf_data.atomicfile; nobody else calls os.replace / os.rename or
+    builds per-process temp names."""
+    import ast
+    import pathlib
+    root = pathlib.Path(ROOT)
+    offenders = []
+    for d in ("hf_data", "scripts", "fleet"):
+        for p in sorted((root / d).rglob("*.py")):
+            rel = p.relative_to(root).as_posix()
+            if rel == "hf_data/atomicfile.py":
+                continue
+            for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"))):
+                if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                        and node.value.id == "os"
+                        and node.attr in ("replace", "rename", "getpid")):
+                    offenders.append(f"{rel}:{node.lineno} os.{node.attr}")
+    assert offenders == []
 
 
 # --- ungauged runner: workers are spawned, never forked -----------------------

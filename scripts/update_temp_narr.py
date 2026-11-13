@@ -11,7 +11,7 @@ because the GDEX form is 0.5–1 GB multi-variable GRIB tars per ~8 days, i.e.
 ~2.6 GB of download per month to extract a single band.
 
 Each 3-hourly Lambert field is bilinearly resampled onto the canonical
-NLDAS-heritage 0.125° temp grid (forcing.TEMP_GRID — so every temp PQF in the
+NLDAS-heritage 0.125° temp grid (forcing_archive.TEMP_GRID — so every temp PQF in the
 store shares one geometry, which the [TEMPForcing] DEM= extrapolation grid is
 built against), converted K→°C, and linearly interpolated to HOURLY members
 (EF5 zero-fills missing hourly files, which would freeze SNOW17 at 0 °C).
@@ -43,6 +43,7 @@ import truststore
 truststore.inject_into_ssl()
 import urllib.request
 
+from hf_data.atomicfile import atomic_path  # noqa: E402
 from hf_data.forcing_archive import TEMP_GRID, VARS, kelvin_to_degc, store_bytes  # noqa: E402
 
 HF_REPO = "vincewin/CREST_data"
@@ -97,21 +98,21 @@ def _download_year(year: int) -> str | None:
     # PSL rate-limits bursts (HTTP 429 on 2026-10-07, 21 min after it
     # republished the year file) — back off and retry transient errors
     # instead of failing the whole self-heal until the next cooldown
-    for attempt, wait in enumerate((30, 120, 300, None)):
-        try:
-            urllib.request.urlretrieve(url, dest + ".part")
-            break
-        except Exception as e:
-            code = getattr(e, "code", None)
-            transient = code is None or code == 429 or code >= 500
-            if wait is None or not transient:
-                raise
-            ra = getattr(e, "headers", None) and e.headers.get("Retry-After")
-            if ra and str(ra).isdigit():
-                wait = max(wait, min(int(ra), 900))
-            print(f"  [narr] download failed ({e}); retry {attempt + 1}/3 in {wait} s")
-            time.sleep(wait)
-    os.replace(dest + ".part", dest)
+    with atomic_path(dest) as tmp:
+        for attempt, wait in enumerate((30, 120, 300, None)):
+            try:
+                urllib.request.urlretrieve(url, tmp)
+                break
+            except Exception as e:
+                code = getattr(e, "code", None)
+                transient = code is None or code == 429 or code >= 500
+                if wait is None or not transient:
+                    raise
+                ra = getattr(e, "headers", None) and e.headers.get("Retry-After")
+                if ra and str(ra).isdigit():
+                    wait = max(wait, min(int(ra), 900))
+                print(f"  [narr] download failed ({e}); retry {attempt + 1}/3 in {wait} s")
+                time.sleep(wait)
     json.dump(remote, open(meta, "w"))
     return dest
 

@@ -36,3 +36,20 @@ def test_degc_hours_above_threshold_turn_snow_off():
     res = _detect({H00: pqf_bytes(WARM_C), H06: pqf_bytes(WARM_C + 1.0)})
     assert res["snow"] is False
     assert res["min_temp_c"] == 5.0
+
+
+def test_snow_parameter_grids_come_from_the_configured_data_repo(tmp_path, monkeypatch):
+    import rasterio
+    from hf_data import crashlog, snow
+    opened = []
+
+    def no_network(path, *a, **kw):
+        opened.append(path)
+        raise OSError("offline")
+    monkeypatch.setattr(rasterio, "open", no_network)
+    monkeypatch.setattr(crashlog, "capture", lambda *a, **kw: None)
+    monkeypatch.setenv("CREST_DATA_REPO", "me/data")
+    assert snow.clip_snow_grids(BBOX, str(tmp_path), unsafe_ssl=False) == {}
+    assert opened and all(p.startswith(
+        "/vsicurl/https://huggingface.co/datasets/me/data/resolve/main/param/snow17/v1/")
+        for p in opened)

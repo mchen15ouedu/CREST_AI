@@ -85,7 +85,7 @@ def _tif_pqf_bytes(tif_path: str) -> bytes | None:
     schema = pa.schema([pa.field("v", pa.float32())]).with_metadata(meta)
     buf = io.BytesIO()
     # BYTE_STREAM_SPLIT: float-specific encoding — ~2-3x better than plain
-    # zstd on smooth state fields, still bit-exact and readable by _read_pqf
+    # zstd on smooth state fields, still bit-exact and readable by forcing_archive.read_pqf
     pq.write_table(pa.table({"v": a.reshape(-1)}, schema=schema),
                    buf, compression="zstd", use_dictionary=False,
                    column_encoding={"v": "BYTE_STREAM_SPLIT"})
@@ -98,9 +98,9 @@ def _pqf_to_tif(pqf_path: str, tif_path: str):
     import rasterio
     from rasterio.transform import from_origin
     from hf_data.atomicfile import atomic_path
-    from hf_data.forcing import _read_pqf
+    from hf_data.forcing_archive import read_pqf
     with open(pqf_path, "rb") as fh:
-        a, xll, yll, cell, nodata = _read_pqf(fh.read())
+        a, xll, yll, cell, nodata = read_pqf(fh.read())
     nr, nc = a.shape
     os.makedirs(os.path.dirname(tif_path), exist_ok=True)
     with atomic_path(tif_path) as tmp, rasterio.open(

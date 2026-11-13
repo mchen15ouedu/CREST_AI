@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
-from hf_data import llm, nowcaststore
+from hf_data import llm, nowcastfeed, nowcaststore
 
 TOP_GAUGES = int(os.environ.get("BRIEF_TOP_GAUGES", "14"))
 TOP_STATES = int(os.environ.get("BRIEF_TOP_STATES", "8"))
@@ -91,7 +91,7 @@ def snapshot() -> dict:
         t0_dt = None
 
     idx = {str(g): i for i, g in enumerate(cols["gid"])}
-    qn = nowcaststore._qcols(cols)[:nowcaststore.RISK_H]
+    qn = nowcastfeed.qcols(cols, "q")[:nowcaststore.RISK_H]
     qmat = np.stack([cols[n] for n in qn], 1) if qn else None
     has_obs = "obs_last_q" in cols
 

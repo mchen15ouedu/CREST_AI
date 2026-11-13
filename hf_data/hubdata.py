@@ -19,6 +19,7 @@ import os
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -141,6 +142,15 @@ def hf_api():
 # --------------------------------------------------------------------------- #
 # adapters
 # --------------------------------------------------------------------------- #
+@contextmanager
+def _no_answer():
+    """Adapter calls whose every failure means "the Hub gave no answer"."""
+    try:
+        yield
+    except Exception as e:
+        raise Unreachable(f"{type(e).__name__}: {e}") from e
+
+
 class HubAdapter:
     """The real Hub through huggingface_hub. The token is read per call, so a
     Space that receives HF_TOKEN late still writes."""
@@ -165,31 +175,23 @@ class HubAdapter:
         return HfApi(token=token())
 
     def list_files(self, repo: str) -> list[str]:
-        try:
+        with _no_answer():
             return list(self._api().list_repo_files(repo, repo_type="dataset"))
-        except Exception as e:
-            raise Unreachable(f"{type(e).__name__}: {e}") from e
 
     def exists(self, repo: str, path: str) -> bool:
-        try:
+        with _no_answer():
             return bool(self._api().get_paths_info(repo, [path], repo_type="dataset"))
-        except Exception as e:
-            raise Unreachable(f"{type(e).__name__}: {e}") from e
 
     def file_info(self, repo: str) -> dict:
-        try:
+        with _no_answer():
             info = self._api().dataset_info(repo, files_metadata=True)
-        except Exception as e:
-            raise Unreachable(f"{type(e).__name__}: {e}") from e
         return {s.rfilename: (s.blob_id, s.size) for s in info.siblings}
 
     def snapshot(self, repo: str, local_dir: str, patterns: list[str]) -> None:
         from huggingface_hub import snapshot_download
-        try:
+        with _no_answer():
             snapshot_download(repo_id=repo, repo_type="dataset", token=token(),
                               local_dir=local_dir, allow_patterns=patterns)
-        except Exception as e:
-            raise Unreachable(f"{type(e).__name__}: {e}") from e
 
     def create(self, repo: str, private: bool) -> None:
         self._api().create_repo(repo, repo_type="dataset", private=private,
@@ -220,37 +222,55 @@ class HubAdapter:
 
 
 class MemoryHub:
-    """In-memory dataset repo(s) for tests: {path: bytes} per repo id (one
-    shared file map unless a repo is given its own). Set `outage = True` to
-    make every call unreachable."""
+    """In-memory dataset repos for tests: one {path: bytes} map per repo id.
+    The seed `files` belong to the first repo the hub is asked about (or to
+    `repo`, if given), and `.files` is that repo's map; every other repo starts
+    empty (`repo_files(repo)`). Set `outage = True` to make every call
+    unreachable."""
 
-    def __init__(self, files: dict | None = None):
-        self.files: dict[str, bytes] = {k: _as_bytes(v) for k, v in (files or {}).items()}
+    def __init__(self, files: dict | None = None, repo: str | None = None):
+        self._home = repo
+        self._seed: dict[str, bytes] = {k: _as_bytes(v) for k, v in (files or {}).items()}
+        self._repos: dict[str, dict[str, bytes]] = {}
+        if repo is not None:
+            self._repos[repo] = self._seed
         self.outage = False
         self.writable = True
-        self.commits: list[dict] = []          # {"message", "ops"} per commit
+        self.commits: list[dict] = []          # {"message", "ops", "repo"} per commit
         self._tmp = None
+
+    @property
+    def files(self) -> dict[str, bytes]:
+        """The first repo's file map (the seed, before any repo was used)."""
+        return self._seed if self._home is None else self._repos[self._home]
+
+    def repo_files(self, repo: str) -> dict[str, bytes]:
+        """The file map of `repo` (live: tests may edit it)."""
+        if self._home is None:
+            self._home, self._repos[repo] = repo, self._seed
+        return self._repos.setdefault(repo, {})
 
     def can_write(self) -> bool:
         return self.writable
 
     def list_files(self, repo: str) -> list[str]:
         self._check()
-        return sorted(self.files)
+        return sorted(self.repo_files(repo))
 
     def exists(self, repo: str, path: str) -> bool:
         self._check()
-        return path in self.files
+        return path in self.repo_files(repo)
 
     def file_info(self, repo: str) -> dict:
         import hashlib
         self._check()
-        return {k: (hashlib.sha1(v).hexdigest(), len(v)) for k, v in self.files.items()}
+        return {k: (hashlib.sha1(v).hexdigest(), len(v))
+                for k, v in self.repo_files(repo).items()}
 
     def snapshot(self, repo: str, local_dir: str, patterns: list[str]) -> None:
         from fnmatch import fnmatch
         self._check()
-        for k, v in self.files.items():
+        for k, v in self.repo_files(repo).items():
             if any(fnmatch(k, p) for p in patterns):
                 p = os.path.join(local_dir, *k.split("/"))
                 os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -263,13 +283,15 @@ class MemoryHub:
     def open(self, repo: str, path: str):
         import io
         self._check()
-        if path not in self.files:
+        files = self.repo_files(repo)
+        if path not in files:
             raise NotFound(path)
-        return io.BytesIO(self.files[path])
+        return io.BytesIO(files[path])
 
     def commit(self, repo: str, ops: list, message: str) -> None:
         self._check()
-        files = dict(self.files)               # all or nothing, like the Hub
+        live = self.repo_files(repo)
+        files = dict(live)                     # all or nothing, like the Hub
         for op in ops:
             if isinstance(op, Put):
                 body = op.payload()
@@ -281,8 +303,9 @@ class MemoryHub:
                 files = {k: v for k, v in files.items() if not k.startswith(op.path)}
             else:
                 files.pop(op.path, None)
-        self.files = files
-        self.commits.append({"message": message, "ops": list(ops)})
+        live.clear()                           # keep the map's identity
+        live.update(files)
+        self.commits.append({"message": message, "ops": list(ops), "repo": repo})
 
     def _check(self):
         if self.outage:
@@ -290,13 +313,15 @@ class MemoryHub:
 
     def download(self, repo: str, path: str, *, fresh: bool) -> str:
         self._check()
-        if path not in self.files:
+        files = self.repo_files(repo)
+        if path not in files:
             raise NotFound(path)
         if self._tmp is None:
             self._tmp = tempfile.mkdtemp(prefix="memhub_")
-        p = os.path.join(self._tmp, path.replace("/", "__"))
+        p = os.path.join(self._tmp, repo.replace("/", "__"), path.replace("/", "__"))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as fp:
-            fp.write(self.files[path])
+            fp.write(files[path])
         return p
 
 
@@ -315,10 +340,11 @@ COMMITS_PER_HOUR = int(os.environ.get("HF_COMMITS_PER_HOUR", "256"))
 
 
 class CommitBudget:
-    """Sliding-window count of commits that landed; `take()` refuses once
-    `limit` commits fell inside the last `window_s`. Process-local: it keeps
-    one process from spending the whole account limit, it cannot see other
-    processes on the same token."""
+    """Sliding-window count of commits; `take()` reserves one (check and spend
+    in one locked step) and refuses once `limit` fell inside the last
+    `window_s`; `give_back()` returns a reservation whose commit did not land.
+    Process-local: it keeps one process from spending the whole account
+    limit, it cannot see other processes on the same token."""
 
     def __init__(self, limit: int = COMMITS_PER_HOUR, window_s: float = 3600.0,
                  clock=time.time):
@@ -334,9 +360,23 @@ class CommitBudget:
             self._trim(self.clock())
             return max(0, self.limit - len(self._stamps))
 
-    def spend(self) -> None:
+    def take(self) -> float | None:
+        """Reserve one commit: its stamp, or None when the budget is spent."""
         with self._lock:
-            self._stamps.append(self.clock())
+            now = self.clock()
+            self._trim(now)
+            if len(self._stamps) >= self.limit:
+                return None
+            self._stamps.append(now)
+            return now
+
+    def give_back(self, stamp: float) -> None:
+        """Undo a `take()` whose commit failed."""
+        with self._lock:
+            try:
+                self._stamps.remove(stamp)
+            except ValueError:                 # already aged out
+                pass
 
 
 _ACCOUNT_BUDGET = CommitBudget()          # every real-Hub Dataset in this process
@@ -372,7 +412,7 @@ class Dataset:
         except NotFound:
             return Read(MISSING)
         except Exception as e:
-            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+            return _unreachable(e)
 
     def read_json(self, path: str, kind: type | None = None,
                   fresh: bool = False) -> Read:
@@ -406,7 +446,7 @@ class Dataset:
         try:
             return Read(DATA, bool(self.adapter.exists(self.repo, path)))
         except Exception as e:
-            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+            return _unreachable(e)
 
     def file_info(self, prefix: str = "") -> Read:
         """{path: (blob id, size)} of the files under `prefix` — the blob id
@@ -414,7 +454,7 @@ class Dataset:
         try:
             info = self.adapter.file_info(self.repo)
         except Exception as e:
-            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+            return _unreachable(e)
         return Read(DATA, {k: v for k, v in info.items() if k.startswith(prefix)})
 
     def snapshot(self, local_dir: str, patterns: list[str]) -> Read:
@@ -423,7 +463,7 @@ class Dataset:
         try:
             self.adapter.snapshot(self.repo, local_dir, list(patterns))
         except Exception as e:
-            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+            return _unreachable(e)
         return Read(DATA, local_dir)
 
     def create(self, private: bool = True) -> Committed:
@@ -445,34 +485,40 @@ class Dataset:
         except NotFound:
             return Read(MISSING)
         except Exception as e:
-            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+            return _unreachable(e)
 
     def list_files(self, prefix: str = "") -> Read:
         """Sorted repo paths starting with `prefix` (DATA or UNREACHABLE)."""
         try:
             files = self.adapter.list_files(self.repo)
         except Exception as e:
-            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+            return _unreachable(e)
         return Read(DATA, sorted(f for f in files if f.startswith(prefix)))
 
     def commit(self, ops: list, message: str) -> Committed:
         """ONE commit of `ops` (Put / Delete). Never raises."""
         if not self.can_write:
             return Committed(False, "no HF token: read-only")
-        if self.budget.remaining() <= 0:
+        stamp = self.budget.take()
+        if stamp is None:
             return Committed(False, f"commit budget spent ({self.budget.limit}"
                                     f" per {self.budget.window_s:g} s)")
         try:
             self.adapter.commit(self.repo, list(ops), message)
         except Exception as e:
+            self.budget.give_back(stamp)       # only commits that land count
             return Committed(False, f"{type(e).__name__}: {e}")
-        self.budget.spend()
         return Committed(True)
 
     def batch(self, label: str, min_interval_s: float = 600.0,
-              max_ops: int = 500, clock=time.time) -> "CommitBatch":
+              max_ops: int | None = 500, clock=time.time,
+              max_pending: int | None = None) -> "CommitBatch":
         """A queue of writes committed together (see CommitBatch)."""
-        return CommitBatch(self, label, min_interval_s, max_ops, clock)
+        return CommitBatch(self, label, min_interval_s, max_ops, clock, max_pending)
+
+
+def _unreachable(e: Exception) -> Read:
+    return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
 
 
 def _json_loader(kind: type | None):
@@ -524,44 +570,87 @@ class Cached:
 
 
 class CommitBatch:
-    """Many small writes, few commits: ops queue up (a later Put/Delete of
-    the same path replaces the earlier one) and `flush()` commits them all at
-    once when `min_interval_s` passed since the batch started or last landed,
-    or `max_ops` are queued, or `force`. A failed commit leaves the queue for
-    the next flush."""
+    """Many small writes, few commits. Entries queue up under a key — one op
+    keyed by its path, or several ops (one outlet's files, say) under a given
+    key; a later entry of the same key replaces the earlier one whole — and
+    `flush()` commits them all at once when `min_interval_s` passed since the
+    batch started or last landed, or `max_ops` entries are queued, or `force`.
+    A failed commit leaves the queue for the next flush, cut to the oldest
+    `max_pending` entries when that is set (RAM stays bounded while the Hub
+    is down); `error` says why it failed."""
 
     def __init__(self, ds: Dataset, label: str, min_interval_s: float,
-                 max_ops: int, clock):
+                 max_ops: int | None, clock, max_pending: int | None = None):
         self.ds, self.label = ds, label
         self.min_interval_s, self.max_ops, self.clock = min_interval_s, max_ops, clock
-        self._ops: dict[str, Any] = {}
+        self.max_pending = max_pending
+        self.error: str | None = None
+        self._entries: dict[str, list] = {}
         self._last = clock()
         self._lock = threading.Lock()
 
     @property
     def pending(self) -> int:
-        return len(self._ops)
+        return len(self._entries)
 
-    def add(self, op) -> None:
+    @property
+    def nbytes(self) -> int:
+        """Bytes the queued Puts would upload."""
+        n = 0
+        for ops in list(self._entries.values()):
+            for op in ops:
+                if isinstance(op, Put):
+                    body = op.payload()
+                    n += len(body) if isinstance(body, bytes) else os.path.getsize(body)
+        return n
+
+    def keys(self) -> list[str]:
+        """Queued entry keys, oldest first."""
         with self._lock:
-            self._ops.pop(op.path, None)          # re-insert: keeps add order
-            self._ops[op.path] = op
+            return list(self._entries)
+
+    def add(self, op, key: str | None = None) -> None:
+        """Queue one op (keyed by its path) or a list of ops under `key`."""
+        ops = list(op) if isinstance(op, (list, tuple)) else [op]
+        if key is None:
+            if len(ops) != 1:
+                raise ValueError("several ops need a key")
+            key = ops[0].path
+        with self._lock:
+            self._entries.pop(key, None)          # re-insert: keeps add order
+            self._entries[key] = ops
 
     def flush(self, force: bool = False) -> Committed | None:
         """None when nothing was due; otherwise the commit's outcome."""
+        return self._flush(force)[0]
+
+    def flush_keys(self, force: bool = False) -> list[str]:
+        """Like flush; the keys that landed ([] when nothing did)."""
+        res, keys = self._flush(force)
+        return keys if res else []
+
+    def _flush(self, force: bool):
         with self._lock:
-            if not self._ops:
-                return None
-            due = (force or len(self._ops) >= self.max_ops
+            if not self._entries:
+                return None, []
+            due = (force
+                   or (self.max_ops is not None and len(self._entries) >= self.max_ops)
                    or self.clock() - self._last >= self.min_interval_s)
             if not due:
-                return None
-            ops = list(self._ops.values())
-            res = self.ds.commit(ops, f"{self.label} x{len(ops)}")
+                return None, []
+            keys = list(self._entries)
+            ops = [op for k in keys for op in self._entries[k]]
+            res = self.ds.commit(ops, f"{self.label} x{len(keys)}")
             if res:
-                self._ops.clear()
+                self.error = None
+                self._entries.clear()
                 self._last = self.clock()
-            return res
+            else:
+                self.error = res.error
+                if self.max_pending is not None:
+                    for k in keys[self.max_pending:]:
+                        del self._entries[k]
+            return res, keys
 
 
 def data() -> Dataset:

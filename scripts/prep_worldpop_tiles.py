@@ -39,6 +39,7 @@ import truststore
 truststore.inject_into_ssl()
 
 from forcing_update_common import hf_token   # noqa: E402
+from hf_data.atomicfile import atomic_path   # noqa: E402
 
 RELEASE = "R2025A"
 SRC_DIR = os.environ.get("WORLDPOP_SRC", r"E:\hydroZone\riskdata_src\worldpop")
@@ -84,11 +85,9 @@ def download_bands(year: int, workers: int = 5) -> list[str]:
         r = requests.get(url, stream=True, timeout=3600,
                          headers={"User-Agent": "CREST-AI/1.0"})
         r.raise_for_status()
-        tmp = local + f".part{os.getpid()}"
-        with open(tmp, "wb") as fh:
+        with atomic_path(local) as tmp, open(tmp, "wb") as fh:
             for chunk in r.iter_content(1 << 22):
                 fh.write(chunk)
-        os.replace(tmp, local)
         print(f"  {os.path.basename(local)}: "
               f"{os.path.getsize(local) / 1e6:.0f} MB in "
               f"{time.time() - t0:.0f} s", flush=True)

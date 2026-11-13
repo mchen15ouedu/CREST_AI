@@ -695,7 +695,7 @@ function handleSimEvent(simId, ev) {
     gaugeState[ev.gauge_id] = "done";
     renderTabs();
     // outcome: ok | cached | no_basin | no_state | cut_failed | cancelled | failed
-    const ok = ev.outcome === "ok" || ev.outcome === "cached";
+    const ok = ev.ok === true;                        // GaugeRunResult.ok, from the server
     if (ev.outcome === "cancelled") {                 // user stop / superseded — not an error
       if (aiInfo) setProgress(ev.gauge_id, 100, "stopped ⏹");
       allowResim();
