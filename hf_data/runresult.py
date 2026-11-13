@@ -44,20 +44,3 @@ class GaugeRunResult:
     @property
     def state_key(self) -> str | None:
         return f"{self.gauge_id}_{self.state_model}" if self.state_model else None
-
-    # ---- transition shim (ticket 08 removes it) ---------------------------
-    # fleet_run / eventsim / routednow still read the old done-dict keys
-    _LEGACY_RC = {Outcome.OK: 0, Outcome.CACHED: 0, Outcome.FAILED: -1,
-                  Outcome.NO_BASIN: -2, Outcome.NO_STATE: -3,
-                  Outcome.CUT_FAILED: -4, Outcome.CANCELLED: -9}
-
-    def get(self, key, default=None):
-        """Deprecated: the old done-dict view, for callers not yet migrated."""
-        o = self.outcome
-        legacy = {"returncode": self._LEGACY_RC[o], "reason": self.reason,
-                  "error": self.reason if o is Outcome.FAILED else None,
-                  "no_basin": o is Outcome.NO_BASIN, "no_state": o is Outcome.NO_STATE,
-                  "cut_failed": o is Outcome.CUT_FAILED,
-                  "cancelled": o is Outcome.CANCELLED, "cached": o is Outcome.CACHED}
-        v = legacy.get(key)
-        return default if v is None or v is False else v

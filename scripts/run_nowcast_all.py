@@ -27,12 +27,10 @@ nowcast_space/model.py (KEEP IN SYNC — same checkpoint format).
 from __future__ import annotations
 
 import argparse
-import io
 import math
 import os
 import random
 import sys
-import tarfile
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -153,14 +151,30 @@ def _statics_z(token, ck, gid, fname="gauges/gauge_statics.parquet",
 
 
 # ---- precip: summed-area-table box means -------------------------------------
-def _read_pqf_bytes(data: bytes) -> np.ndarray | None:
-    pf = pq.ParquetFile(io.BytesIO(data))
-    meta = {k.decode(): v.decode() for k, v in pf.schema_arrow.metadata.items()
-            if not k.startswith(b"ARROW")}
-    nr, nc = int(meta["nrows"]), int(meta["ncols"])
-    if (nr, nc) != MRMS_GRID[3:5]:
+def _on_mrms_grid(a) -> np.ndarray | None:
+    """The grid when it is on the writer's MRMS lattice, else None."""
+    if a is None or a.shape != tuple(MRMS_GRID[3:5]):
         return None
-    return pf.read().column("v").to_numpy().reshape(nr, nc)
+    return a
+
+
+def _hour_grid(t: datetime, recent: dict, arc, load_recent) -> tuple[np.ndarray | None, bool]:
+    """(full MRMS grid for hour t or None, came from the Pass2 tar).
+    The mrms_recent Pass1 grid when there is one (what operations ran on),
+    else the Pass2 month tar through the forcing archive."""
+    from hf_data.forcing_archive import read_pqf
+    if t in recent:
+        try:
+            data = load_recent(recent[t])
+        except Exception:
+            data = None
+        if data is not None:
+            return _on_mrms_grid(read_pqf(data)[0]), False
+    try:
+        g = arc.read("mrms", t)
+    except Exception:                      # gap or network: the hour is missing
+        return None, False
+    return _on_mrms_grid(g.values if g is not None else None), g is not None
 
 
 def _basin_box(lon, lat, area_km2, pad=1.2):
@@ -208,21 +222,20 @@ def _recent_hours(files) -> dict[datetime, str]:
     return out
 
 
-def _pass2_member(t: datetime, token) -> bytes | None:
-    """One hour out of the Pass2 month tar (HF-cached; weekly-updated)."""
+def _recent_loader(token):
+    """repo path of an mrms_recent file -> its bytes."""
     from huggingface_hub import hf_hub_download
-    try:
-        local = hf_hub_download(HF_REPO, f"mrms/{t.year}/mrms_{t.year}_{t.month:02d}.tar",
-                                repo_type="dataset", token=token)
-        with tarfile.open(local) as tf:
-            for name in (f"mrms_corr_{t:%Y%m%d%H}.pqf", f"mrms_{t:%Y%m%d%H}.pqf"):
-                try:
-                    return tf.extractfile(name).read()
-                except KeyError:
-                    continue
-    except Exception:
-        pass
-    return None
+
+    def load(path: str) -> bytes:
+        with open(hf_hub_download(HF_REPO, path, repo_type="dataset", token=token), "rb") as fh:
+            return fh.read()
+    return load
+
+
+def _archive(token):
+    """Forcing archive over the Pass2 month tars (HF-cached; weekly-updated)."""
+    from hf_data.forcing_archive import ForcingArchive
+    return ForcingArchive(HF_REPO, token=token)
 
 
 # ---- USGS obs (batched NWIS) -------------------------------------------------
@@ -366,28 +379,18 @@ def _virtual_v3(token, t0, hours, recent, files, model3, ck3, model3_12, ck3_12,
         cached = {}
 
     pmat_v = np.full((len(vid), L), np.nan, "float32")
-    for i, t in enumerate(hours):
-        key = f"h{t:%Y%m%d%H}"
-        if key in cached:
-            pmat_v[:, i] = cached[key]
-            continue
-        data = None
-        if t in recent:
-            try:
-                p = hf_hub_download(HF_REPO, recent[t], repo_type="dataset",
-                                    token=token)
-                data = open(p, "rb").read()
-            except Exception:
-                data = None
-        if data is None:
-            data = _pass2_member(t, token)
-        if data is None:
-            continue
-        a = _read_pqf_bytes(data)
-        if a is None:
-            continue
-        pmat_v[:, i] = _box_means(a, boxes)
-        cached[key] = pmat_v[:, i].copy()
+    load_recent = _recent_loader(token)
+    with _archive(token) as arc:
+        for i, t in enumerate(hours):
+            key = f"h{t:%Y%m%d%H}"
+            if key in cached:
+                pmat_v[:, i] = cached[key]
+                continue
+            a, _ = _hour_grid(t, recent, arc, load_recent)
+            if a is None:
+                continue
+            pmat_v[:, i] = _box_means(a, boxes)
+            cached[key] = pmat_v[:, i].copy()
 
     # features: precip + statics; obs channels pinned to the missing state
     sz = _statics_z(token, ck3, vid, "gauges/virtual_statics.parquet",
@@ -569,32 +572,21 @@ def main() -> int:
 
     pmat = np.full((len(gid), L), np.nan, "float32")
     computed, from_pass2, missing = 0, 0, []
-    for i, t in enumerate(hours):
-        key = f"h{t:%Y%m%d%H}"
-        if key in cached:
-            pmat[:, i] = cached[key]
-            continue
-        data = None
-        if t in recent:
-            try:
-                p = hf_hub_download(HF_REPO, recent[t], repo_type="dataset", token=token)
-                data = open(p, "rb").read()
-            except Exception:
-                data = None
-        if data is None:
-            data = _pass2_member(t, token)
-            if data is not None:
-                from_pass2 += 1
-        if data is None:
-            missing.append(t)
-            continue
-        a = _read_pqf_bytes(data)
-        if a is None:
-            missing.append(t)
-            continue
-        pmat[:, i] = _box_means(a, boxes)
-        cached[f"h{t:%Y%m%d%H}"] = pmat[:, i].copy()
-        computed += 1
+    load_recent = _recent_loader(token)
+    with _archive(token) as arc:
+        for i, t in enumerate(hours):
+            key = f"h{t:%Y%m%d%H}"
+            if key in cached:
+                pmat[:, i] = cached[key]
+                continue
+            a, pass2 = _hour_grid(t, recent, arc, load_recent)
+            from_pass2 += pass2
+            if a is None:
+                missing.append(t)
+                continue
+            pmat[:, i] = _box_means(a, boxes)
+            cached[f"h{t:%Y%m%d%H}"] = pmat[:, i].copy()
+            computed += 1
 
     # -- obs -------------------------------------------------------------------
     chunks = [list(gid[i:i + 100]) for i in range(0, len(gid), 100)]

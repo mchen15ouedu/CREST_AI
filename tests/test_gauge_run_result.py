@@ -7,38 +7,12 @@ from __future__ import annotations
 import json
 import os
 import threading
-import types
 from datetime import datetime
 
 import pytest
 
 T0 = datetime(2025, 7, 3, 0, 0)
 T1 = datetime(2025, 7, 3, 3, 0)               # 4 hourly steps, inclusive
-
-
-@pytest.fixture
-def offline(table, tmp_path, monkeypatch):
-    """run_gauge on the synthetic basin table with every remote read stubbed."""
-    from hf_data import (basic, basinextent, multipliers, neighbors, params,
-                         paramstore, pipeline, runstates, statecache)
-    from hf_data import snow as snow_mod
-    monkeypatch.setattr(statecache, "CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setattr(pipeline, "gauge_info", lambda gid: {
-        "id": str(gid).zfill(8), "name": "Test Creek", "lat": 41.2, "lon": -90.5,
-        "area": 448.6})
-    monkeypatch.setattr(basic, "clip_basic_data",
-                        lambda bbox, d, **k: types.SimpleNamespace(derived=False))
-    monkeypatch.setattr(basinextent, "carve", lambda d, ext, gid: {"mask": None})
-    monkeypatch.setattr(neighbors, "upstream_gauges", lambda *a, **k: [])
-    monkeypatch.setattr(runstates, "nodes_of", lambda *a, **k: (None, None))
-    monkeypatch.setattr(paramstore, "get", lambda *a, **k: None)
-    monkeypatch.setattr(multipliers, "to_control_params",
-                        lambda gid, model=None: ({"wm": 1.0}, {"alpha": 1.0}))
-    monkeypatch.setattr(snow_mod, "detect_snow",
-                        lambda *a, **k: {"snow": False, "reason": "test"})
-    monkeypatch.setattr(params, "clip_param_grids", lambda *a, **k: {})
-    monkeypatch.setattr(pipeline, "build_control", lambda spec: None)
-    return pipeline
 
 
 def _drain(gen):
@@ -150,14 +124,3 @@ def test_job_reports_cached_and_cancelled(offline, monkeypatch):
     assert _job(offline, monkeypatch, ["05467000"])["05467000"]["outcome"] == "cached"
     stopped = _job(offline, monkeypatch, ["05467000"], cancelled=True)
     assert stopped["05467000"]["outcome"] == "cancelled"
-
-
-def test_legacy_done_view_for_unmigrated_callers():
-    """fleet_run / eventsim / routednow read old done-dict keys until ticket 08."""
-    from hf_data.runresult import GaugeRunResult, Outcome
-    ok = GaugeRunResult(Outcome.OK, "05467000")
-    assert ok.get("returncode") == 0 and ok.get("no_basin") is None
-    nb = GaugeRunResult(Outcome.NO_BASIN, "15019990", reason="no_terrain")
-    assert nb.get("no_basin") is True and nb.get("reason") == "no_terrain"
-    assert nb.get("returncode", 0) not in (0, None)
-    assert GaugeRunResult(Outcome.CANCELLED, "x").get("returncode") == -9

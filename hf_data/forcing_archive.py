@@ -66,6 +66,12 @@ VARS = {
 TEMP_GRID = (-124.9375, 25.0625, 0.12473060344827586, 224, 464, -9999.0)
 
 
+def store_key(bbox) -> str:
+    """Key of the per-(variable, basin box) clipped-forcing store
+    (forcing.store_dir): the box at three decimals, '-' -> 'm', '.' -> 'p'."""
+    return "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p")
+
+
 # --------------------------------------------------------------------------- #
 # per-variable value rules
 # --------------------------------------------------------------------------- #
@@ -273,20 +279,22 @@ class ArchiveGap(LookupError):
         self.var, self.year, self.month = var, year, month
 
 
-def _hub_fetch(repo: str, cache_dir: str | None):
+def _hub_fetch(repo: str, cache_dir: str | None, token: str | None = None):
     def fetch(path: str) -> str:
         from huggingface_hub import hf_hub_download
         from huggingface_hub.errors import EntryNotFoundError
         try:
-            return hf_hub_download(repo, path, repo_type="dataset", cache_dir=cache_dir)
+            return hf_hub_download(repo, path, repo_type="dataset", cache_dir=cache_dir,
+                                   token=token)
         except EntryNotFoundError as e:          # permanent 404 -> "not there"
             raise FileNotFoundError(path) from e
     return fetch
 
 
 class ForcingArchive:
-    def __init__(self, repo: str = HF_REPO, cache_dir: str | None = None, fetch=None):
-        self._fetch = fetch or _hub_fetch(repo, cache_dir)
+    def __init__(self, repo: str = HF_REPO, cache_dir: str | None = None, fetch=None,
+                 token: str | None = None):
+        self._fetch = fetch or _hub_fetch(repo, cache_dir, token)
         self._open: dict[tuple[str, int, int], tuple[tarfile.TarFile, set[str]]] = {}
 
     def _tar(self, var: str, t: datetime) -> tuple[tarfile.TarFile, set[str]]:
@@ -307,7 +315,9 @@ class ForcingArchive:
             self._open[key] = (tf, set(tf.getnames()))
         return self._open[key]
 
-    def read(self, var: str, t: datetime, bbox) -> Grid | None:
+    def read(self, var: str, t: datetime, bbox=None) -> Grid | None:
+        """Grid of `var` at `t` clipped to bbox (W,S,E,N); bbox None -> the
+        full domain. None when the month's tar has no member for `t`."""
         cfg = VARS[var]
         tf, names = self._tar(var, t)
         member = t.strftime(cfg.member_fmt)
@@ -317,6 +327,8 @@ class ForcingArchive:
             return None
         a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())
         a, was_k = validate(var, a, nod, member)     # full grid, before clipping
+        if bbox is None:
+            return Grid(a, xll, yll, cell, nod, member, was_k)
         clip = _clip(a, xll, yll, cell, nod, bbox)
         if clip is None:                        # box outside the archive grid
             return None
