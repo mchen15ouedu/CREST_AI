@@ -21,7 +21,9 @@ CREST_state, was enough to keep the fleet's 5 years out for good.
 
 Deliberately a separate repo from CREST_state: persist.backup mirrors local
 deletions to CREST_state, so fleet data there would be erased by the janitor.
-Every failure path is a silent no-op — the run just proceeds uncached.
+Every failure path is a silent no-op — the run just proceeds uncached. A
+real 404 is remembered for TTL_S ("the fleet has nothing here"); a Hub that
+could not be reached is not, so the next run probes again.
 """
 from __future__ import annotations
 
@@ -31,10 +33,11 @@ import os
 import threading
 import time
 
-from hf_data import statecache
+from hf_data import hubdata, statecache
 from hf_data.atomicfile import atomic_path
 
-REPO = os.environ.get("CREST_FLEET_REPO", "vincewin/CREST_fleet")
+DATASET = hubdata.fleet()
+REPO = DATASET.repo        # for the fleet writers not yet on DATASET (ticket 09)
 # re-probe a key this often: the ungauged fleet re-uploads checkpoints, the
 # janitor's LRU cap can evict fetched grids, and a gauge may finish later
 TTL_S = float(os.environ.get("CREST_FLEET_TTL_S", "21600"))
@@ -46,20 +49,8 @@ _lock = threading.Lock()
 _key_locks: dict[str, threading.Lock] = {}
 
 
-def _token():
-    return os.environ.get("HF_TOKEN")
-
-
 def _key(gauge, model) -> str:
     return f"{str(gauge).zfill(8)}_{model}"
-
-
-def _download(path: str) -> str | None:
-    try:
-        from huggingface_hub import hf_hub_download
-        return hf_hub_download(REPO, path, repo_type="dataset", token=_token())
-    except Exception:
-        return None
 
 
 def _sig(path: str) -> str:
@@ -142,7 +133,7 @@ def ensure_local(gauge, state_model, rows_model: str | None = None,
     Returns "fetched" (fleet data became newly available now), "cached" (the
     fleet's data is already in the local cache) or None (the fleet has
     nothing under these keys, or it could not be reached)."""
-    if not REPO or not _token():
+    if not hubdata.token():                        # private repo: no token, no fleet
         return None
     rows_model = rows_model or state_model
     key = _key(gauge, state_model) + "|" + rows_model
@@ -160,23 +151,26 @@ def ensure_local(gauge, state_model, rows_model: str | None = None,
                     or (rec and rec.get("fleet_sig")):
                 return "cached"
             # fetched earlier but evicted locally since -> merge again
-        _seen[key] = now
         got = found = 0
-        p = _download(f"results/{_key(gauge, rows_model)}.json")
-        if p:
+        reached = True
+        for path, merge in (
+                (f"results/{_key(gauge, rows_model)}.json",
+                 lambda p: _merge_rows(gauge, rows_model, p, variant)),
+                (f"states/{_key(gauge, state_model)}.pqf",
+                 lambda p: _merge_states(gauge, state_model, p))):
+            r = DATASET.local_path(path)
+            if r.unreachable:
+                reached = False
+            if not r.ok:
+                continue
             found += 1
             try:
-                got += 1 if _merge_rows(gauge, rows_model, p, variant) else 0
+                got += 1 if merge(r.value) else 0
             except Exception:
                 pass
-        p = _download(f"states/{_key(gauge, state_model)}.pqf")
-        if p:
-            found += 1
-            try:
-                got += 1 if _merge_states(gauge, state_model, p) else 0
-            except Exception:
-                pass
-        _remote[key] = (now, bool(found))
+        if reached:                                # an outage is not "nothing there"
+            _seen[key] = now
+            _remote[key] = (now, bool(found))
         if got:
             return "fetched"
         return "cached" if found else None
@@ -186,18 +180,15 @@ def has_remote(gauge, model) -> bool:
     """Does the fleet repo hold state grids under this key? (one cheap HEAD,
     remembered for TTL_S) — used to tell a full-basin run that the fleet's
     pre-run of this gauge exists under the speed scheme."""
-    if not REPO or not _token():
+    if not hubdata.token():
         return False
     key = "has|" + _key(gauge, model)
     now = time.time()
     hit = _remote.get(key)
     if hit and now - hit[0] < TTL_S:
         return hit[1]
-    try:
-        from huggingface_hub import HfApi
-        ok = bool(HfApi(token=_token()).file_exists(
-            REPO, f"states/{_key(gauge, model)}.pqf", repo_type="dataset"))
-    except Exception:
-        ok = False
-    _remote[key] = (now, ok)
-    return ok
+    r = DATASET.exists(f"states/{_key(gauge, model)}.pqf")
+    if not r.ok:
+        return False                               # unreachable: not remembered
+    _remote[key] = (now, r.value)
+    return r.value

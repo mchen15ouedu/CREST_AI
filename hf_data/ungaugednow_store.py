@@ -16,7 +16,7 @@ frontend which one it got.
 The keep-warm Space (ungauged_space/runner.py) advances the ungauged
 HydroBASINS points that have an upstream USGS gauge every hour with
 hf_data.routednow.compute and writes the result set to
-nowcast/ungauged_latest.parquet in vincewin/CREST_data:
+nowcast/ungauged_latest.parquet in the feedback dataset (hubdata.feedback()):
 
   vp                str    ungauged point id ("V" + HYRIV_ID)
   lat, lon          f32
@@ -36,14 +36,14 @@ READ side (dashboard): for_bbox() / by_ids() / series(), TTL-cached.
 from __future__ import annotations
 
 import json
-import os
-import threading
-import time
 from datetime import datetime, timedelta
 
 import numpy as np
 
-REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")
+from . import hubdata, nowcastfeed
+from .hubdata import Put
+
+DATASET = hubdata.feedback()
 # One writer (a shard of the keep-warm fleet) publishes ungauged_latest<tag>.parquet;
 # the reader concatenates every shard file. tag="" for a single unsharded writer.
 LATEST_PREFIX = "nowcast/ungauged_latest"
@@ -52,7 +52,7 @@ TTL_S = 240
 HORIZON_H = 12
 TS_FMT = "%Y-%m-%d %H:%M"
 MAX_ROW_AGE_H = 26.0                # = ungauged_space CARRY_TTL_H
-META_T0_FMT = "%Y-%m-%d %H:%M UTC"
+META_T0_FMT = nowcastfeed.T0_FMT
 
 
 # --------------------------------------------------------------------------- #
@@ -120,54 +120,39 @@ def build_table(records: list[dict], t0: datetime, horizon: int = HORIZON_H):
     return tbl.replace_schema_metadata(meta)
 
 
-def upload_latest(table, tag: str = "", token: str | None = None) -> bool:
-    """Write `table` to nowcast/ungauged_latest<tag>.parquet in CREST_data.
-    Each keep-warm shard passes its own tag (e.g. "__0of3") so shards don't
-    clobber each other; the reader concatenates them."""
+def upload_latest(table, tag: str = "") -> bool:
+    """Write `table` to nowcast/ungauged_latest<tag>.parquet in the feedback
+    dataset. Each keep-warm shard passes its own tag (e.g. "__0of3") so
+    shards don't clobber each other; the reader concatenates them. False
+    without a token; raises RuntimeError when the commit did not land."""
     import io
 
     import pyarrow.parquet as pq
-    from huggingface_hub import CommitOperationAdd, HfApi
 
-    token = token or os.environ.get("HF_TOKEN")
-    if not token:
+    if not DATASET.can_write:
         return False
     buf = io.BytesIO()
     pq.write_table(table, buf, compression="zstd")
-    buf.seek(0)
-    HfApi(token=token).create_commit(
-        repo_id=REPO, repo_type="dataset",
-        operations=[CommitOperationAdd(f"{LATEST_PREFIX}{tag}.parquet", buf)],
-        commit_message=f"ungauged nowcast{tag} {table.schema.metadata.get(b't0', b'').decode()}")
+    t0 = (table.schema.metadata or {}).get(b"t0", b"").decode()
+    res = DATASET.commit([Put(f"{LATEST_PREFIX}{tag}.parquet", buf.getvalue())],
+                         f"ungauged nowcast{tag} {t0}")
+    if not res:
+        raise RuntimeError(f"ungauged nowcast upload: {res.error}")
     return True
 
 
 # --------------------------------------------------------------------------- #
 # READ side — served by the dashboard
 # --------------------------------------------------------------------------- #
-_lock = threading.Lock()
-_cache: dict = {"at": 0.0, "meta": None, "cols": None}
-
-
-def _load_v3():
+def _v3_table(local: str):
     """DI-LSTM v3 virtual-point file -> (meta, cols) in the store's layout, or
-    None if it is not published (then the EF5 routed shards are served)."""
+    None when the file carries no usable forecast (then the EF5 routed shards
+    are served)."""
     import pyarrow.parquet as pq
-    from huggingface_hub import hf_hub_download
-    token = os.environ.get("HF_TOKEN")
-    try:
-        p = hf_hub_download(REPO, V3_LATEST, repo_type="dataset", token=token,
-                            force_download=True)
-    except Exception:
-        return None
-    t = pq.read_table(p)
+    t = pq.read_table(local)
     names = t.schema.names
-    q12 = sorted((n for n in names if n.startswith("q12_") and n[4:].isdigit()),
-                 key=lambda n: int(n[4:]))
-    q6 = sorted((n for n in names if n[0] == "q" and n[1:].isdigit()),
-                key=lambda n: int(n[1:]))
-    src = q12 or q6                       # 12-h model preferred (12-h horizon)
-    if not src or "vp" not in names:
+    src = nowcastfeed.qcols(names, "q12_") or nowcastfeed.qcols(names, "q")
+    if not src or "vp" not in names:     # 12-h model preferred (12-h horizon)
         return None
     cols = {n: t.column(n).to_numpy(zero_copy_only=False)
             for n in ("vp", "lat", "lon", "area_km2") if n in names}
@@ -175,8 +160,7 @@ def _load_v3():
         cols[f"q{k + 1}"] = t.column(n).to_numpy(zero_copy_only=False)
     if "hist" in names:
         cols["hist"] = t.column("hist").to_numpy(zero_copy_only=False)
-    m = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()
-         if not k.startswith(b"ARROW")}
+    m = nowcastfeed.schema_meta(t)
     meta = {"t0": m.get("t0", ""), "generated": m.get("generated") or m.get("t0", ""),
             "horizon": str(len(src)), "n_points": str(len(cols["vp"])),
             "source": "dilstm_v3", "model_file": m.get("model12_file") or m.get("model_file", ""),
@@ -184,27 +168,28 @@ def _load_v3():
     return meta, cols
 
 
-def _load():
-    v3 = _load_v3()
-    if v3 is not None:
-        return v3
+def _read_routed(ds: hubdata.Dataset) -> hubdata.Read:
+    """Every ungauged_latest<shard>.parquet, concatenated, rows from a shard
+    that stopped publishing dropped. MISSING when no shard is published."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from huggingface_hub import HfApi, hf_hub_download
-    token = os.environ.get("HF_TOKEN")
-    files = sorted(f for f in HfApi(token=token).list_repo_files(REPO, repo_type="dataset")
-                   if f.startswith(LATEST_PREFIX) and f.endswith(".parquet"))
-    if not files:
-        raise FileNotFoundError("no ungauged nowcast parquet yet")
+    listed = ds.list_files(LATEST_PREFIX)
+    if not listed.ok:
+        return listed
     tables, meta = [], {}
-    for f in files:
-        p = hf_hub_download(REPO, f, repo_type="dataset", token=token)
-        t = pq.read_table(p)
+    for f in (f for f in listed.value if f.endswith(".parquet")):
+        r = ds.read(f, pq.read_table)
+        if r.unreachable:
+            return r
+        if r.missing:                        # deleted since the listing
+            continue
+        t = r.value
         tables.append(t)
-        m = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()
-             if not k.startswith(b"ARROW")}
+        m = nowcastfeed.schema_meta(t)
         if not meta or m.get("generated", "") > meta.get("generated", ""):
             meta = m                         # report the freshest shard's issue time
+    if not tables:
+        return hubdata.Read(hubdata.MISSING)
     if len(tables) == 1:
         big = tables[0]
     else:
@@ -217,10 +202,7 @@ def _load():
     # Drop rows whose own issue time is far behind the freshest shard: a shard
     # that stopped publishing (1of3 since 2026-08-13) was served under the
     # fresh shard's t0 label. Rows with no parseable t0 cannot be dated -> drop.
-    try:
-        newest = datetime.strptime(meta.get("t0", ""), META_T0_FMT)
-    except ValueError:
-        newest = None
+    newest = nowcastfeed.issue_time(meta)
     if newest is not None and "t0" in cols:
         keep = np.zeros(len(cols["t0"]), bool)
         for i, v in enumerate(cols["t0"]):
@@ -232,37 +214,30 @@ def _load():
         if not keep.all():
             cols = {k: v[keep] for k, v in cols.items()}
     meta["source"] = "ef5_routed"
-    return meta, cols
+    return hubdata.Read(hubdata.DATA, (meta, cols))
+
+
+def _read_feed(ds: hubdata.Dataset) -> hubdata.Read:
+    """The v3 file when published and usable, else the EF5 routed shards. An
+    unreachable v3 read is an outage, not a reason to switch feeds."""
+    v3 = ds.read(V3_LATEST, _v3_table, fresh=True)
+    if v3.unreachable or (v3.ok and v3.value is not None):
+        return v3
+    return _read_routed(ds)
 
 
 def _fresh():
-    now = time.time()
-    with _lock:
-        if _cache["cols"] is not None and now - _cache["at"] < TTL_S:
-            return _cache["meta"], _cache["cols"]
-    try:
-        meta, cols = _load()
-        with _lock:
-            _cache.update(at=now, meta=meta, cols=cols)
-        return meta, cols
-    except Exception:
-        with _lock:                       # serve stale rather than nothing
-            return _cache["meta"], _cache["cols"]
+    """(meta, cols) of the current feed, or (None, None)."""
+    return nowcastfeed.table(nowcastfeed.read(DATASET, "ungauged", _read_feed, TTL_S))
 
 
 def _qkeys(cols) -> list[str]:
-    return sorted((n for n in cols if n and n[0] == "q" and n[1:].isdigit()),
-                  key=lambda n: int(n[1:]))
+    return nowcastfeed.qcols(cols, "q")
 
 
 def issue_t0() -> datetime | None:
     meta, cols = _fresh()
-    if cols is None:
-        return None
-    try:
-        return datetime.strptime(meta.get("t0", ""), META_T0_FMT)
-    except ValueError:
-        return None
+    return None if cols is None else nowcastfeed.issue_time(meta)
 
 
 def _pack(cols, i, qk, t0):
@@ -301,11 +276,9 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 200) -> dict:
     meta, cols = _fresh()
     if cols is None:
         return {"ok": False, "reason": "no precomputed ungauged nowcast yet"}
-    m = ((cols["lon"] >= w) & (cols["lon"] <= e)
-         & (cols["lat"] >= s) & (cols["lat"] <= n))
-    idx = np.nonzero(m)[0]
+    idx = nowcastfeed.in_bbox(cols, w, s, e, n)
     total = int(len(idx))
-    idx = idx[np.argsort(-cols["area_km2"][idx])][:max(1, limit)]
+    idx = idx[:max(1, limit)]
     t0 = issue_t0()
     return {"ok": True, "t0": meta.get("t0"), "generated": meta.get("generated"),
             "source": meta.get("source"), "model_file": meta.get("model_file"),
@@ -313,32 +286,35 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 200) -> dict:
             "points": _select(cols, idx, t0)}
 
 
-_nu: dict = {"at": 0.0, "set": None}
 NU_TTL_S = 900
+NO_UPSTREAM_PREFIX = "nowcast/ungauged_no_upstream"
+
+
+def _load_ids(local: str) -> set:
+    with open(local, encoding="utf-8") as fp:
+        return set(json.load(fp))
+
+
+def _read_no_upstream(ds: hubdata.Dataset) -> hubdata.Read:
+    listed = ds.list_files(NO_UPSTREAM_PREFIX)
+    if not listed.ok:
+        return listed
+    ids: set = set()
+    for f in (f for f in listed.value if f.endswith(".json")):
+        r = ds.read(f, _load_ids)
+        if r.unreachable:
+            return r
+        if r.ok:
+            ids |= r.value
+    return hubdata.Read(hubdata.DATA, ids)
 
 
 def _no_upstream_ids() -> set:
     """Points the keep-warm fleet has confirmed have NO upstream USGS gauge
-    (union of the per-shard nowcast/ungauged_no_upstream*.json lists)."""
-    now = time.time()
-    with _lock:
-        if _nu["set"] is not None and now - _nu["at"] < NU_TTL_S:
-            return _nu["set"]
-    ids: set = set()
-    try:
-        from huggingface_hub import HfApi, hf_hub_download
-        token = os.environ.get("HF_TOKEN")
-        files = [f for f in HfApi(token=token).list_repo_files(REPO, repo_type="dataset")
-                 if f.startswith("nowcast/ungauged_no_upstream") and f.endswith(".json")]
-        for f in files:
-            p = hf_hub_download(REPO, f, repo_type="dataset", token=token)
-            ids |= set(json.load(open(p)))
-    except Exception:
-        with _lock:                          # serve stale rather than nothing
-            return _nu["set"] or set()
-    with _lock:
-        _nu.update(at=now, set=ids)
-    return ids
+    (union of the per-shard nowcast/ungauged_no_upstream*.json lists); the
+    last good set while the Hub is unreachable."""
+    r = nowcastfeed.read(DATASET, NO_UPSTREAM_PREFIX, _read_no_upstream, NU_TTL_S)
+    return r.value if r.ok else set()
 
 
 def by_ids(ids) -> dict:

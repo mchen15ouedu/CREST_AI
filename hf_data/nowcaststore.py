@@ -1,43 +1,56 @@
 """Precomputed fleet nowcasts — read side of scripts/run_nowcast_all.py.
 
-The updater Space refreshes nowcast/latest.parquet in vincewin/CREST_data
-hourly (DI-LSTM hourly predictions q1..qN — currently N=12 — for every CONUS
-GAGES-II gauge, issue time t0 = newest MRMS Pass1 hour). This module serves
-it to the dashboard with a short in-process TTL cache; hf_hub_download's
-etag check makes the refresh a cheap no-op until the Space actually uploads
-a new file. Risk tiers (pins/heatmap) stay on the FIRST RISK_H hours so the
-map coloring is unchanged as the model horizon grows.
+The updater Space refreshes nowcast/latest.parquet in the feedback dataset
+(hubdata.feedback()) hourly (DI-LSTM hourly predictions q1..qN — currently
+N=12 — for every CONUS GAGES-II gauge, issue time t0 = newest MRMS Pass1
+hour). This module serves it to the dashboard with a short in-process TTL
+cache (nowcastfeed: the last good copy is served while the Hub is
+unreachable); the download's etag check makes the refresh a cheap no-op
+until the Space actually uploads a new file. Risk tiers (pins/heatmap) stay
+on the FIRST RISK_H hours so the map coloring is unchanged as the model
+horizon grows.
 """
 from __future__ import annotations
 
 import os
 import threading
-import time
 from datetime import datetime, timedelta
 
 import numpy as np
 
-REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")
+from . import hubdata, nowcastfeed
+
+DATASET = hubdata.feedback()
+LATEST = "nowcast/latest.parquet"
+PRECIP = "nowcast/precip_cache.parquet"
+THRESHOLDS = "nowcast/flood_thresholds.parquet"
 TTL_S = 240
 RISK_H = 6           # tier window: pins/heatmap use the first 6 forecast hours
 
 
 def _qcols(cols) -> list:
     """Ordered 6-h-model columns q1..qN (risk basis) in latest.parquet."""
-    return sorted((n for n in cols if n[0] == "q" and n[1:].isdigit()),
-                  key=lambda n: int(n[1:]))
+    return nowcastfeed.qcols(cols, "q")
 
 
 def _q12cols(cols) -> list:
     """Ordered 12-h-model columns q12_1..q12_N (hydrograph-only, own trace)."""
-    return sorted((n for n in cols if n.startswith("q12_") and n[4:].isdigit()),
-                  key=lambda n: int(n[4:]))
+    return nowcastfeed.qcols(cols, "q12_")
 
 _lock = threading.Lock()
-_cache: dict = {"at": 0.0, "meta": None, "cols": None}
-_thr: dict = {"at": 0.0, "map": None}     # gid -> Q10 (m3/s); static file
 THR_TTL_S = 3600
-_pc: dict = {"at": 0.0, "times": None, "idx": None, "arr": None}
+
+
+def _load_precip(local: str):
+    import pyarrow.parquet as pq
+    t = pq.read_table(local)
+    hcols = sorted(n for n in t.schema.names if n.startswith("h")
+                   and n[1:].isdigit())
+    times = [f"{n[1:5]}-{n[5:7]}-{n[7:9]} {n[9:11]}:00" for n in hcols]
+    idx = {g: i for i, g in enumerate(t.column("gid").to_pylist())}
+    arr = np.stack([t.column(n).to_numpy(zero_copy_only=False)
+                    for n in hcols], 1).astype("float32")
+    return times, idx, arr
 
 
 def _precip_cache():
@@ -45,91 +58,45 @@ def _precip_cache():
     (written by the same hourly commit as latest.parquet, so it matches t0).
     Returns (times [iso-hour strs], {gid: row index}, arr [n_gauges, n_hours])
     or (None, None, None)."""
-    now = time.time()
-    with _lock:
-        if _pc["arr"] is not None and now - _pc["at"] < TTL_S:
-            return _pc["times"], _pc["idx"], _pc["arr"]
-    try:
-        import pyarrow.parquet as pq
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, "nowcast/precip_cache.parquet",
-                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
-        t = pq.read_table(p)
-        hcols = sorted(n for n in t.schema.names if n.startswith("h")
-                       and n[1:].isdigit())
-        times = [f"{n[1:5]}-{n[5:7]}-{n[7:9]} {n[9:11]}:00" for n in hcols]
-        idx = {g: i for i, g in enumerate(t.column("gid").to_pylist())}
-        arr = np.stack([t.column(n).to_numpy(zero_copy_only=False)
-                        for n in hcols], 1).astype("float32")
-        with _lock:
-            _pc.update(at=now, times=times, idx=idx, arr=arr)
-        return times, idx, arr
-    except Exception:
-        with _lock:
-            return _pc["times"], _pc["idx"], _pc["arr"]
-
-
-def _load():
-    import pyarrow.parquet as pq
-    from huggingface_hub import hf_hub_download
-    p = hf_hub_download(REPO, "nowcast/latest.parquet", repo_type="dataset",
-                        token=os.environ.get("HF_TOKEN"))
-    t = pq.read_table(p)
-    meta = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()
-            if not k.startswith(b"ARROW")}
-    cols = {name: t.column(name).to_numpy(zero_copy_only=False)
-            for name in t.schema.names}
-    return meta, cols
+    r = nowcastfeed.read(DATASET, PRECIP,
+                         lambda ds: ds.read(PRECIP, _load_precip), TTL_S)
+    return r.value if r.ok else (None, None, None)
 
 
 def _fresh():
-    now = time.time()
-    with _lock:
-        if _cache["cols"] is not None and now - _cache["at"] < TTL_S:
-            return _cache["meta"], _cache["cols"]
-    try:
-        meta, cols = _load()
-        with _lock:
-            _cache.update(at=now, meta=meta, cols=cols)
-        return meta, cols
-    except Exception:
-        with _lock:                      # serve stale rather than nothing
-            return _cache["meta"], _cache["cols"]
+    """(meta, cols) of the current latest.parquet, or (None, None)."""
+    return nowcastfeed.table(nowcastfeed.read(
+        DATASET, LATEST, lambda ds: ds.read(LATEST, nowcastfeed.load_parquet),
+        TTL_S))
 
 
 BASE_RISE = 5.0                    # yellow tier: predicted >= 5 x baseflow
 NOISE_Q = 0.5                      # m3/s floor — below this nothing is flagged
 
 
+def _load_thresholds(local: str) -> dict:
+    import pyarrow.parquet as pq
+    t = pq.read_table(local)
+    names = set(t.schema.names)
+
+    def col(n):
+        return (t.column(n).to_numpy(zero_copy_only=False) if n in names
+                else np.full(len(t), np.nan, "float32"))
+    m = {}
+    q2, q5, q10, qb = col("q2_cms"), col("q5_cms"), col("q10_cms"), col("qbase_cms")
+    for g, b, a2, a5, a10 in zip(t.column("gid").to_pylist(), qb, q2, q5, q10):
+        m[g] = (float(b), float(a2), float(a5), float(a10))
+    return m
+
+
 def _thresholds() -> dict:
     """Per-gauge thresholds {gid: (qbase, q2, q5, q10)} — NaN where unknown.
-    From scripts/compute_flood_thresholds.py (annual-peak LP3 + 3-yr median)."""
-    now = time.time()
-    with _lock:
-        if _thr["map"] is not None and now - _thr["at"] < THR_TTL_S:
-            return _thr["map"]
-    try:
-        import pyarrow.parquet as pq
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, "nowcast/flood_thresholds.parquet",
-                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
-        t = pq.read_table(p)
-        names = set(t.schema.names)
-
-        def col(n):
-            return (t.column(n).to_numpy(zero_copy_only=False) if n in names
-                    else np.full(len(t), np.nan, "float32"))
-        m = {}
-        q2, q5, q10, qb = col("q2_cms"), col("q5_cms"), col("q10_cms"), col("qbase_cms")
-        for g, b, a2, a5, a10 in zip(t.column("gid").to_pylist(), qb, q2, q5, q10):
-            m[g] = (float(b), float(a2), float(a5), float(a10))
-        with _lock:
-            _thr.update(at=now, map=m)
-        return m
-    except Exception:
-        with _lock:
-            return _thr["map"] or {}
-
+    From scripts/compute_flood_thresholds.py (annual-peak LP3 + 3-yr median).
+    {} when the file is not published (or never read)."""
+    r = nowcastfeed.read(DATASET, THRESHOLDS,
+                         lambda ds: ds.read(THRESHOLDS, _load_thresholds),
+                         THR_TTL_S)
+    return r.value if r.ok else {}
 
 OBS_AGE_MAX_H = float(os.environ.get("RISK_OBS_AGE_MAX_H", "6"))
 OBS_GATE_FRAC = float(os.environ.get("RISK_OBS_GATE_FRAC", "0.3"))
@@ -305,12 +272,7 @@ def hotspots(max_n: int | None = None) -> dict:
 def issue_t0() -> datetime | None:
     """Issue time of the current precomputed nowcast (UTC), or None."""
     meta, cols = _fresh()
-    if cols is None:
-        return None
-    try:
-        return datetime.strptime(meta.get("t0", ""), "%Y-%m-%d %H:%M UTC")
-    except ValueError:
-        return None
+    return None if cols is None else nowcastfeed.issue_time(meta)
 
 
 def nowcast_series(gid: str) -> list[tuple[datetime, float]]:
@@ -353,20 +315,15 @@ def for_bbox(w: float, s: float, e: float, n: float, limit: int = 100,
         return {"ok": False, "reason": "no precomputed nowcast available yet"}
     if ids:
         want = [s2.strip().zfill(8) for s2 in ids.split(",") if s2.strip()]
-        m = np.isin(cols["gid"], want)
+        idx = nowcastfeed.largest_first(cols, np.nonzero(np.isin(cols["gid"], want))[0])
     else:
-        m = ((cols["lon"] >= w) & (cols["lon"] <= e)
-             & (cols["lat"] >= s) & (cols["lat"] <= n))
-    idx = np.nonzero(m)[0]
+        idx = nowcastfeed.in_bbox(cols, w, s, e, n)
     total = int(len(idx))
-    idx = idx[np.argsort(-cols["area_km2"][idx])][:max(1, limit)]
+    idx = idx[:max(1, limit)]
     from hf_data.gaugetz import tz_of as _tz
     qs = _qcols(cols)
     q12s = _q12cols(cols)
-    try:
-        t0 = datetime.strptime(meta.get("t0", ""), "%Y-%m-%d %H:%M UTC")
-    except ValueError:
-        t0 = None
+    t0 = nowcastfeed.issue_time(meta)
     times = ([(t0 + timedelta(hours=k + 1)).strftime("%Y-%m-%d %H:%M")
               for k in range(max(len(qs), len(q12s)))] if t0 else [])
     thr = _thresholds()

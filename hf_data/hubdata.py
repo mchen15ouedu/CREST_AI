@@ -106,6 +106,23 @@ def feedback_repo() -> str:
     return os.environ.get("CREST_FEEDBACK_REPO") or data_repo()
 
 
+DEFAULT_FLEET_REPO = "vincewin/CREST_fleet"
+
+
+def fleet_repo() -> str:
+    """The fleet's precomputed runs (private; separate from CREST_state, whose
+    janitor mirrors local deletions)."""
+    return os.environ.get("CREST_FLEET_REPO", DEFAULT_FLEET_REPO)
+
+
+DEFAULT_STATE_REPO = "vincewin/CREST_state"
+
+
+def state_repo() -> str:
+    """The private cache mirror (persist.py: states, results, params, ...)."""
+    return os.environ.get("CREST_STATE_REPO", DEFAULT_STATE_REPO)
+
+
 def token() -> str | None:
     """The Hub token, or None (read-only, anonymous)."""
     return os.environ.get("HF_TOKEN") or None
@@ -153,6 +170,40 @@ class HubAdapter:
         except Exception as e:
             raise Unreachable(f"{type(e).__name__}: {e}") from e
 
+    def exists(self, repo: str, path: str) -> bool:
+        try:
+            return bool(self._api().get_paths_info(repo, [path], repo_type="dataset"))
+        except Exception as e:
+            raise Unreachable(f"{type(e).__name__}: {e}") from e
+
+    def file_info(self, repo: str) -> dict:
+        try:
+            info = self._api().dataset_info(repo, files_metadata=True)
+        except Exception as e:
+            raise Unreachable(f"{type(e).__name__}: {e}") from e
+        return {s.rfilename: (s.blob_id, s.size) for s in info.siblings}
+
+    def snapshot(self, repo: str, local_dir: str, patterns: list[str]) -> None:
+        from huggingface_hub import snapshot_download
+        try:
+            snapshot_download(repo_id=repo, repo_type="dataset", token=token(),
+                              local_dir=local_dir, allow_patterns=patterns)
+        except Exception as e:
+            raise Unreachable(f"{type(e).__name__}: {e}") from e
+
+    def create(self, repo: str, private: bool) -> None:
+        self._api().create_repo(repo, repo_type="dataset", private=private,
+                                exist_ok=True)
+
+    def open(self, repo: str, path: str):
+        from huggingface_hub import HfFileSystem
+        try:
+            return HfFileSystem(token=token()).open(
+                f"datasets/{repo}/{path}", "rb", block_size=1 << 20,
+                cache_type="readahead")
+        except FileNotFoundError as e:
+            raise NotFound(path) from e
+
     def commit(self, repo: str, ops: list, message: str) -> None:
         import io
         from huggingface_hub import CommitOperationAdd, CommitOperationDelete
@@ -186,6 +237,35 @@ class MemoryHub:
     def list_files(self, repo: str) -> list[str]:
         self._check()
         return sorted(self.files)
+
+    def exists(self, repo: str, path: str) -> bool:
+        self._check()
+        return path in self.files
+
+    def file_info(self, repo: str) -> dict:
+        import hashlib
+        self._check()
+        return {k: (hashlib.sha1(v).hexdigest(), len(v)) for k, v in self.files.items()}
+
+    def snapshot(self, repo: str, local_dir: str, patterns: list[str]) -> None:
+        from fnmatch import fnmatch
+        self._check()
+        for k, v in self.files.items():
+            if any(fnmatch(k, p) for p in patterns):
+                p = os.path.join(local_dir, *k.split("/"))
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as fp:
+                    fp.write(v)
+
+    def create(self, repo: str, private: bool) -> None:
+        self._check()
+
+    def open(self, repo: str, path: str):
+        import io
+        self._check()
+        if path not in self.files:
+            raise NotFound(path)
+        return io.BytesIO(self.files[path])
 
     def commit(self, repo: str, ops: list, message: str) -> None:
         self._check()
@@ -316,8 +396,56 @@ class Dataset:
                clock=time.time) -> "Cached":
         """A TTL-cached read of `path` (JSON unless `load` is given) that
         serves the last good copy, marked stale, while the Hub is unreachable."""
-        return Cached(self, path, ttl_s, load or _json_loader(kind),
-                      ttl_s if retry_s is None else retry_s, fresh, clock)
+        load = load or _json_loader(kind)
+        return cached(lambda: self.read(path, load, fresh=fresh), ttl_s,
+                      retry_s=retry_s, clock=clock)
+
+    def exists(self, path: str) -> Read:
+        """Whether `path` is in the repo, without downloading it (value =
+        bool; UNREACHABLE when the Hub gave no answer)."""
+        try:
+            return Read(DATA, bool(self.adapter.exists(self.repo, path)))
+        except Exception as e:
+            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+
+    def file_info(self, prefix: str = "") -> Read:
+        """{path: (blob id, size)} of the files under `prefix` — the blob id
+        changes whenever the file is re-uploaded."""
+        try:
+            info = self.adapter.file_info(self.repo)
+        except Exception as e:
+            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+        return Read(DATA, {k: v for k, v in info.items() if k.startswith(prefix)})
+
+    def snapshot(self, local_dir: str, patterns: list[str]) -> Read:
+        """Download every file matching one of the glob `patterns` (e.g.
+        "params/**") into `local_dir`, keeping repo paths (value = local_dir)."""
+        try:
+            self.adapter.snapshot(self.repo, local_dir, list(patterns))
+        except Exception as e:
+            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+        return Read(DATA, local_dir)
+
+    def create(self, private: bool = True) -> Committed:
+        """Create the repo if it does not exist yet. Never raises."""
+        if not self.can_write:
+            return Committed(False, "no HF token: read-only")
+        try:
+            self.adapter.create(self.repo, private)
+        except Exception as e:
+            return Committed(False, f"{type(e).__name__}: {e}")
+        return Committed(True)
+
+    def open(self, path: str) -> Read:
+        """A binary file object over the remote file, read by range requests
+        (for parquet footers and column chunks of big files) — value = the
+        file object; the caller closes it."""
+        try:
+            return Read(DATA, self.adapter.open(self.repo, path))
+        except NotFound:
+            return Read(MISSING)
+        except Exception as e:
+            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
 
     def list_files(self, prefix: str = "") -> Read:
         """Sorted repo paths starting with `prefix` (DATA or UNREACHABLE)."""
@@ -357,14 +485,20 @@ def _json_loader(kind: type | None):
     return load
 
 
+def cached(fetch, ttl_s: float, retry_s: float | None = None,
+           clock=time.time) -> "Cached":
+    """A TTL cache over any `fetch() -> Read` (a read assembled from several
+    files, say) with the same outage policy as Dataset.cached."""
+    return Cached(fetch, ttl_s, ttl_s if retry_s is None else retry_s, clock)
+
+
 class Cached:
-    """See Dataset.cached. `get()` re-reads after `ttl_s`; after an
-    unreachable read it waits `retry_s` before trying again. A MISSING answer
+    """See Dataset.cached. `get()` re-fetches after `ttl_s`; after an
+    unreachable fetch it waits `retry_s` before trying again. A MISSING answer
     drops the cached copy (the file is gone, that is not an outage)."""
 
-    def __init__(self, ds, path, ttl_s, load, retry_s, fresh, clock):
-        self.ds, self.path, self.ttl_s, self.load = ds, path, ttl_s, load
-        self.retry_s, self.fresh, self.clock = retry_s, fresh, clock
+    def __init__(self, fetch, ttl_s, retry_s, clock):
+        self.fetch, self.ttl_s, self.retry_s, self.clock = fetch, ttl_s, retry_s, clock
         self._serve: Read | None = None       # the answer until the next Hub read
         self._next = 0.0                      # clock time of the next Hub read
         self._lock = threading.Lock()
@@ -374,7 +508,7 @@ class Cached:
             now = self.clock()
             if not force and self._serve is not None and now < self._next:
                 return self._serve
-            r = self.ds.read(self.path, self.load, fresh=self.fresh)
+            r = self.fetch()
             if not r.unreachable:
                 self._serve, self._next = r, now + self.ttl_s
             else:
@@ -382,6 +516,11 @@ class Cached:
                     r = Read(DATA, self._serve.value, stale=True)
                 self._serve, self._next = r, now + self.retry_s
             return r
+
+    def put(self, value) -> None:
+        """Serve `value` (just written by this process) until the TTL runs out."""
+        with self._lock:
+            self._serve, self._next = Read(DATA, value), self.clock() + self.ttl_s
 
 
 class CommitBatch:
@@ -433,3 +572,13 @@ def data() -> Dataset:
 def feedback() -> Dataset:
     """The feedback dataset repo on the real Hub."""
     return Dataset(feedback_repo())
+
+
+def fleet() -> Dataset:
+    """The fleet dataset repo on the real Hub."""
+    return Dataset(fleet_repo())
+
+
+def state() -> Dataset:
+    """The state (cache mirror) dataset repo on the real Hub."""
+    return Dataset(state_repo())

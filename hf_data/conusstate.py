@@ -39,10 +39,12 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
-from hf_data import fleetstore
+from hf_data import hubdata
 from hf_data.atomicfile import atomic_path
+from hf_data.hubdata import Put
 
-REPO = fleetstore.REPO
+DATASET = hubdata.fleet()
+RETRY_S = 60.0                             # after an unreachable read
 INDEX_FILE = "mosaic/index.json"
 CELL = 1.0 / 1200.0                        # 3 arc-seconds
 NODATA = -9999.0
@@ -57,18 +59,20 @@ NO_MOSAIC = ("lake_",)
 T_FMT = "%Y%m%d_%H%M"
 
 _lock = threading.Lock()
-_listing: tuple[float, dict] | None = None
-_index: tuple[float, dict] | None = None
+_caches: dict[str, tuple] = {}
 _footers: dict[str, tuple] = {}
 
 
-def _token():
-    return os.environ.get("HF_TOKEN")
-
-
-def _fs():
-    from huggingface_hub import HfFileSystem
-    return HfFileSystem(token=_token())
+def _cached(name: str, fetch) -> hubdata.Cached:
+    """The TTL cache `name` over the current DATASET (rebuilt if it changed):
+    re-read after TTL_S, the last good copy while the Hub is unreachable."""
+    with _lock:
+        hit = _caches.get(name)
+        if hit is None or hit[0] is not DATASET:
+            ds = DATASET
+            hit = (ds, hubdata.cached(lambda: fetch(ds), TTL_S, retry_s=RETRY_S))
+            _caches[name] = hit
+    return hit[1]
 
 
 def base_model(model: str) -> str:
@@ -78,29 +82,33 @@ def base_model(model: str) -> str:
 # ---- what the fleet holds ----------------------------------------------------
 def listing(force: bool = False) -> dict:
     """{gauge id: [state keys]} of the gauged fleet bundles (one repo listing,
-    remembered for TTL_S)."""
-    global _listing
-    now = time.time()
-    with _lock:
-        if _listing and not force and now - _listing[0] < TTL_S:
-            return _listing[1]
-    from huggingface_hub import HfApi
+    remembered for TTL_S; the last good one while the Hub is unreachable).
+    Raises RuntimeError when the fleet was never reachable."""
+    r = _cached("listing", _read_listing).get(force=force)
+    if not r.ok:
+        raise RuntimeError(f"fleet listing: {r.error}")
+    return r.value
+
+
+def _read_listing(ds: hubdata.Dataset) -> hubdata.Read:
+    r = ds.list_files("states/")
+    if not r.ok:
+        return r
     out: dict[str, list[str]] = {}
-    for f in HfApi(token=_token()).list_repo_files(REPO, repo_type="dataset"):
-        if f.startswith("states/") and f.endswith(".pqf") and not f.startswith("states/V"):
+    for f in r.value:
+        if f.endswith(".pqf") and not f.startswith("states/V"):
             key = f[len("states/"):-len(".pqf")]
             out.setdefault(key.split("_", 1)[0], []).append(key)
-    with _lock:
-        _listing = (now, out)
-    return out
+    return hubdata.Read(hubdata.DATA, out)
 
 
 def _open(key: str):
     """(ParquetFile, grid dict) of a fleet bundle, footer read over HTTP."""
     import pyarrow.parquet as pq
-    fh = _fs().open(f"datasets/{REPO}/states/{key}.pqf", "rb",
-                    block_size=1 << 20, cache_type="readahead")
-    pf = pq.ParquetFile(fh, pre_buffer=True)
+    r = DATASET.open(f"states/{key}.pqf")
+    if not r.ok:
+        raise (FileNotFoundError(key) if r.missing else OSError(r.error))
+    pf = pq.ParquetFile(r.value, pre_buffer=True)
     md = pf.schema_arrow.metadata or {}
     grid = {"nrows": int(md[b"nrows"]), "ncols": int(md[b"ncols"]),
             "xll": float(md[b"xllcorner"]), "yll": float(md[b"yllcorner"]),
@@ -163,37 +171,39 @@ def entry_times(e: dict) -> list[datetime]:
 
 # ---- the index (CONUS manifest) ----------------------------------------------
 def load_index(force: bool = False) -> dict:
-    """{key: entry} from the fleet repo ({} when it does not exist yet)."""
-    global _index
-    now = time.time()
-    with _lock:
-        if _index and not force and now - _index[0] < TTL_S:
-            return _index[1]
-    try:
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, INDEX_FILE, repo_type="dataset", token=_token(),
-                            force_download=force)
-        with open(p, encoding="utf-8") as fh:
-            idx = json.load(fh).get("bundles", {})
-    except Exception:
-        idx = {}
-    with _lock:
-        _index = (now, idx)
-    return idx
+    """{key: entry} from the fleet repo ({} when it does not exist yet, or
+    was never readable; the last good index while the Hub is unreachable)."""
+    r = _index_cache().get(force=force)
+    return r.value if r.ok else {}
+
+
+def _index_cache() -> hubdata.Cached:
+    return _cached("index", lambda ds: ds.read(INDEX_FILE, _load_bundles, fresh=True))
+
+
+def _load_bundles(local: str) -> dict:
+    with open(local, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise TypeError("index is not an object")
+    return data.get("bundles", {})
 
 
 def refresh_index(workers: int = 8, upload: bool = True, log=print) -> dict:
     """Bring the index up to the fleet's current content: read the footer of
-    every bundle that is new or was re-uploaded since it was indexed."""
+    every bundle that is new or was re-uploaded since it was indexed. Raises
+    RuntimeError when the fleet or its index cannot be read, or the new
+    index does not land."""
     from concurrent.futures import ThreadPoolExecutor
-    from huggingface_hub import HfApi
-    api = HfApi(token=_token())
-    info = api.dataset_info(REPO, files_metadata=True)
-    blobs = {s.rfilename[len("states/"):-len(".pqf")]: (s.blob_id, s.size)
-             for s in info.siblings
-             if s.rfilename.startswith("states/") and s.rfilename.endswith(".pqf")
-             and not s.rfilename.startswith("states/V")}
-    idx = dict(load_index(force=True))
+    info = DATASET.file_info("states/")
+    if not info.ok:
+        raise RuntimeError(f"fleet file list: {info.error}")
+    blobs = {f[len("states/"):-len(".pqf")]: v for f, v in info.value.items()
+             if f.endswith(".pqf") and not f.startswith("states/V")}
+    cur = _index_cache().get(force=True)       # stale is fine: entries carry their oid
+    if not (cur.ok or cur.missing):            # never rebuild from scratch on a bad read
+        raise RuntimeError(f"mosaic index unreadable: {cur.error}")
+    idx = dict(cur.value) if cur.ok else {}
     for k in [k for k in idx if k not in blobs]:
         del idx[k]                                   # bundle left the fleet
     todo = [k for k, (oid, _) in blobs.items() if idx.get(k, {}).get("oid") != oid]
@@ -224,12 +234,10 @@ def refresh_index(workers: int = 8, upload: bool = True, log=print) -> dict:
     if upload and todo:
         body = json.dumps({"updated": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
                            "cell": CELL, "bundles": idx}).encode()
-        api.upload_file(path_or_fileobj=body, path_in_repo=INDEX_FILE, repo_id=REPO,
-                        repo_type="dataset",
-                        commit_message=f"mosaic index: {len(idx)} bundles")
-    global _index
-    with _lock:
-        _index = (time.time(), idx)
+        res = DATASET.commit([Put(INDEX_FILE, body)], f"mosaic index: {len(idx)} bundles")
+        if not res:
+            raise RuntimeError(f"mosaic index upload: {res.error}")
+    _index_cache().put(idx)
     return idx
 
 
@@ -242,7 +250,7 @@ def maybe_refresh(min_age_h: float = 24.0) -> None:
     most every min_age_h. Called from the event runner's hourly tick — ONE
     Space writes the index, so there is never a second writer to collide with."""
     global _last_check
-    if time.time() - _last_check < min_age_h * 3600 or not _token():
+    if time.time() - _last_check < min_age_h * 3600 or not DATASET.can_write:
         return
     _last_check = time.time()
 
@@ -251,15 +259,14 @@ def maybe_refresh(min_age_h: float = 24.0) -> None:
             return
         try:
             age = float("inf")
+            r = DATASET.read_json(INDEX_FILE, kind=dict, fresh=True)
+            if r.unreachable:
+                return                         # no answer: try at the next check
             try:
-                from huggingface_hub import hf_hub_download
-                p = hf_hub_download(REPO, INDEX_FILE, repo_type="dataset",
-                                    token=_token(), force_download=True)
-                with open(p, encoding="utf-8") as fh:
-                    upd = json.load(fh).get("updated", "")
                 age = (datetime.utcnow() - datetime.strptime(
-                    upd, "%Y-%m-%d %H:%M UTC")).total_seconds() / 3600.0
-            except Exception:
+                    r.value.get("updated", ""), "%Y-%m-%d %H:%M UTC")
+                       ).total_seconds() / 3600.0
+            except (AttributeError, ValueError):
                 pass
             if age >= min_age_h:
                 refresh_index(workers=4, log=lambda m: None)
