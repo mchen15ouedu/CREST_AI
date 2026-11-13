@@ -27,6 +27,8 @@ import time
 
 import numpy as np
 
+from hf_data.atomicfile import atomic_path
+
 MIN_COVER = float(os.environ.get("CREST_MOSAIC_MIN_COVER", "0.90"))
 PARTIAL_COVER = float(os.environ.get("CREST_STATE_PARTIAL_COVER", "0.50"))
 PARTIAL_GAP_DAYS = float(os.environ.get("CREST_STATE_PARTIAL_GAP_DAYS", "30"))
@@ -136,17 +138,13 @@ def _replace(src: str, dst: str, tries: int = 5) -> bool:
             return True
         except OSError:
             pass
-        tmp = f"{dst}.{os.getpid()}.tmp"
         try:                          # other filesystem: copy beside, then rename
-            shutil.copy2(src, tmp)
-            os.replace(tmp, dst)
+            with atomic_path(dst) as tmp:
+                shutil.copy2(src, tmp)
             os.remove(src)
             return True
         except OSError:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            pass
         time.sleep(0.5 * (i + 1))    # Windows: a reader holds dst open
     return False
 

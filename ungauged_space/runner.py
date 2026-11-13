@@ -32,15 +32,12 @@ Space variables (Settings -> Variables):
   UNGAUGED_LIMIT     cap points (0 = all) — for smoke tests
 Secret: HF_TOKEN (write access — uploads to CREST_data and CREST_fleet).
 """
-import http.server
-import json
 import multiprocessing
 import os
 import shutil
-import threading
+import subprocess
+import sys
 import time
-import urllib.parse
-import urllib.request
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -49,13 +46,9 @@ CACHE = "/tmp/crest_cache"
 LOG = "/tmp/ungauged.log"
 REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")   # nowcast parquet + no-upstream list
 CONUS = (-125.5, 24.0, -66.5, 50.0)          # (w, s, e, n)
-started = time.time()
+CREST_AI_GIT = "https://github.com/mchen15ouedu/CREST_AI.git"
 state = {"phase": "booting", "passes": 0, "t0": None, "ok": 0, "fail": 0,
          "uploaded": 0, "last_min": 0.0}
-
-PEERS = [u.strip() for u in os.environ.get("UNGAUGED_PEERS", "").split(",") if u.strip()]
-SELF_HOST = (os.environ.get("SPACE_ID", "").replace("/", "-").replace("_", "-")
-             .lower() + ".hf.space")
 
 
 def _log(msg: str):
@@ -65,28 +58,13 @@ def _log(msg: str):
     print(line, flush=True)
 
 
-def keepalive_loop():
-    while True:
-        for u in PEERS:
-            if urllib.parse.urlparse(u).hostname == SELF_HOST:
-                continue
-            try:
-                urllib.request.urlopen(u, timeout=20).read(100)
-            except Exception:
-                pass
-        time.sleep(1200)
-
-
-def sh(cmd):
-    import subprocess
-    subprocess.run(cmd, shell=True, check=True)
-
-
-def boot_sources():
+def clone_sources():
+    """The one boot step that precedes the shared runtime: the Dockerfile
+    copies only this file, so hf_data/spaceruntime.py (boot, keep-awake,
+    status page, child env) exists only after this clone."""
     shutil.rmtree(SRC, ignore_errors=True)
-    sh(f"git clone --depth 1 https://github.com/mchen15ouedu/CREST_AI.git {SRC}")
-    if not os.path.exists(os.path.join(SRC, "EF5")):
-        os.symlink("/EF5", os.path.join(SRC, "EF5"))
+    subprocess.run(["git", "clone", "--depth", "1", CREST_AI_GIT, SRC], check=True)
+    sys.path.insert(0, SRC)
 
 
 # --------------------------------------------------------------------------- #
@@ -454,13 +432,10 @@ def warm_loop():
         state["phase"] = "NO HF_TOKEN — add the secret in Space settings"
         _log(state["phase"])
         return
-    os.environ.update(CREST_DEMO_MOCK="0", CREST_CACHE_DIR=CACHE,
-                      HF_HOME=os.path.join(CACHE, "hub"),
-                      GDAL_HTTP_MAX_RETRY="5", GDAL_HTTP_RETRY_DELAY="2",
-                      PYTHONUNBUFFERED="1")
+    from hf_data import spaceruntime as rt
+    # the passes run in this process (and in spawned workers, which inherit it)
+    os.environ.update(rt.child_env(CACHE))
     os.chdir(SRC)                              # EF5 runs relative to ./EF5/bin/ef5
-    import sys
-    sys.path.insert(0, SRC)
     _seed_uploaded_keys()                       # so we don't re-upload what's already there
     _seed_ineligible()                          # skip known headwaters from the start
     _seed_carry()                               # restart must not shrink served coverage
@@ -485,33 +460,18 @@ def warm_loop():
 # --------------------------------------------------------------------------- #
 # status page
 # --------------------------------------------------------------------------- #
-class Status(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        try:
-            with open(LOG) as f:
-                tail = f.readlines()[-60:]
-        except OSError:
-            tail = ["(no log yet)\n"]
-        du = shutil.disk_usage("/tmp")
-        body = (f"CREST_ungauged (keep-warm) — {state['phase']}\n"
-                f"up {(time.time() - started) / 3600:.1f} h | pass {state['passes']} "
-                f"@ t0={state['t0']} | {state['ok']} ok, {state['fail']} fail, "
-                f"{state['uploaded']} checkpoints | last pass {state['last_min']} min | "
-                f"disk /tmp {du.used / 1e9:.0f}/{du.total / 1e9:.0f} GB\n"
-                + "=" * 72 + "\n" + "".join(tail))
-        data = body.encode("utf-8", "replace")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, *a):
-        pass
+def ungauged_summary():
+    return (f"pass {state['passes']} @ t0={state['t0']} | {state['ok']} ok, "
+            f"{state['fail']} fail, {state['uploaded']} checkpoints | "
+            f"last pass {state['last_min']} min")
 
 
 if __name__ == "__main__":
-    boot_sources()
-    threading.Thread(target=warm_loop, daemon=True).start()
-    threading.Thread(target=keepalive_loop, daemon=True).start()
-    http.server.ThreadingHTTPServer(("0.0.0.0", 7860), Status).serve_forever()
+    clone_sources()
+    from hf_data import spaceruntime as rt
+    rt.boot_sources(SRC)
+    rt.start_thread(warm_loop)
+    rt.KeepAwake(rt.peers_from_env("UNGAUGED_PEERS"),
+                 state=state, first_delay_s=60).start()
+    rt.serve_status("CREST_ungauged (keep-warm)", state, log_path=LOG, tail=60,
+                    summary=ungauged_summary, rule=72)
