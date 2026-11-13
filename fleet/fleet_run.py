@@ -212,70 +212,49 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
     from hf_data import basinextent
     t_start = time.time()
     last_status = ""
-    rows_model = state_model = None
-    lakes_prov = None
     try:
-        ext = basinextent.ef5_extent(gid)
         # M3: one cut set for the whole period, so no chunk re-keys the record
         cuts = pipeline.plan_cut_set(gid, t0, t1)
     except basinextent.BasinExtentError as e:
-        return {"gauge": gid, "ok": False, "rc": -2, "no_basin": True,
+        return {"gauge": gid, "ok": False, "outcome": "no_basin",
                 "last": str(e)[-300:]}
+    res = None
     cur = t0
     while cur < t1:
         ce = min(cur + timedelta(days=chunk_days), t1)
-        rc = None
+        res = None
         for kind, payload in pipeline.run_gauge(gid, cur, ce, use_mock=False,
                                                 grids=False, scheme="speed",
                                                 cut_ids=cuts):
             if kind == "status":
                 last_status = payload
-            elif kind == "params":
-                rows_model = payload.get("cache_model") or rows_model
-                state_model = payload.get("state_model") or state_model
-                lakes_prov = payload.get("lakes") or lakes_prov
             elif kind == "done":
-                rc = payload.get("returncode")
-        if rc != 0:
+                res = payload
+        if res is None or not res.ok:
             return {"gauge": gid, "ok": False, "at": cur.strftime("%Y-%m-%d"),
-                    "rc": rc, "last": last_status[-300:]}
+                    "outcome": res.outcome.value if res else "failed",
+                    "last": ((res and res.reason) or last_status)[-300:]}
         cur = ce
 
-    # the run resolved model/scheme itself and reported its keys: rows under
-    # model+scheme(+parameter tag), state grids under model+scheme
-    if rows_model:
-        rec_path = statecache.results_path(gid, rows_model)
-        recs = [rec_path] if os.path.exists(rec_path) else []
-    else:
-        recs = sorted(glob.glob(os.path.join(statecache.CACHE_DIR, "results",
-                                             f"{str(gid).zfill(8)}_*.json")),
-                      key=os.path.getmtime)
-    if not recs:
-        return {"gauge": gid, "ok": False, "rc": -1, "last": "no result record"}
-    rec_path = recs[-1]
-    key = os.path.splitext(os.path.basename(rec_path))[0]
-    skey = f"{str(gid).zfill(8)}_{state_model}" if state_model else key
-
-    sdir = statecache.state_dir(gid, skey.split("_", 1)[1])
-    # provenance: which basin outline (and table version) these rows were
-    # simulated on - box-era records lack it
-    try:
-        rec = json.load(open(rec_path))
-        rec["extent"] = basinextent.provenance(ext)
-        rec["cut_ids"] = cuts
-        rec["lakes"] = lakes_prov                      # lake set (None: lake module off)
-        with open(rec_path, "w") as fh:
-            json.dump(rec, fh)
-    except (OSError, ValueError):
-        pass
+    # the run reports its own record and state folder: rows under
+    # model+scheme(+parameter tag), state grids under model+scheme; the
+    # pipeline already stamped the record's provenance (extent, cut_ids, lakes)
+    rec_path = res.record_path if res else None
+    if not rec_path or not os.path.exists(rec_path):
+        return {"gauge": gid, "ok": False, "outcome": "failed", "last": "no result record"}
+    key, skey = res.record_key, res.state_key
+    with open(rec_path) as fh:
+        rec = json.load(fh)
+    n_states = len(rec.get("state_times", []))
+    n_rows = len(rec.get("rows", []))
     pre = _prefix(gid)
     # bundle to a temp FILE: streamed pack, and the compressed bundle of a big
     # basin is never held in RAM (statebundle.pack_dir)
     fd, bpath = tempfile.mkstemp(prefix=f"fleet_{skey}_", suffix=".pqf")
     os.close(fd)
     try:
-        if statebundle.pack_dir(sdir, out_path=bpath) is None:
-            return {"gauge": gid, "ok": False, "rc": -1, "last": "no state grids"}
+        if statebundle.pack_dir(res.state_dir, out_path=bpath) is None:
+            return {"gauge": gid, "ok": False, "outcome": "failed", "last": "no state grids"}
         mb = os.path.getsize(bpath) / 1e6
         api = HfApi(token=os.environ["HF_TOKEN"])
         api.create_commit(repo_id=FLEET_REPO, repo_type="dataset",
@@ -288,8 +267,6 @@ def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dic
             os.remove(bpath)
         except OSError:
             pass
-    n_states = len(json.load(open(rec_path)).get("state_times", []))
-    n_rows = len(json.load(open(rec_path)).get("rows", []))
 
     # bound local disk: everything just uploaded is re-fetchable
     shutil.rmtree(os.path.join(statecache.CACHE_DIR, "states", str(gid).zfill(8)),
@@ -408,7 +385,7 @@ def main():
             try:
                 r = fu.result()
             except Exception as e:
-                r = {"gauge": futs[fu], "ok": False, "rc": -1,
+                r = {"gauge": futs[fu], "ok": False, "outcome": "failed",
                      "last": f"{type(e).__name__}: {e}"}
             r["when"] = datetime.now().strftime("%Y-%m-%d %H:%M")
             prog.write(json.dumps(r) + "\n")

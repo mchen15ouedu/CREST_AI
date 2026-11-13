@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 
 import numpy as np
 import pytest
@@ -70,3 +71,28 @@ def table(tmp_path, monkeypatch):
     monkeypatch.setattr(basinextent, "_CAP_ENV", "")
     yield basinextent
     basinextent._tbl = None
+
+
+@pytest.fixture
+def offline(table, tmp_path, monkeypatch):
+    """run_gauge on the synthetic basin table with every remote read stubbed."""
+    from hf_data import (basic, basinextent, multipliers, neighbors, params,
+                         paramstore, pipeline, runstates, statecache)
+    from hf_data import snow as snow_mod
+    monkeypatch.setattr(statecache, "CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(pipeline, "gauge_info", lambda gid: {
+        "id": str(gid).zfill(8), "name": "Test Creek", "lat": 41.2, "lon": -90.5,
+        "area": 448.6})
+    monkeypatch.setattr(basic, "clip_basic_data",
+                        lambda bbox, d, **k: types.SimpleNamespace(derived=False))
+    monkeypatch.setattr(basinextent, "carve", lambda d, ext, gid: {"mask": None})
+    monkeypatch.setattr(neighbors, "upstream_gauges", lambda *a, **k: [])
+    monkeypatch.setattr(runstates, "nodes_of", lambda *a, **k: (None, None))
+    monkeypatch.setattr(paramstore, "get", lambda *a, **k: None)
+    monkeypatch.setattr(multipliers, "to_control_params",
+                        lambda gid, model=None: ({"wm": 1.0}, {"alpha": 1.0}))
+    monkeypatch.setattr(snow_mod, "detect_snow",
+                        lambda *a, **k: {"snow": False, "reason": "test"})
+    monkeypatch.setattr(params, "clip_param_grids", lambda *a, **k: {})
+    monkeypatch.setattr(pipeline, "build_control", lambda spec: None)
+    return pipeline
