@@ -43,7 +43,7 @@ import truststore
 truststore.inject_into_ssl()
 import urllib.request
 
-from hf_data.forcing import TEMP_GRID, VARS, _write_pqf, check_temp_units  # noqa: E402
+from hf_data.forcing_archive import TEMP_GRID, VARS, kelvin_to_degc, store_bytes  # noqa: E402
 
 HF_REPO = "vincewin/CREST_data"
 PSL_URLS = ("https://psl.noaa.gov/thredds/fileServer/Datasets/NARR/monolevel/air.2m.{year}.nc",
@@ -175,7 +175,7 @@ class NarrYear:
         idx = self.hours.get(when)
         if idx is None:
             return None
-        a = np.ma.filled(self.air[idx, :, :].astype("float64"), np.nan) - 273.15
+        a = kelvin_to_degc(np.ma.filled(self.air[idx, :, :].astype("float64"), np.nan))
         if not np.isfinite(a).any():
             return None                # empty record: no data, not a nodata grid
         i0 = np.clip(np.floor(self.fi).astype(int), 0, a.shape[0] - 2)
@@ -249,11 +249,10 @@ def update_month(year: int, month: int, years: dict[int, NarrYear], api,
         v = hourly_field(years, t)
         if v is None:
             continue
-        # never upload a non-°C member (raises; the month is skipped, nothing committed)
-        check_temp_units(v, TEMP_GRID[5], t.strftime(cfg.out_fmt), convert=False)
-        buf = os.path.join(tempfile.gettempdir(), "narr_member.pqf")
-        _write_pqf(buf, v, xll, yll, cell, TEMP_GRID[5])
-        new.append((t.strftime(cfg.out_fmt), open(buf, "rb").read()))
+        # the archive refuses a non-°C member (raises; the month is skipped,
+        # nothing committed)
+        name = t.strftime(cfg.out_fmt)
+        new.append((name, store_bytes("temp", v, xll, yll, cell, TEMP_GRID[5], name=name)))
     if not new:
         src_end = max((max(ny.hours) for ny in years.values() if ny.hours),
                       default=None)
