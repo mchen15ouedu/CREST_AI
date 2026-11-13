@@ -30,6 +30,11 @@ import threading
 
 import numpy as np
 
+try:
+    from .atomicfile import atomic_path
+except ImportError:                                  # standalone use
+    from atomicfile import atomic_path
+
 RELEASE = os.environ.get("WORLDPOP_RELEASE", "R2025A")
 YEAR_MIN, YEAR_MAX = 2026, 2030
 # display buckets -> WorldPop age codes (00 = <1 yr, 01 = 1-4, then 5-yr)
@@ -95,11 +100,9 @@ def _read_window(url: str, bbox, res: str):
             r = requests.get(url, timeout=600, stream=True,
                              headers={"User-Agent": "CREST-AI/1.0"})
             r.raise_for_status()
-            tmp = local + ".part"
-            with open(tmp, "wb") as fh:
+            with atomic_path(local) as tmp, open(tmp, "wb") as fh:
                 for chunk in r.iter_content(1 << 20):
                     fh.write(chunk)
-            os.replace(tmp, local)
         src = local
     with _gdal_env():
         with rasterio.open(src) as ds:
@@ -170,10 +173,9 @@ def build_window(event_id: str, bbox, log=print) -> str:
                 acc = a if acc is None else acc + a
             out[f"{sex}_{label}"] = acc
     os.makedirs(RV_DIR, exist_ok=True)
-    tmp = path + ".part.npz"
-    np.savez_compressed(tmp, transform=np.array(
-        [tr.a, tr.b, tr.c, tr.d, tr.e, tr.f]), res=res, year=year, **out)
-    os.replace(tmp, path)
+    with atomic_path(path) as tmp, open(tmp, "wb") as fh:   # file object: no ".npz" appended
+        np.savez_compressed(fh, transform=np.array(
+            [tr.a, tr.b, tr.c, tr.d, tr.e, tr.f]), res=res, year=year, **out)
     log(f"worldpop: {event_id} cached ({res})")
     return path
 
