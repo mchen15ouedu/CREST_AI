@@ -176,6 +176,22 @@ class HubAdapter:
         except Exception as e:
             raise Unreachable(f"{type(e).__name__}: {e}") from e
 
+    def file_info(self, repo: str) -> dict:
+        try:
+            info = self._api().dataset_info(repo, files_metadata=True)
+        except Exception as e:
+            raise Unreachable(f"{type(e).__name__}: {e}") from e
+        return {s.rfilename: (s.blob_id, s.size) for s in info.siblings}
+
+    def open(self, repo: str, path: str):
+        from huggingface_hub import HfFileSystem
+        try:
+            return HfFileSystem(token=token()).open(
+                f"datasets/{repo}/{path}", "rb", block_size=1 << 20,
+                cache_type="readahead")
+        except FileNotFoundError as e:
+            raise NotFound(path) from e
+
     def commit(self, repo: str, ops: list, message: str) -> None:
         import io
         from huggingface_hub import CommitOperationAdd, CommitOperationDelete
@@ -213,6 +229,18 @@ class MemoryHub:
     def exists(self, repo: str, path: str) -> bool:
         self._check()
         return path in self.files
+
+    def file_info(self, repo: str) -> dict:
+        import hashlib
+        self._check()
+        return {k: (hashlib.sha1(v).hexdigest(), len(v)) for k, v in self.files.items()}
+
+    def open(self, repo: str, path: str):
+        import io
+        self._check()
+        if path not in self.files:
+            raise NotFound(path)
+        return io.BytesIO(self.files[path])
 
     def commit(self, repo: str, ops: list, message: str) -> None:
         self._check()
@@ -355,6 +383,26 @@ class Dataset:
         except Exception as e:
             return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
 
+    def file_info(self, prefix: str = "") -> Read:
+        """{path: (blob id, size)} of the files under `prefix` — the blob id
+        changes whenever the file is re-uploaded."""
+        try:
+            info = self.adapter.file_info(self.repo)
+        except Exception as e:
+            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+        return Read(DATA, {k: v for k, v in info.items() if k.startswith(prefix)})
+
+    def open(self, path: str) -> Read:
+        """A binary file object over the remote file, read by range requests
+        (for parquet footers and column chunks of big files) — value = the
+        file object; the caller closes it."""
+        try:
+            return Read(DATA, self.adapter.open(self.repo, path))
+        except NotFound:
+            return Read(MISSING)
+        except Exception as e:
+            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+
     def list_files(self, prefix: str = "") -> Read:
         """Sorted repo paths starting with `prefix` (DATA or UNREACHABLE)."""
         try:
@@ -424,6 +472,11 @@ class Cached:
                     r = Read(DATA, self._serve.value, stale=True)
                 self._serve, self._next = r, now + self.retry_s
             return r
+
+    def put(self, value) -> None:
+        """Serve `value` (just written by this process) until the TTL runs out."""
+        with self._lock:
+            self._serve, self._next = Read(DATA, value), self.clock() + self.ttl_s
 
 
 class CommitBatch:
