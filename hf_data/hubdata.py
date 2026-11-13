@@ -106,6 +106,15 @@ def feedback_repo() -> str:
     return os.environ.get("CREST_FEEDBACK_REPO") or data_repo()
 
 
+DEFAULT_FLEET_REPO = "vincewin/CREST_fleet"
+
+
+def fleet_repo() -> str:
+    """The fleet's precomputed runs (private; separate from CREST_state, whose
+    janitor mirrors local deletions)."""
+    return os.environ.get("CREST_FLEET_REPO", DEFAULT_FLEET_REPO)
+
+
 def token() -> str | None:
     """The Hub token, or None (read-only, anonymous)."""
     return os.environ.get("HF_TOKEN") or None
@@ -153,6 +162,12 @@ class HubAdapter:
         except Exception as e:
             raise Unreachable(f"{type(e).__name__}: {e}") from e
 
+    def exists(self, repo: str, path: str) -> bool:
+        try:
+            return bool(self._api().get_paths_info(repo, [path], repo_type="dataset"))
+        except Exception as e:
+            raise Unreachable(f"{type(e).__name__}: {e}") from e
+
     def commit(self, repo: str, ops: list, message: str) -> None:
         import io
         from huggingface_hub import CommitOperationAdd, CommitOperationDelete
@@ -186,6 +201,10 @@ class MemoryHub:
     def list_files(self, repo: str) -> list[str]:
         self._check()
         return sorted(self.files)
+
+    def exists(self, repo: str, path: str) -> bool:
+        self._check()
+        return path in self.files
 
     def commit(self, repo: str, ops: list, message: str) -> None:
         self._check()
@@ -320,6 +339,14 @@ class Dataset:
         return cached(lambda: self.read(path, load, fresh=fresh), ttl_s,
                       retry_s=retry_s, clock=clock)
 
+    def exists(self, path: str) -> Read:
+        """Whether `path` is in the repo, without downloading it (value =
+        bool; UNREACHABLE when the Hub gave no answer)."""
+        try:
+            return Read(DATA, bool(self.adapter.exists(self.repo, path)))
+        except Exception as e:
+            return Read(UNREACHABLE, error=f"{type(e).__name__}: {e}")
+
     def list_files(self, prefix: str = "") -> Read:
         """Sorted repo paths starting with `prefix` (DATA or UNREACHABLE)."""
         try:
@@ -440,3 +467,8 @@ def data() -> Dataset:
 def feedback() -> Dataset:
     """The feedback dataset repo on the real Hub."""
     return Dataset(feedback_repo())
+
+
+def fleet() -> Dataset:
+    """The fleet dataset repo on the real Hub."""
+    return Dataset(fleet_repo())
