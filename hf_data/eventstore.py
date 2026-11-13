@@ -21,14 +21,20 @@ Storage discipline (HF limits):
 from __future__ import annotations
 
 import datetime
-import io
 import json
 import os
 import re
 import threading
 import time
 
-REPO = os.environ.get("CREST_DATA_REPO", "vincewin/CREST_data")
+from . import hubdata
+from .hubdata import Delete, Put
+
+# Every Hub read, listing and commit goes through this Dataset (tests swap in
+# one over hubdata.MemoryHub). REPO stays for modules that still build Hub
+# paths from it (eventqueue, eventsim, riskprobe, server: ticket 06).
+DATASET = hubdata.data()
+REPO = DATASET.repo
 PREFIX = "events"
 # tiered retention: newest KEEP_FULL events keep their full frame stacks;
 # older ones are demoted to manifest + maxdepth (tif+png) only; beyond
@@ -65,7 +71,7 @@ LIST_MONTHLY = os.environ.get("EVENT_LIST_MONTHLY", "0") == "1"
 # whatever the count cap or age. They also don't count toward KEEP_EVENTS.
 PINNED_FILE = f"{PREFIX}/pinned.json"
 PINNED_TTL_S = float(os.environ.get("EVENT_PINNED_TTL_S", "600"))
-_pin_cache = {"t": 0.0, "ids": frozenset(), "ok": False}
+_pin_cache: dict = {}
 # when an event rolls OFF the list (count cap or MAX_AGE_D age), we clear only
 # its ANIMATION files and KEEP the simulation results (manifest + max-depth map
 # + final product + DEM) in the store — a monthly animation cleanup that leaves
@@ -82,9 +88,8 @@ _FRAME_RE = re.compile(r"^depth_\d+\.(?:png|tif)$")
 def _anim_delete_ops(allfiles, ev):
     """Delete ops for just the animation files of event `ev` (keeps manifest,
     maxdepth.*, final.json, dem.tif, domain.geojson)."""
-    from huggingface_hub import CommitOperationDelete
     pre = f"{PREFIX}/{ev}/"
-    return [CommitOperationDelete(f) for f in allfiles
+    return [Delete(f) for f in allfiles
             if f.startswith(pre) and _ANIM_RE.match(os.path.basename(f))]
 
 _lock = threading.Lock()
@@ -122,27 +127,28 @@ def pinned_ids(force: bool = False) -> frozenset:
     {"ids": [...], "note": ...}). Cached PINNED_TTL_S. If the file can't be
     READ (network), the last known set is kept — a transient error must never
     unprotect a demo event; only a successful read of a missing file empties it."""
-    now = time.time()
-    if not force and now - _pin_cache["t"] < PINNED_TTL_S:
-        return _pin_cache["ids"] if _pin_cache["ok"] else None
-    try:
-        from huggingface_hub import hf_hub_download
-        from huggingface_hub.utils import EntryNotFoundError
-        try:
-            p = hf_hub_download(REPO, PINNED_FILE, repo_type="dataset",
-                                token=os.environ.get("HF_TOKEN"), force_download=True)
-            with open(p, encoding="utf-8") as fp:
-                data = json.load(fp)
-            raw = data.get("ids") if isinstance(data, dict) else data
-            if isinstance(raw, str):
-                raw = [raw]
-            ids = frozenset(str(x) for x in (raw or []))
-        except EntryNotFoundError:
-            ids = frozenset()
-        _pin_cache.update(t=now, ids=ids, ok=True)
-    except Exception:
-        _pin_cache["t"] = now - PINNED_TTL_S + 60      # retry in a minute
-    return _pin_cache["ids"] if _pin_cache["ok"] else None
+    r = _pins().get(force=force)
+    if r.missing:
+        return frozenset()
+    return r.value if r.ok else None
+
+
+def _load_pins(local: str) -> frozenset:
+    with open(local, encoding="utf-8") as fp:
+        data = json.load(fp)
+    raw = data.get("ids") if isinstance(data, dict) else data
+    if isinstance(raw, str):
+        raw = [raw]
+    return frozenset(str(x) for x in (raw or []))
+
+
+def _pins():
+    """The pinned.json cache of the current DATASET (rebuilt if it changed)."""
+    if _pin_cache.get("ds") is not DATASET:
+        _pin_cache.update(ds=DATASET, c=DATASET.cached(
+            PINNED_FILE, ttl_s=PINNED_TTL_S, retry_s=60, load=_load_pins,
+            fresh=True))
+    return _pin_cache["c"]
 
 
 def _aged_out(idx: dict, keep: str | None = None) -> list[str]:
@@ -170,38 +176,41 @@ def _serviceable(frames: list, local: set, stored: set) -> list:
 
 
 def _api():
-    from huggingface_hub import HfApi
-    tok = os.environ.get("HF_TOKEN")
-    return HfApi(token=tok) if tok else None
+    """Legacy HfApi handle for eventqueue, which still talks to the Hub
+    directly (ticket 06); the event store itself commits through DATASET."""
+    return hubdata.hf_api()
+
+
+INDEX_FILE = f"{PREFIX}/index.json"
+
+
+def _read_index() -> hubdata.Read:
+    """The index as a Read: writers must not mistake an outage for an empty
+    list (they would commit an index holding only their own change)."""
+    r = DATASET.read_json(INDEX_FILE, kind=dict)
+    return hubdata.Read(hubdata.DATA, {}) if r.missing else r
 
 
 def load_index() -> dict:
     """{event_id: summary} newest-first insertion order; {} on any failure."""
-    try:
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, f"{PREFIX}/index.json", repo_type="dataset",
-                            token=os.environ.get("HF_TOKEN"))
-        with open(p, encoding="utf-8") as fp:
-            return json.load(fp)
-    except Exception:
-        return {}
+    r = _read_index()
+    return r.value if r.ok else {}
 
 
 MISSED_FILE = f"{PREFIX}/missed.json"
 MISSED_KEEP = 200
 
 
+def _read_missed() -> hubdata.Read:
+    r = DATASET.read_json(MISSED_FILE, kind=list)
+    return hubdata.Read(hubdata.DATA, []) if r.missing else r
+
+
 def load_missed() -> list:
     """Recorded CREST misses (newest last): events the trigger opened but
     EF5 did not reproduce, so no map was published. [] on any failure."""
-    try:
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, MISSED_FILE, repo_type="dataset",
-                            token=os.environ.get("HF_TOKEN"))
-        with open(p, encoding="utf-8") as fp:
-            return json.load(fp)
-    except Exception:
-        return []
+    r = _read_missed()
+    return r.value if r.ok else []
 
 
 def note_missed(rec: dict) -> bool:
@@ -209,12 +218,13 @@ def note_missed(rec: dict) -> bool:
     check's numbers plus `checks` (every hourly check so far: at, t0, frac,
     sim/obs peaks), `n_checks` and `first_at` — the auto-calibration
     trigger reads 'missed every hour for the whole event' from that history."""
-    from huggingface_hub import CommitOperationAdd
-    api = _api()
-    if api is None:
+    if not DATASET.can_write:
         return False
     with _lock:
-        rows = load_missed()
+        got = _read_missed()
+        if not got.ok:                          # never [rec] over the whole log
+            return False
+        rows = got.value
         prev = next((r for r in rows if r.get("event") == rec.get("event")), None)
         rows = [r for r in rows if r.get("event") != rec.get("event")]
         checks = list((prev or {}).get("checks") or [])
@@ -227,17 +237,11 @@ def note_missed(rec: dict) -> bool:
                "first_at": (prev or {}).get("first_at") or rec.get("at")}
         rows.append(rec)
         rows = rows[-MISSED_KEEP:]
-        try:
-            api.create_commit(
-                repo_id=REPO, repo_type="dataset",
-                operations=[CommitOperationAdd(
-                    MISSED_FILE, io.BytesIO(json.dumps(rows).encode()))],
-                commit_message=f"CREST missed {rec.get('event')}: EF5 peak "
-                               f"{rec.get('sim_peak_m3s')} vs observed "
-                               f"{rec.get('obs_peak_m3s')} m3/s — no map")
-            return True
-        except Exception:
-            return False
+        return bool(DATASET.commit(
+            [Put(MISSED_FILE, rows)],
+            f"CREST missed {rec.get('event')}: EF5 peak "
+            f"{rec.get('sim_peak_m3s')} vs observed "
+            f"{rec.get('obs_peak_m3s')} m3/s — no map"))
 
 
 AUTOCAL_FILE = f"{PREFIX}/autocal.json"
@@ -252,26 +256,11 @@ AUTOCAL_DONE_FILE = f"{PREFIX}/autocal_done.json"
 def _load_hub_json(path: str, kind: type):
     """`path` from the dataset (fresh), or kind() when the file does not exist
     yet, or None when it could not be read (network, auth, corrupt JSON,
-    wrong type). Only a real 404 counts as missing: an offline
-    LocalEntryNotFoundError (a subclass of EntryNotFoundError) is an outage."""
-    try:
-        from huggingface_hub import hf_hub_download
-        from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
-    except Exception:
-        return None
-    try:
-        p = hf_hub_download(REPO, path, repo_type="dataset",
-                            token=os.environ.get("HF_TOKEN"),
-                            force_download=True)
-        with open(p, encoding="utf-8") as fp:
-            data = json.load(fp)
-    except LocalEntryNotFoundError:
-        return None
-    except EntryNotFoundError:
+    wrong type). Only a real 404 counts as missing (hubdata decides)."""
+    r = DATASET.read_json(path, kind=kind, fresh=True)
+    if r.missing:
         return kind()
-    except Exception:
-        return None
-    return data if isinstance(data, kind) else None
+    return r.value if r.ok else None
 
 
 def load_autocal() -> list | None:
@@ -311,9 +300,7 @@ def note_autocal(rec: dict) -> bool:
     commit. False, with nothing committed, when either file could not be read
     (never [rec] over the whole log) or the commit failed: the caller keeps
     the record and retries."""
-    from huggingface_hub import CommitOperationAdd
-    api = _api()
-    if api is None:
+    if not DATASET.can_write:
         return False
     with _lock:
         rows = load_autocal()
@@ -328,69 +315,52 @@ def note_autocal(rec: dict) -> bool:
                 for r in rows:
                     _ledger_add(ledger, r)
             _ledger_add(ledger, rec)
-            ops.append(CommitOperationAdd(
-                AUTOCAL_DONE_FILE, io.BytesIO(json.dumps(ledger).encode())))
+            ops.append(Put(AUTOCAL_DONE_FILE, ledger))
         rows.append(rec)
         rows = rows[-AUTOCAL_KEEP:]
-        ops.insert(0, CommitOperationAdd(
-            AUTOCAL_FILE, io.BytesIO(json.dumps(rows).encode())))
-        try:
-            api.create_commit(
-                repo_id=REPO, repo_type="dataset", operations=ops,
-                commit_message=f"autocal {rec.get('gauge') or rec.get('kind')}: "
-                               f"{'ran' if rec.get('ran') else 'skipped'} "
-                               f"({rec.get('reason') or 'NSE %s -> %s' % (rec.get('baseline_nse'), rec.get('best_nse'))})")
-            return True
-        except Exception:
-            return False
+        ops.insert(0, Put(AUTOCAL_FILE, rows))
+        return bool(DATASET.commit(
+            ops,
+            f"autocal {rec.get('gauge') or rec.get('kind')}: "
+            f"{'ran' if rec.get('ran') else 'skipped'} "
+            f"({rec.get('reason') or 'NSE %s -> %s' % (rec.get('baseline_nse'), rec.get('best_nse'))})"))
 
 
 def drop_events(event_ids, purge: bool = True, why: str = "") -> bool:
     """Remove events from the list (and, with purge, delete their result
     folders) — e.g. an episode whose map the CREST-miss guard disowned."""
-    from huggingface_hub import CommitOperationAdd, CommitOperationDelete
-    api = _api()
     pins = pinned_ids(force=True)
     if pins is None:
         return False
     ids = [e for e in event_ids if e and e not in pins]   # demo events stay
-    if api is None or not ids:
+    if not DATASET.can_write or not ids:
         return False
     with _lock:
-        idx = load_index()
+        got = _read_index()
+        if not got.ok:
+            return False
+        idx = got.value
         gone = [e for e in ids if e in idx]
         for e in gone:
             idx.pop(e, None)
         ops = []
         if gone:
-            ops.append(CommitOperationAdd(f"{PREFIX}/index.json",
-                                          io.BytesIO(json.dumps(idx).encode())))
+            ops.append(Put(INDEX_FILE, idx))
         if purge:
-            try:
-                allfiles = api.list_repo_files(REPO, repo_type="dataset")
-            except Exception:
-                allfiles = []
-            stored = {f.split("/")[1] for f in allfiles
-                      if f.startswith(f"{PREFIX}/") and f.count("/") >= 2}
-            ops += [CommitOperationDelete(f"{PREFIX}/{e}/", is_folder=True)
+            allfiles = DATASET.list_files(f"{PREFIX}/").value or []
+            stored = {f.split("/")[1] for f in allfiles if f.count("/") >= 2}
+            ops += [Delete(f"{PREFIX}/{e}/", folder=True)
                     for e in ids if e in stored]
         if not ops:
             return False
-        try:
-            api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
-                              commit_message=f"drop {len(ids)} event(s)"
-                                             f"{': ' + why if why else ''}")
-            return True
-        except Exception:
-            return False
+        return bool(DATASET.commit(ops, f"drop {len(ids)} event(s)"
+                                        f"{': ' + why if why else ''}"))
 
 
 def publish_event(local_dir: str, manifest: dict) -> bool:
     """Upload one finished event dir + updated index + prune old events,
     all in a single commit. Returns True on success."""
-    from huggingface_hub import CommitOperationAdd, CommitOperationDelete
-    api = _api()
-    if api is None:
+    if not DATASET.can_write:
         return False
     ev = manifest["event_id"]
     # V30 provenance: stamped HERE so it describes the machine that actually
@@ -408,7 +378,10 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
     except Exception:
         pass
     with _lock:
-        idx = load_index()
+        got = _read_index()
+        if not got.ok:                # an outage is not an empty list: retry later
+            return False
+        idx = got.value
         prior = idx.pop(ev, None)
         summary = {k: manifest.get(k) for k in
                    ("bbox", "t0", "sim_start", "t_end", "model", "trigger",
@@ -444,14 +417,18 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
             # starts at trigger-minus-backset and never slides (03190000's
             # crest was lost to the old replace-the-folder behavior).
             new_start = str(manifest.get("sim_start") or "")
-            stored = None                     # this event's files on the store
-            try:
-                allfiles = api.list_repo_files(REPO, repo_type="dataset")
-                stored = {os.path.basename(f) for f in allfiles
-                          if f.startswith(f"{PREFIX}/{ev}/")}
-            except Exception:
-                stored = None
-            pm = _prior_manifest(ev) if new_start else None
+            listing = DATASET.list_files(f"{PREFIX}/{ev}/")
+            stored = ({os.path.basename(f) for f in listing.value}
+                      if listing.ok else None)   # this event's files on the store
+            pm = None
+            if new_start:
+                got = DATASET.read_json(f"{PREFIX}/{ev}/manifest.json",
+                                        kind=dict, fresh=True)
+                if got.unreachable:
+                    # without the prior manifest the carried-forward frames
+                    # would be dropped from the episode record
+                    return False
+                pm = got.value
             carried = [f for f in (pm or {}).get("frames", [])
                        if f.get("t", "") < new_start]
             if carried:
@@ -480,8 +457,7 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
                         # the manifest still listed them (found 2026-09-11).
                         continue
                     if _FRAME_RE.match(base) and base not in referenced:
-                        ops.append(CommitOperationDelete(
-                            f"{PREFIX}/{ev}/{base}"))     # re-simulated span
+                        ops.append(Delete(f"{PREFIX}/{ev}/{base}"))  # re-simulated span
             summary["n_frames"] = len(manifest.get("frames") or [])
             with open(os.path.join(local_dir, "manifest.json"),
                       "w") as fp:
@@ -489,7 +465,7 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
         for fn in sorted(os.listdir(local_dir)):
             p = os.path.join(local_dir, fn)
             if os.path.isfile(p):
-                ops.append(CommitOperationAdd(f"{PREFIX}/{ev}/{fn}", p))
+                ops.append(Put(f"{PREFIX}/{ev}/{fn}", p))
         # demote events beyond KEEP_FULL (default = KEEP_EVENTS, so normally
         # none): strip the animation, keep the results, stay listed.
         demote = [] if pins is None else [
@@ -502,83 +478,55 @@ def publish_event(local_dir: str, manifest: dict) -> bool:
         purge = [d for d in drop if d not in strip]
         allfiles = []
         if demote or strip:
-            try:
-                allfiles = api.list_repo_files(REPO, repo_type="dataset")
-            except Exception:
-                allfiles, demote, strip = [], [], []   # leave folders for the sweep
+            listing = DATASET.list_files(f"{PREFIX}/")
+            if listing.ok:
+                allfiles = listing.value
+            else:
+                demote, strip = [], []          # leave folders for the sweep
         for d in demote:
             ops += _anim_delete_ops(allfiles, d)
             idx[d]["demoted"] = True
         for d in strip:
             ops += _anim_delete_ops(allfiles, d)        # keep results, drop anim
-        ops.append(CommitOperationAdd(
-            f"{PREFIX}/index.json",
-            io.BytesIO(json.dumps(idx).encode())))
+        ops.append(Put(INDEX_FILE, idx))
         for d in purge:
-            ops.append(CommitOperationDelete(f"{PREFIX}/{d}/", is_folder=True))
-        try:
-            api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
-                              commit_message=f"event {ev} "
-                                             f"(+{len(ops) - 1 - len(drop)} files, "
-                                             f"-{len(drop)} old)")
-            return True
-        except Exception:
-            return False
+            ops.append(Delete(f"{PREFIX}/{d}/", folder=True))
+        return bool(DATASET.commit(ops, f"event {ev} "
+                                        f"(+{len(ops) - 1 - len(drop)} files, "
+                                        f"-{len(drop)} old)"))
 
 
 def _prior_manifest(ev: str) -> dict | None:
-    """The event's currently-published manifest (None if never published)."""
-    try:
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, f"{PREFIX}/{ev}/manifest.json",
-                            repo_type="dataset",
-                            token=os.environ.get("HF_TOKEN"),
-                            force_download=True)
-        with open(p, encoding="utf-8") as fp:
-            return json.load(fp)
-    except Exception:
-        return None
+    """The event's currently-published manifest (None if never published or
+    unreadable)."""
+    return DATASET.read_json(f"{PREFIX}/{ev}/manifest.json", fresh=True).value
 
 
 def load_manifest(ev: str) -> dict | None:
     """A published event's manifest, HF-cached (re-downloaded only when it
     changed on the Hub) — for readers that scan many events, e.g. the
     autocal over-prediction trigger. None on any failure."""
-    try:
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, f"{PREFIX}/{ev}/manifest.json",
-                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
-        with open(p, encoding="utf-8") as fp:
-            return json.load(fp)
-    except Exception:
-        return None
+    return DATASET.read_json(f"{PREFIX}/{ev}/manifest.json").value
 
 
 def mark_ended(event_ids) -> bool:
     """Flip episodes to 'ended' in the index (single small commit). Their
     folders — including archive.parquet — stay until retention removes them."""
-    from huggingface_hub import CommitOperationAdd
-    api = _api()
-    if api is None:
+    if not DATASET.can_write:
         return False
     with _lock:
-        idx = load_index()
+        got = _read_index()
+        if not got.ok:
+            return False
+        idx = got.value
         changed = [e for e in event_ids
                    if e in idx and idx[e].get("status") != "ended"]
         if not changed:
             return True
         for e in changed:
             idx[e]["status"] = "ended"
-        try:
-            api.create_commit(
-                repo_id=REPO, repo_type="dataset",
-                operations=[CommitOperationAdd(
-                    f"{PREFIX}/index.json",
-                    io.BytesIO(json.dumps(idx).encode()))],
-                commit_message=f"episodes ended: {', '.join(changed)}")
-            return True
-        except Exception:
-            return False
+        return bool(DATASET.commit([Put(INDEX_FILE, idx)],
+                                   f"episodes ended: {', '.join(changed)}"))
 
 
 def _parse_hydro_t(t):
@@ -608,12 +556,9 @@ def finalize_episodes(event_ids, log=print) -> int:
     Idempotent: episodes already carrying "final" are skipped, so the
     hourly tick can re-call it to heal a lost index race (a worker publish
     that snapshotted the index mid-finalize). Returns episodes finalized."""
-    from huggingface_hub import CommitOperationAdd, hf_hub_download
     from . import eventscore
-    api = _api()
-    if api is None:
+    if not DATASET.can_write:
         return 0
-    tok = os.environ.get("HF_TOKEN")
     done = 0
     fin_by_ev = {}
     for ev in event_ids:
@@ -646,10 +591,10 @@ def finalize_episodes(event_ids, log=print) -> int:
         depth_stats = {}
         try:
             import rasterio
-            p = hf_hub_download(REPO, f"{PREFIX}/{ev}/maxdepth.tif",
-                                repo_type="dataset", token=tok,
-                                force_download=True)
-            with rasterio.open(p) as ds:
+            got = DATASET.local_path(f"{PREFIX}/{ev}/maxdepth.tif", fresh=True)
+            if not got.ok:
+                raise FileNotFoundError(f"maxdepth.tif {got.status}")
+            with rasterio.open(got.value) as ds:
                 md = ds.read(1).astype(float) / 100.0
             gr = man.get("grid") or {}
             cell_km2 = (gr.get("dx_m", 30.0) * gr.get("dy_m", 30.0)) / 1e6
@@ -709,28 +654,25 @@ def finalize_episodes(event_ids, log=print) -> int:
     if not fin_by_ev:
         return 0
     with _lock:
-        idx = load_index()
+        got = _read_index()
+        if not got.ok:
+            log("finalize: index unreadable, retrying next tick")
+            return 0
+        idx = got.value
         ops = []
-        # scorecard: the model's running track record, episodes only
-        card = {}
-        try:
-            p = hf_hub_download(REPO, f"{PREFIX}/scorecard.json",
-                                repo_type="dataset", token=tok,
-                                force_download=True)
-            with open(p, encoding="utf-8") as fp:
-                card = json.load(fp)
-        except Exception:
-            pass
+        # scorecard: the model's running track record, episodes only. An
+        # unreadable scorecard is left alone (rewriting it from {} would wipe
+        # every gauge's history); only a missing one starts fresh.
+        sc = DATASET.read_json(f"{PREFIX}/scorecard.json", kind=dict, fresh=True)
+        card = {} if sc.missing else sc.value
         for ev, d in fin_by_ev.items():
             if ev in idx:
                 idx[ev]["status"] = "ended"
                 idx[ev]["final"] = d["final"]
-            ops.append(CommitOperationAdd(
-                f"{PREFIX}/{ev}/final.json",
-                io.BytesIO(json.dumps(
-                    {"event_id": ev, **d["final"],
-                     "nowcast_verification": d["score"]}).encode())))
-            if d["gauge"] and d["score"]:
+            ops.append(Put(f"{PREFIX}/{ev}/final.json",
+                           {"event_id": ev, **d["final"],
+                            "nowcast_verification": d["score"]}))
+            if card is not None and d["gauge"] and d["score"]:
                 rows = [r for r in card.get(d["gauge"], [])
                         if r.get("event_id") != ev]
                 rows.append({"event_id": ev, **{k: d["score"].get(k) for k in
@@ -739,22 +681,18 @@ def finalize_episodes(event_ids, log=print) -> int:
                              "peak_ratio_h6": (d["score"]["leads"].get("6")
                                                or {}).get("peak_ratio")})
                 card[d["gauge"]] = rows[-20:]
-        if any(d["gauge"] and d["score"] for d in fin_by_ev.values()):
-            ops.append(CommitOperationAdd(
-                f"{PREFIX}/scorecard.json",
-                io.BytesIO(json.dumps(card).encode())))
-        ops.append(CommitOperationAdd(
-            f"{PREFIX}/index.json", io.BytesIO(json.dumps(idx).encode())))
-        try:
-            api.create_commit(repo_id=REPO, repo_type="dataset",
-                              operations=ops,
-                              commit_message="episode final products: "
-                                             + ", ".join(fin_by_ev))
-            log(f"finalized {done} episode(s): {', '.join(fin_by_ev)}")
-            return done
-        except Exception as e:
-            log(f"finalize commit failed ({type(e).__name__})")
+        if card is not None and any(d["gauge"] and d["score"]
+                                    for d in fin_by_ev.values()):
+            ops.append(Put(f"{PREFIX}/scorecard.json", card))
+        elif card is None:
+            log("finalize: scorecard unreadable, left unchanged")
+        ops.append(Put(INDEX_FILE, idx))
+        res = DATASET.commit(ops, "episode final products: " + ", ".join(fin_by_ev))
+        if not res:
+            log(f"finalize commit failed ({res.error})")
             return 0
+        log(f"finalized {done} episode(s): {', '.join(fin_by_ev)}")
+        return done
 
 
 def retention_sweep() -> int:
@@ -766,23 +704,20 @@ def retention_sweep() -> int:
     Runs even during quiet stretches so the list ages out with no new events;
     it is also what clears the animations of events that left the list without
     a subsequent publish_event to do it (the store keeps the result folder)."""
-    from huggingface_hub import CommitOperationAdd, CommitOperationDelete
-    api = _api()
-    if api is None:
+    if not DATASET.can_write:
         return 0
     pins = pinned_ids()
     if pins is None:
         return 0
     with _lock:
-        idx = load_index()
+        got = _read_index()
+        if not got.ok:
+            return 0
+        idx = got.value
         aged = _aged_out(idx)                       # leaving the list this pass
-        try:
-            allfiles = api.list_repo_files(REPO, repo_type="dataset")
-        except Exception:
-            allfiles = []
+        allfiles = DATASET.list_files(f"{PREFIX}/").value or []
         # event ids with a result folder in the store but no longer listed
-        stored = {f.split("/")[1] for f in allfiles
-                  if f.startswith(f"{PREFIX}/") and f.count("/") >= 2}
+        stored = {f.split("/")[1] for f in allfiles if f.count("/") >= 2}
         if not idx and stored:
             # an empty index next to stored results is a failed index read,
             # not "nothing listed" — sweeping now would strip every event's
@@ -799,7 +734,7 @@ def retention_sweep() -> int:
             stripped += bool(new)
         for e in orphans:                           # already off-list archives
             if (_age_days(e) or 0.0) > RESULTS_MAX_AGE_D:
-                ops.append(CommitOperationDelete(f"{PREFIX}/{e}/", is_folder=True))
+                ops.append(Delete(f"{PREFIX}/{e}/", folder=True))
                 purged += 1
             else:
                 extra = _anim_delete_ops(allfiles, e)   # clear any stray animation
@@ -807,16 +742,11 @@ def retention_sweep() -> int:
                 stripped += bool(extra)
         if not ops:
             return 0
-        ops.append(CommitOperationAdd(f"{PREFIX}/index.json",
-                                      io.BytesIO(json.dumps(idx).encode())))
-        try:
-            api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
-                              commit_message=f"retention: {stripped} animation(s) "
-                                             f"cleared (results kept), {purged} "
-                                             f"result(s) purged > {RESULTS_MAX_AGE_D:g} d")
-            return stripped + purged
-        except Exception:
-            return 0
+        ops.append(Put(INDEX_FILE, idx))
+        res = DATASET.commit(ops, f"retention: {stripped} animation(s) "
+                                  f"cleared (results kept), {purged} "
+                                  f"result(s) purged > {RESULTS_MAX_AGE_D:g} d")
+        return stripped + purged if res else 0
 
 
 def reconcile_store(dry_run: bool = False, log=print) -> int:
@@ -825,32 +755,32 @@ def reconcile_store(dry_run: bool = False, log=print) -> int:
     fix the index's n_frames to match. Repairs the 404-blank frames left by
     the Delete+Add publish bug and by animation stripping. Returns the
     number of manifests rewritten."""
-    from huggingface_hub import CommitOperationAdd, hf_hub_download
-    api = _api()
-    if api is None:
+    if not DATASET.can_write:
         return 0
     with _lock:
-        allfiles = api.list_repo_files(REPO, repo_type="dataset")
+        listing = DATASET.list_files(f"{PREFIX}/")
+        if not listing.ok:
+            raise RuntimeError(f"reconcile: listing failed ({listing.error})")
+        allfiles = listing.value
         by_ev: dict[str, set] = {}
         for f in allfiles:
             parts = f.split("/")
             if len(parts) >= 3 and parts[0] == PREFIX and parts[1] != "queue":
                 by_ev.setdefault(parts[1], set()).add(parts[-1])
-        idx = load_index()
+        got = _read_index()
+        if not got.ok:
+            raise RuntimeError(f"reconcile: index unreadable ({got.error})")
+        idx = got.value
         ops, touched = [], 0
         for ev in sorted(by_ev):
             files = by_ev[ev]
             if "manifest.json" not in files:
                 continue
-            try:
-                mp = hf_hub_download(REPO, f"{PREFIX}/{ev}/manifest.json",
-                                     repo_type="dataset",
-                                     token=os.environ.get("HF_TOKEN"))
-                with open(mp, encoding="utf-8") as fp:
-                    man = json.load(fp)
-            except Exception as e:
-                log(f"{ev}: manifest unreadable ({type(e).__name__})")
+            mr = DATASET.read_json(f"{PREFIX}/{ev}/manifest.json", kind=dict)
+            if not mr.ok:
+                log(f"{ev}: manifest unreadable ({mr.error or mr.status})")
                 continue
+            man = mr.value
             frames = man.get("frames") or []
             keep = _serviceable(frames, set(), files)
             if len(keep) == len(frames):
@@ -863,24 +793,21 @@ def reconcile_store(dry_run: bool = False, log=print) -> int:
             touched += 1
             if dry_run:
                 continue
-            ops.append(CommitOperationAdd(
-                f"{PREFIX}/{ev}/manifest.json",
-                io.BytesIO(json.dumps(man).encode())))
+            ops.append(Put(f"{PREFIX}/{ev}/manifest.json", man))
             if ev in idx:
                 idx[ev]["n_frames"] = len(keep)
         if dry_run or not ops:
             return touched
-        ops.append(CommitOperationAdd(f"{PREFIX}/index.json",
-                                      io.BytesIO(json.dumps(idx).encode())))
-        api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
-                          commit_message=f"reconcile: {touched} manifest(s) "
-                                         f"trimmed to stored frames")
+        ops.append(Put(INDEX_FILE, idx))
+        res = DATASET.commit(ops, f"reconcile: {touched} manifest(s) "
+                                  f"trimmed to stored frames")
+        if not res:
+            raise RuntimeError(f"reconcile commit failed ({res.error})")
         return touched
 
 
 def event_url(event_id: str, filename: str) -> str:
-    return (f"https://huggingface.co/datasets/{REPO}/resolve/main/"
-            f"{PREFIX}/{event_id}/{filename}")
+    return DATASET.url(f"{PREFIX}/{event_id}/{filename}")
 
 
 # ---- admin archive: EVERY stored result folder, listed or not ---------------
@@ -924,26 +851,20 @@ def _arch_summary(ev: str, m: dict, files: list, listed: dict | None) -> dict:
 
 def _arch_build():
     from concurrent.futures import ThreadPoolExecutor
-    from huggingface_hub import HfApi, hf_hub_download
-    tok = os.environ.get("HF_TOKEN")
     try:
-        allfiles = HfApi(token=tok).list_repo_files(REPO, repo_type="dataset")
+        listing = DATASET.list_files(f"{PREFIX}/")
+        if not listing.ok:
+            raise RuntimeError(listing.error)
         idx = load_index()
         per: dict = {}
-        for f in allfiles:
-            if f.startswith(f"{PREFIX}/") and f.count("/") >= 2:
+        for f in listing.value:
+            if f.count("/") >= 2:
                 ev, name = f.split("/", 2)[1:]
                 per.setdefault(ev, []).append(name)
 
-        def one(ev):
-            try:                      # HF-cached: re-downloaded only on change
-                p = hf_hub_download(REPO, f"{PREFIX}/{ev}/manifest.json",
-                                    repo_type="dataset", token=tok)
-                with open(p, encoding="utf-8") as fp:
-                    m = json.load(fp)
-            except Exception:
-                m = {}
-            return ev, _arch_summary(ev, m, per[ev], idx.get(ev))
+        def one(ev):              # HF-cached: re-downloaded only on change
+            m = DATASET.read_json(f"{PREFIX}/{ev}/manifest.json", kind=dict).value
+            return ev, _arch_summary(ev, m or {}, per[ev], idx.get(ev))
 
         with ThreadPoolExecutor(max_workers=8) as ex:
             out = dict(ex.map(one, sorted(per)))
@@ -972,5 +893,4 @@ def archive_index(force: bool = False) -> dict:
                 "n_listed": sum(1 for e in evs if e["listed"]),
                 "building": _arch["building"], "built": _arch["built"],
                 "error": _arch["error"], "results_max_age_d": RESULTS_MAX_AGE_D,
-                "base": (f"https://huggingface.co/datasets/{REPO}/resolve/main/"
-                         f"{PREFIX}")}
+                "base": DATASET.url(PREFIX)}
