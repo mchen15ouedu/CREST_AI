@@ -54,6 +54,17 @@ While CREST runs, AO emits `RunProgress` events:
 - `streamflow_2d` → `StreamflowFrame` (time, grid_path) — one raster per timestep.
 - `log` / `metric` / `done`.
 
+**Not to be confused with the gauge run's result.** The operator agent's
+`RunResult` above is an agent artifact (run spec, skill metrics, hydro
+assessment). The gauge-run code path — `hf_data.pipeline.run_gauge` and the
+chat demo's `pipeline.analyze` — ends with a different type,
+`GaugeRunResult` (`hf_data/runresult.py`): an `outcome` (`Outcome`: ok,
+cached, no_basin, no_state, cut_failed, cancelled, failed), the rows, a
+`reason`, and where the record and states live. That stream's progress events
+are `("status" | "meta" | "params" | "hydro" | "q2d", payload)` followed by
+exactly one `("done", GaugeRunResult)`; callers branch on `outcome` (or `.ok`),
+never on EF5 return codes.
+
 ## Human-in-the-loop gates
 - **AOS**: `OutletSelection.user_confirmed` must be `True` before API/AO proceed.
 - **ACP**: `clarifications_needed` non-empty → chatbot asks the user before ADR.

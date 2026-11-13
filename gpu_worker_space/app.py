@@ -53,6 +53,11 @@ def _git(*args, cwd=None):
                           capture_output=True, text=True).stdout.strip()
 
 
+# Not spaceruntime.boot_sources: the other runners shallow-clone the whole
+# CREST_AI repo from GitHub and link the image's EF5 build; this worker needs
+# sparse checkouts from two other sources (the crestimap fork at a pinned ref,
+# hf_data from the CREST_demo Space) and no EF5 — and it must have hf_data
+# before spaceruntime is even importable.
 def _bootstrap():
     """Blobless sparse clones: crestimap/ from the fork at FORK_REF, hf_data/
     from the CREST_demo Space (eventsim/eventstore reuse — nothing
@@ -87,6 +92,8 @@ def _bootstrap():
 
 
 _bootstrap()
+from hf_data import spaceruntime                             # noqa: E402  (from the clone)
+
 try:
     _FORK_SHA = subprocess.run(
         ["git", "-C", os.path.join(APP, "_fork"), "rev-parse", "HEAD"],
@@ -743,6 +750,7 @@ def _status():
                          for k in ("accepted", "rejected", "empty")},
             "scan": W["scan"],
             "fork_sha": _FORK_SHA,
+            "self_ping": W.get("self_ping"),
             "gpu_budget": {"used_min_24h": round(_used_s(time.time()) / 60, 1),
                            "budget_min": round(DAILY_BUDGET_S / 60, 1),
                            "authenticated": bool(ZERO_AUTH and _tok),
@@ -750,23 +758,12 @@ def _status():
                            "paused": W["paused_note"] or None}}
 
 
-def _keep_awake():
-    import requests
-    host = os.environ.get("SPACE_HOST", "")
-    while host:
-        time.sleep(900)
-        try:
-            requests.get(f"https://{host}", timeout=30)
-        except Exception:
-            pass
-
-
 def _self_drive():
     """Server-side tick loop — the worker's actual engine.
 
     gr.Timer is a FRONTEND timer: it only fires while a browser session has
-    the Space open, and demo.load only fires on a page load. _keep_awake's
-    plain GET keeps the container off sleep but opens no Gradio session, so
+    the Space open, and demo.load only fires on a page load. The keep-awake
+    self-ping keeps the container off sleep but opens no Gradio session, so
     with nobody watching this worker sat RUNNING and completely idle — found
     2026-08-24: 59 min of silence between boot and the first externally
     triggered /tick, and every past ZeroGPU solve coincided with someone
@@ -814,7 +811,15 @@ def _self_drive():
         time.sleep(SELF_TICK_S)
 
 
-threading.Thread(target=_keep_awake, daemon=True).start()
+# keep-awake: the shared policy's AUTHENTICATED self-visit of the Space page,
+# at the old 15-min cadence. The old anonymous GET was turned away by HF's
+# proxy whenever the Space is private, so it never counted against the sleep
+# timer (the failure fixed for autocal in e3a17b8). "/" is the Gradio page:
+# any 2xx counts. Result lands in the status JSON as "self_ping".
+if spaceruntime.own_host():
+    spaceruntime.KeepAwake(peers=[], token=_tok, self_path="/", expect_json=False,
+                           interval_s=900, self_ping_every=1, first_delay_s=900,
+                           state=W).start()
 threading.Thread(target=_self_drive, daemon=True).start()
 log(f"boot: {IDENT} publish={PUBLISH} zero={HAS_ZERO} "
     f"delay={ZERO_DELAY_S:.0f}s budget={MAX_CELLS / 1e6:.1f}M cells "

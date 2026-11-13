@@ -11,7 +11,7 @@ because the GDEX form is 0.5–1 GB multi-variable GRIB tars per ~8 days, i.e.
 ~2.6 GB of download per month to extract a single band.
 
 Each 3-hourly Lambert field is bilinearly resampled onto the canonical
-NLDAS-heritage 0.125° temp grid (forcing.TEMP_GRID — so every temp PQF in the
+NLDAS-heritage 0.125° temp grid (forcing_archive.TEMP_GRID — so every temp PQF in the
 store shares one geometry, which the [TEMPForcing] DEM= extrapolation grid is
 built against), converted K→°C, and linearly interpolated to HOURLY members
 (EF5 zero-fills missing hourly files, which would freeze SNOW17 at 0 °C).
@@ -43,7 +43,8 @@ import truststore
 truststore.inject_into_ssl()
 import urllib.request
 
-from hf_data.forcing import TEMP_GRID, VARS, _write_pqf, check_temp_units  # noqa: E402
+from hf_data.atomicfile import atomic_path  # noqa: E402
+from hf_data.forcing_archive import TEMP_GRID, VARS, kelvin_to_degc, store_bytes  # noqa: E402
 
 HF_REPO = "vincewin/CREST_data"
 PSL_URLS = ("https://psl.noaa.gov/thredds/fileServer/Datasets/NARR/monolevel/air.2m.{year}.nc",
@@ -97,21 +98,21 @@ def _download_year(year: int) -> str | None:
     # PSL rate-limits bursts (HTTP 429 on 2026-10-07, 21 min after it
     # republished the year file) — back off and retry transient errors
     # instead of failing the whole self-heal until the next cooldown
-    for attempt, wait in enumerate((30, 120, 300, None)):
-        try:
-            urllib.request.urlretrieve(url, dest + ".part")
-            break
-        except Exception as e:
-            code = getattr(e, "code", None)
-            transient = code is None or code == 429 or code >= 500
-            if wait is None or not transient:
-                raise
-            ra = getattr(e, "headers", None) and e.headers.get("Retry-After")
-            if ra and str(ra).isdigit():
-                wait = max(wait, min(int(ra), 900))
-            print(f"  [narr] download failed ({e}); retry {attempt + 1}/3 in {wait} s")
-            time.sleep(wait)
-    os.replace(dest + ".part", dest)
+    with atomic_path(dest) as tmp:
+        for attempt, wait in enumerate((30, 120, 300, None)):
+            try:
+                urllib.request.urlretrieve(url, tmp)
+                break
+            except Exception as e:
+                code = getattr(e, "code", None)
+                transient = code is None or code == 429 or code >= 500
+                if wait is None or not transient:
+                    raise
+                ra = getattr(e, "headers", None) and e.headers.get("Retry-After")
+                if ra and str(ra).isdigit():
+                    wait = max(wait, min(int(ra), 900))
+                print(f"  [narr] download failed ({e}); retry {attempt + 1}/3 in {wait} s")
+                time.sleep(wait)
     json.dump(remote, open(meta, "w"))
     return dest
 
@@ -175,7 +176,7 @@ class NarrYear:
         idx = self.hours.get(when)
         if idx is None:
             return None
-        a = np.ma.filled(self.air[idx, :, :].astype("float64"), np.nan) - 273.15
+        a = kelvin_to_degc(np.ma.filled(self.air[idx, :, :].astype("float64"), np.nan))
         if not np.isfinite(a).any():
             return None                # empty record: no data, not a nodata grid
         i0 = np.clip(np.floor(self.fi).astype(int), 0, a.shape[0] - 2)
@@ -249,11 +250,10 @@ def update_month(year: int, month: int, years: dict[int, NarrYear], api,
         v = hourly_field(years, t)
         if v is None:
             continue
-        # never upload a non-°C member (raises; the month is skipped, nothing committed)
-        check_temp_units(v, TEMP_GRID[5], t.strftime(cfg.out_fmt), convert=False)
-        buf = os.path.join(tempfile.gettempdir(), "narr_member.pqf")
-        _write_pqf(buf, v, xll, yll, cell, TEMP_GRID[5])
-        new.append((t.strftime(cfg.out_fmt), open(buf, "rb").read()))
+        # the archive refuses a non-°C member (raises; the month is skipped,
+        # nothing committed)
+        name = t.strftime(cfg.out_fmt)
+        new.append((name, store_bytes("temp", v, xll, yll, cell, TEMP_GRID[5], name=name)))
     if not new:
         src_end = max((max(ny.hours) for ny in years.values() if ny.hours),
                       default=None)

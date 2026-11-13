@@ -325,6 +325,24 @@ def _basin_outline(ef5_dir: str, gauge_ll=None, max_pts: int = 1200, log=print):
     return [[round(y, 4), round(x, 4)] for x, y in best[::step]]
 
 
+def run_error(gid: str, result) -> Exception | None:
+    """The exception an event's gauge run ends in, from its outcome
+    (hf_data.runresult): None when it simulated (ok / cached); a
+    hucdomain.DomainError for an outlet without a basin outline (the event is
+    skipped, never boxed); RuntimeError for any other run that did not
+    simulate, or a run that ended without a result."""
+    from .hucdomain import DomainError
+    from .runresult import Outcome
+    if result is None:
+        return RuntimeError(f"{gid}: gauge run ended without a result")
+    if result.ok:
+        return None
+    if result.outcome is Outcome.NO_BASIN:
+        return DomainError(f"{gid}: no basin boundary ({result.reason})")
+    return RuntimeError(f"{gid}: gauge run {result.outcome.value}"
+                        + (f": {result.reason}" if result.reason else ""))
+
+
 def run_one(gid: str, t0: datetime.datetime | None = None,
             trigger: dict | None = None, episode_id: str | None = None,
             defer: bool = False, force_cpu: bool = False,
@@ -395,7 +413,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
         # outline (basinextent: GAGES-II polygon ∪ the carved catchment, on
         # the HydroSHEDS lattice) — the same extent as the dashboard's runs,
         # so they share clip and forcing stores. No basin -> no event.
-        from . import basinextent, hucdomain
+        from . import basinextent
         ext = basinextent.ef5_extent(g)
         log(f"EF5 extent from the basin outline ({ext['source']}, "
             f"{ext['carved_km2']:,.0f} km² catchment, {ext['cells']:,} cells)")
@@ -403,6 +421,7 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
             f"with gridded runoff output")
         meta = {}
         hydro = {}
+        result = None
 
         def _f(v):
             try:
@@ -428,11 +447,11 @@ def run_one(gid: str, t0: datetime.datetime | None = None,
                             "time": str(r["time"]), "sim_q": _f(r.get("sim_q")),
                             "obs_q": _f(r.get("obs_q")),
                             "precip": _f(r.get("precip"))}
-            elif kind == "done" and payload.get("no_basin"):
-                raise hucdomain.DomainError(f"{gid}: no basin boundary "
-                                            f"({payload.get('reason')})")
-            elif kind == "done" and payload.get("returncode", 0) not in (0, None):
-                raise RuntimeError(f"EF5 failed: {payload}")
+            elif kind == "done":
+                result = payload
+        err = run_error(gid, result)
+        if err is not None:
+            raise err
         out_dir = os.path.join(work, "CREST_output")
         model = (meta.get("model") or "crest").lower()
         wb_model = "crest" if model in ("crest", "hp") else "crestphys"

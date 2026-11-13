@@ -18,7 +18,7 @@ long-term store):
   * routednow.compute -> statecache.prune_states keeps the newest state (next
     hour's warm start) + one checkpoint per 10 days locally, deletes the rest;
   * when a NEW 10-day checkpoint is minted, this uploads the point's state
-    bundle + record to vincewin/CREST_fleet as states/<key>.pqf +
+    bundle + record to the fleet repo (CREST_fleet) as states/<key>.pqf +
     results/<key>.json (key "V..._crestphys-spd") — right beside the gauge keys.
 
 t0 is the issue time of the current gauged DI-LSTM nowcast (nowcaststore), so
@@ -32,30 +32,22 @@ Space variables (Settings -> Variables):
   UNGAUGED_LIMIT     cap points (0 = all) — for smoke tests
 Secret: HF_TOKEN (write access — uploads to CREST_data and CREST_fleet).
 """
-import http.server
-import json
 import multiprocessing
 import os
 import shutil
-import threading
+import subprocess
+import sys
 import time
-import urllib.parse
-import urllib.request
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 SRC = "/app/src"
 CACHE = "/tmp/crest_cache"
 LOG = "/tmp/ungauged.log"
-REPO = os.environ.get("CREST_FEEDBACK_REPO", "vincewin/CREST_data")   # nowcast parquet + no-upstream list
 CONUS = (-125.5, 24.0, -66.5, 50.0)          # (w, s, e, n)
-started = time.time()
+CREST_AI_GIT = "https://github.com/mchen15ouedu/CREST_AI.git"
 state = {"phase": "booting", "passes": 0, "t0": None, "ok": 0, "fail": 0,
          "uploaded": 0, "last_min": 0.0}
-
-PEERS = [u.strip() for u in os.environ.get("UNGAUGED_PEERS", "").split(",") if u.strip()]
-SELF_HOST = (os.environ.get("SPACE_ID", "").replace("/", "-").replace("_", "-")
-             .lower() + ".hf.space")
 
 
 def _log(msg: str):
@@ -65,28 +57,13 @@ def _log(msg: str):
     print(line, flush=True)
 
 
-def keepalive_loop():
-    while True:
-        for u in PEERS:
-            if urllib.parse.urlparse(u).hostname == SELF_HOST:
-                continue
-            try:
-                urllib.request.urlopen(u, timeout=20).read(100)
-            except Exception:
-                pass
-        time.sleep(1200)
-
-
-def sh(cmd):
-    import subprocess
-    subprocess.run(cmd, shell=True, check=True)
-
-
-def boot_sources():
+def clone_sources():
+    """The one boot step that precedes the shared runtime: the Dockerfile
+    copies only this file, so hf_data/spaceruntime.py (boot, keep-awake,
+    status page, child env) exists only after this clone."""
     shutil.rmtree(SRC, ignore_errors=True)
-    sh(f"git clone --depth 1 https://github.com/mchen15ouedu/CREST_AI.git {SRC}")
-    if not os.path.exists(os.path.join(SRC, "EF5")):
-        os.symlink("/EF5", os.path.join(SRC, "EF5"))
+    subprocess.run(["git", "clone", "--depth", "1", CREST_AI_GIT, SRC], check=True)
+    sys.path.insert(0, SRC)
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +119,8 @@ def run_one(vp: str, t0_iso: str, force_upload: bool = False) -> dict:
         return {"vp": vp, "ok": False, "reason": r.get("reason")}
 
     model = r.get("cache_model") or model
-    key = f"{str(vp).zfill(8)}_{model}" if model else None
+    from hf_data import fleetstore
+    key = fleetstore.key(vp, model) if model else None
     injected = bool(r.get("injected"))          # truncated speed domain -> real routed nowcast
     has_upstream = bool(r.get("has_upstream"))  # any upstream USGS gauge exists at all
     after = _checkpoints(vp, model) if model else set()
@@ -162,50 +140,51 @@ def run_one(vp: str, t0_iso: str, force_upload: bool = False) -> dict:
 
 
 def _pack_fleet(vp, model):
-    """Child process: pack the (pruned) state dir + record into bytes for the
-    parent's batched commit. Local copies stay for next hour's warm start."""
-    from hf_data import statebundle, statecache
-    key = f"{str(vp).zfill(8)}_{model}"
-    sdir = statecache.state_dir(vp, model)
-    blob = statebundle.pack_dir(sdir)
-    if blob is None:
-        return None
-    rec_path = statecache.results_path(vp, model)
-    rec = open(rec_path, "rb").read() if os.path.exists(rec_path) else None
-    return {"key": key, "blob": blob, "rec": rec}
+    """Child process: pack the (pruned) state dir + record into a picklable
+    fleetstore.Publication (bytes) for the parent's batched commit. Local
+    copies stay for next hour's warm start."""
+    from hf_data import fleetstore
+    return fleetstore.pack(vp, model, kind=fleetstore.CHECKPOINT)
 
 
-_pending_fleet: list = []            # packed checkpoints awaiting the batched commit
+_fleet_batch = None                  # fleetstore.Batch, made on first use (after the clone)
+
+
+def _batch():
+    global _fleet_batch
+    if _fleet_batch is None:
+        from hf_data import fleetstore
+        _fleet_batch = fleetstore.batch(
+            f"ungauged checkpoints {_shard_tag() or ''}".strip(), max_pending=400)
+    return _fleet_batch
+
+
+def _queue_fleet(pub) -> None:
+    _batch().add(pub)
+
+
+def _pending_fleet_bytes() -> int:
+    return _fleet_batch.nbytes if _fleet_batch is not None else 0
 
 
 def _flush_fleet() -> int:
-    """ONE create_commit for every pending checkpoint (vs one commit per point,
-    which blows HF's 256 commits/hour account limit and 429-starves the parquet
-    publishes as collateral). On failure the batch stays queued for the next
-    flush — the ledger only records keys after a successful commit. Returns the
-    number of checkpoints committed."""
-    if not _pending_fleet or not os.environ.get("HF_TOKEN"):
+    """ONE commit for every pending checkpoint, through the fleet store (vs
+    one commit per point, which blows HF's 256 commits/hour account limit and
+    429-starves the parquet publishes as collateral). On failure the batch
+    stays queued for the next flush — the ledger only records keys after a
+    successful commit. Returns the number of checkpoints committed."""
+    if _fleet_batch is None or not _fleet_batch.pending:
         return 0
     from hf_data import fleetstore
-    from huggingface_hub import CommitOperationAdd, HfApi
-    import io
-    ops, keys = [], []
-    for f in _pending_fleet:
-        ops.append(CommitOperationAdd(f"states/{f['key']}.pqf", io.BytesIO(f["blob"])))
-        if f.get("rec"):
-            ops.append(CommitOperationAdd(f"results/{f['key']}.json", io.BytesIO(f["rec"])))
-        keys.append(f["key"])
-    try:
-        HfApi(token=os.environ["HF_TOKEN"]).create_commit(
-            repo_id=fleetstore.REPO, repo_type="dataset", operations=ops,
-            commit_message=f"ungauged checkpoints x{len(keys)} {_shard_tag() or ''}")
-    except Exception as e:
-        _log(f"  fleet batch commit failed ({len(keys)} ckpts, retrying next "
-             f"flush): {type(e).__name__}: {str(e)[:160]}")
-        del _pending_fleet[400:]         # bound RAM if failures persist
+    if not fleetstore.DATASET.can_write:       # no HF_TOKEN: nothing to retry
+        return 0
+    n = _fleet_batch.pending
+    keys = _fleet_batch.flush()
+    if not keys:
+        _log(f"  fleet batch commit failed ({n} ckpts, retrying next flush): "
+             f"{str(_fleet_batch.error)[:160]}")
         return 0
     _uploaded_keys.update(keys)
-    _pending_fleet.clear()
     return len(keys)
 
 
@@ -239,17 +218,13 @@ def _seed_uploaded_keys():
     """List the ungauged checkpoints already in CREST_fleet so we don't
     re-upload them, and so any point NOT listed is (re)attempted every pass
     until it lands — self-healing past commit-collision drops."""
-    try:
-        from hf_data import fleetstore
-        from huggingface_hub import HfApi
-        files = HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
-            fleetstore.REPO, repo_type="dataset")
-        for f in files:
-            if f.startswith("states/V") and f.endswith(".pqf"):
-                _uploaded_keys.add(f[len("states/"):-len(".pqf")])
-        _log(f"seeded {len(_uploaded_keys)} existing ungauged checkpoints from CREST_fleet")
-    except Exception as e:
-        _log(f"could not seed fleet keys: {type(e).__name__}: {e}")
+    from hf_data import fleetstore
+    r = fleetstore.checkpoint_keys()
+    if not r.ok:
+        _log(f"could not seed fleet keys: {r.error}")
+        return
+    _uploaded_keys.update(r.value)
+    _log(f"seeded {len(_uploaded_keys)} existing ungauged checkpoints from CREST_fleet")
 
 
 _ineligible: set = set()             # ungauged ids with NO upstream gauge (headwaters)
@@ -263,11 +238,11 @@ def _seed_carry():
     """Rebuild the carry ledger from this shard's last published parquet so a
     container restart doesn't collapse the served coverage to zero."""
     try:
-        import pyarrow.parquet as pq
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, f"nowcast/ungauged_latest{_shard_tag()}.parquet",
-                            repo_type="dataset", token=os.environ.get("HF_TOKEN"))
-        t = pq.read_table(p)
+        from hf_data import ungaugednow_store
+        r = ungaugednow_store.load_shard(_shard_tag())
+        if not r.ok:
+            raise LookupError(r.status)
+        t = r.value
         meta = {k.decode(): v.decode() for k, v in (t.schema.metadata or {}).items()}
         default_t0 = meta.get("t0", "").replace(" UTC", "")
         cols = {n: t.column(n).to_pylist() for n in t.schema.names}
@@ -290,38 +265,25 @@ def _shard_tag() -> str:
     return ("__" + sh.replace("/", "of")) if sh else ""    # "0/3" -> "__0of3"
 
 
-def _no_upstream_path() -> str:
-    return f"nowcast/ungauged_no_upstream{_shard_tag()}.json"
-
-
 def _seed_ineligible():
-    """Load this shard's known headwater (no-upstream) ids from CREST_data so
-    they're skipped from the start — the routed-injection design can't serve
-    them, so they're nowcast-ineligible (they remain valid on the hindcast
-    side, which is served on demand, not here)."""
-    try:
-        import json
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(REPO, _no_upstream_path(), repo_type="dataset",
-                            token=os.environ.get("HF_TOKEN"))
-        _ineligible.update(json.load(open(p)))
+    """Load this shard's known headwater (no-upstream) ids from the feedback
+    dataset so they're skipped from the start — the routed-injection design
+    can't serve them, so they're nowcast-ineligible (they remain valid on the
+    hindcast side, which is served on demand, not here)."""
+    from hf_data import ungaugednow_store
+    r = ungaugednow_store.load_no_upstream(_shard_tag())
+    if r.ok:
+        _ineligible.update(r.value)
         _log(f"seeded {len(_ineligible)} nowcast-ineligible (no-upstream) points")
-    except Exception:
-        _log("no prior no-upstream list (first run)")
+    else:
+        _log(f"no prior no-upstream list ({r.status})")
 
 
 def _save_ineligible():
-    try:
-        import io
-        import json
-        from huggingface_hub import CommitOperationAdd, HfApi
-        buf = io.BytesIO(json.dumps(sorted(_ineligible)).encode())
-        HfApi(token=os.environ["HF_TOKEN"]).create_commit(
-            repo_id=REPO, repo_type="dataset",
-            operations=[CommitOperationAdd(_no_upstream_path(), buf)],
-            commit_message=f"no-upstream list {_shard_tag() or 'all'} ({len(_ineligible)})")
-    except Exception as e:
-        _log(f"could not save no-upstream list: {type(e).__name__}: {e}")
+    from hf_data import ungaugednow_store
+    c = ungaugednow_store.save_no_upstream(_ineligible, _shard_tag())
+    if not c:
+        _log(f"could not save no-upstream list: {c.error}")
 
 
 def _keys_for(vp, lon):
@@ -329,10 +291,9 @@ def _keys_for(vp, lon):
     ("<model>-spd") and the full-basin fallback ("<model>"). We don't know which
     a point uses until it runs, so a point is "already checkpointed" if EITHER
     is in the ledger."""
-    from hf_data import routednow
+    from hf_data import fleetstore, routednow
     base = routednow._cache_model(lon)[:-4]         # strip "-spd"
-    g = str(vp).zfill(8)
-    return f"{g}_{base}-spd", f"{g}_{base}"
+    return fleetstore.key(vp, f"{base}-spd"), fleetstore.key(vp, base)
 
 
 def _current_t0():
@@ -406,7 +367,7 @@ def run_pass(t0):
             if r.get("ok"):
                 ok += 1
                 if r.get("fleet"):
-                    _pending_fleet.append(r["fleet"])   # batched: 1 commit per flush
+                    _queue_fleet(r["fleet"])        # batched: 1 commit per flush
                 if r.get("injected"):
                     rows.append(r)                  # nowcast parquet: routed points only
                     _carry[str(r["vp"])] = {        # fresh entry supersedes carried one
@@ -422,7 +383,7 @@ def run_pass(t0):
                 _log(f"  {i}/{len(pts)} done ({ok} ok, {fail} fail, {up} up, "
                      f"{len(rows)} routed, {new_headwater} new headwater)")
             if (len(rows) - last_pub >= PUBLISH_EVERY
-                    or sum(len(f["blob"]) for f in _pending_fleet) > 150e6):
+                    or _pending_fleet_bytes() > 150e6):
                 _publish()
                 up += _flush_fleet()
                 last_pub = len(rows)
@@ -454,13 +415,10 @@ def warm_loop():
         state["phase"] = "NO HF_TOKEN — add the secret in Space settings"
         _log(state["phase"])
         return
-    os.environ.update(CREST_DEMO_MOCK="0", CREST_CACHE_DIR=CACHE,
-                      HF_HOME=os.path.join(CACHE, "hub"),
-                      GDAL_HTTP_MAX_RETRY="5", GDAL_HTTP_RETRY_DELAY="2",
-                      PYTHONUNBUFFERED="1")
+    from hf_data import spaceruntime as rt
+    # the passes run in this process (and in spawned workers, which inherit it)
+    os.environ.update(rt.child_env(CACHE))
     os.chdir(SRC)                              # EF5 runs relative to ./EF5/bin/ef5
-    import sys
-    sys.path.insert(0, SRC)
     _seed_uploaded_keys()                       # so we don't re-upload what's already there
     _seed_ineligible()                          # skip known headwaters from the start
     _seed_carry()                               # restart must not shrink served coverage
@@ -485,33 +443,18 @@ def warm_loop():
 # --------------------------------------------------------------------------- #
 # status page
 # --------------------------------------------------------------------------- #
-class Status(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        try:
-            with open(LOG) as f:
-                tail = f.readlines()[-60:]
-        except OSError:
-            tail = ["(no log yet)\n"]
-        du = shutil.disk_usage("/tmp")
-        body = (f"CREST_ungauged (keep-warm) — {state['phase']}\n"
-                f"up {(time.time() - started) / 3600:.1f} h | pass {state['passes']} "
-                f"@ t0={state['t0']} | {state['ok']} ok, {state['fail']} fail, "
-                f"{state['uploaded']} checkpoints | last pass {state['last_min']} min | "
-                f"disk /tmp {du.used / 1e9:.0f}/{du.total / 1e9:.0f} GB\n"
-                + "=" * 72 + "\n" + "".join(tail))
-        data = body.encode("utf-8", "replace")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, *a):
-        pass
+def ungauged_summary():
+    return (f"pass {state['passes']} @ t0={state['t0']} | {state['ok']} ok, "
+            f"{state['fail']} fail, {state['uploaded']} checkpoints | "
+            f"last pass {state['last_min']} min")
 
 
 if __name__ == "__main__":
-    boot_sources()
-    threading.Thread(target=warm_loop, daemon=True).start()
-    threading.Thread(target=keepalive_loop, daemon=True).start()
-    http.server.ThreadingHTTPServer(("0.0.0.0", 7860), Status).serve_forever()
+    clone_sources()
+    from hf_data import spaceruntime as rt
+    rt.boot_sources(SRC)
+    rt.start_thread(warm_loop)
+    rt.KeepAwake(rt.peers_from_env("UNGAUGED_PEERS"),
+                 state=state, first_delay_s=60).start()
+    rt.serve_status("CREST_ungauged (keep-warm)", state, log_path=LOG, tail=60,
+                    summary=ungauged_summary, rule=72)

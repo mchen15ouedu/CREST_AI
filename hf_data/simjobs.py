@@ -17,6 +17,7 @@ from datetime import datetime
 
 from hf_data import analysis, viz
 from hf_data.pipeline import run_gauge
+from hf_data.runresult import GaugeRunResult, Outcome
 
 MAX_CONCURRENT = int(os.environ.get("CREST_MAX_CONCURRENT", "4"))
 MAX_SIMS = int(os.environ.get("CREST_MAX_SIMS", "10"))
@@ -119,18 +120,22 @@ class SimJob:
         self._emit({"kind": "all_done"})
         self.done.set()
 
+    def _gauge_done(self, gid, res: GaugeRunResult):
+        """The browser's end-of-gauge event, derived from the run's result."""
+        self._finished.add(gid)                  # frees the timeline pacing check
+        self._emit({"kind": "gauge_done", "gauge_id": gid,
+                    "outcome": res.outcome.value, "ok": res.ok, "reason": res.reason,
+                    "n": len(self.hydro.get(gid, []))})
+
     def _run_one(self, gid):
         if self.cancel.is_set():                 # stopped while still queued
-            self._finished.add(gid)
-            self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -9,
-                        "n": len(self.hydro.get(gid, []))})
+            self._gauge_done(gid, GaugeRunResult(Outcome.CANCELLED, gid))
             return
         okey = self.owner.get("sid") or "anon"
         if not admit(okey, self.cancel,
                      lambda msg: self._emit({"kind": "status", "gauge_id": gid, "msg": msg})):
-            self._finished.add(gid)             # stopped while waiting for a slot
-            self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -9,
-                        "n": len(self.hydro.get(gid, []))})
+            # stopped while waiting for a slot
+            self._gauge_done(gid, GaugeRunResult(Outcome.CANCELLED, gid))
             return
         try:
             for kind, payload in run_gauge(
@@ -176,35 +181,7 @@ class SimJob:
                             self._emit({"kind": "status", "gauge_id": gid,
                                         "msg": f"⚠️ 2-D frame render failed: {e}"})
                 elif kind == "done":
-                    rc = payload.get("returncode")
-                    self._finished.add(gid)      # frees the timeline pacing check
-                    if payload.get("cancelled"):
-                        # user stop / superseded — not an error, nothing to render
-                        self._emit({"kind": "gauge_done", "gauge_id": gid,
-                                    "returncode": -9,
-                                    "n": len(self.hydro.get(gid, []))})
-                        continue
-                    if payload.get("no_basin"):
-                        # deliberate, permanent skip (no basin outline, never a
-                        # box) - not an EF5 crash, nothing to render or retry
-                        self._emit({"kind": "gauge_done", "gauge_id": gid,
-                                    "returncode": rc, "no_basin": True,
-                                    "reason": payload.get("reason"),
-                                    "n": len(self.hydro.get(gid, []))})
-                        continue
-                    if payload.get("error") or rc not in (0, None):
-                        from hf_data import crashlog
-                        crashlog.capture(f"ef5:{gid}", message=payload.get("error")
-                                         or f"EF5 exited rc={rc}",
-                                         sim_id=self.id, returncode=rc)
-                    if payload.get("cached"):
-                        self._cached_timeline(gid)        # replay frames from disk
-                    else:
-                        self._build_timeline(gid)
-                    self._emit({"kind": "gauge_done", "gauge_id": gid,
-                                "returncode": rc,
-                                "n": len(self.hydro.get(gid, []))})
-                    self._build_result(gid)
+                    self._finish(gid, payload)
                     try:                     # fresh states/results — sync soon
                         from hf_data import persist
                         persist.poke()
@@ -213,11 +190,27 @@ class SimJob:
         except Exception as e:
             from hf_data import crashlog
             crashlog.capture(f"sim:{gid}", e, sim_id=self.id)
-            self._finished.add(gid)
             self._emit({"kind": "status", "gauge_id": gid, "msg": f"⚠️ {e}"})
-            self._emit({"kind": "gauge_done", "gauge_id": gid, "returncode": -1})
+            self._gauge_done(gid, GaugeRunResult(Outcome.FAILED, gid, reason=str(e)))
         finally:
             release(okey)
+
+    def _finish(self, gid, res: GaugeRunResult):
+        if res.outcome in (Outcome.CANCELLED, Outcome.NO_BASIN):
+            # user stop / superseded, or a deliberate permanent skip (no basin
+            # outline, never a box): not an error, nothing to render or retry
+            self._gauge_done(gid, res)
+            return
+        if not res.ok:
+            from hf_data import crashlog
+            crashlog.capture(f"ef5:{gid}", message=res.reason or res.outcome.value,
+                             sim_id=self.id, outcome=res.outcome.value)
+        if res.outcome is Outcome.CACHED:
+            self._cached_timeline(gid)           # replay frames from disk
+        else:
+            self._build_timeline(gid)
+        self._gauge_done(gid, res)
+        self._build_result(gid)
 
     def _build_timeline(self, gid):
         """After a gauge finishes, pre-render all frames with a fixed color scale

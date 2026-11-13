@@ -694,21 +694,24 @@ function handleSimEvent(simId, ev) {
   } else if (ev.kind === "gauge_done") {
     gaugeState[ev.gauge_id] = "done";
     renderTabs();
-    if (ev.returncode === -9) {                       // user stop / superseded — not an error
+    // outcome: ok | cached | no_basin | no_state | cut_failed | cancelled | failed
+    const ok = ev.ok === true;                        // GaugeRunResult.ok, from the server
+    if (ev.outcome === "cancelled") {                 // user stop / superseded — not an error
       if (aiInfo) setProgress(ev.gauge_id, 100, "stopped ⏹");
       allowResim();
-    } else if (ev.no_basin) {                         // deliberate skip, not a crash: no retry
+    } else if (ev.outcome === "no_basin") {           // deliberate skip, not a crash: no retry
       if (aiInfo) setProgress(ev.gauge_id, 100, "not simulated");
       addMsg(`ℹ️ <b>${ev.gauge_id}</b> is not simulated: it has no basin outline ` +
         `(${ev.reason || "unknown"}). CREST-AI never falls back to a rectangle.`, "status");
-    } else if (ev.returncode != null && ev.returncode !== 0) {
+    } else if (!ok) {
       if (aiInfo) setProgress(ev.gauge_id, 100, "failed ✗");
-      explainError("simulation", `EF5 run failed (rc=${ev.returncode}), ` +
-        `${ev.n || 0} output rows produced`, ev.gauge_id);
+      explainError("simulation", `run ended ${ev.outcome}` +
+        (ev.reason ? ` (${ev.reason})` : "") +
+        `, ${ev.n || 0} output rows produced`, ev.gauge_id);
     } else if (aiInfo) setProgress(ev.gauge_id, 100, "complete ✓");
     else addMsg(`✅ <b>${ev.gauge_id}</b> complete (${ev.n} steps)`, "status");
     if (ev.gauge_id === panelGauge) renderHydro(ev.gauge_id);
-    if (ev.returncode === 0) fetchNowcast(ev.gauge_id);
+    if (ok) fetchNowcast(ev.gauge_id);
   } else if (ev.kind === "params") {
     // effective run parameters — used to pre-fill Model options for manual tuning
     (gaugeResult[ev.gauge_id] = gaugeResult[ev.gauge_id] || {}).runParams = ev;

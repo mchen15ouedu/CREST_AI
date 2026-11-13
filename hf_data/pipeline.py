@@ -28,6 +28,7 @@ from hf_data import (basic, forcing, gauges, lakes, multipliers, obs, params, pa
 from hf_data import snow as _snow
 from hf_data.control import build_control, ControlSpec, Gauge
 from hf_data.runner import MockEF5, run_ef5, stream_run
+from hf_data.runresult import GaugeRunResult, Outcome
 
 
 # --------------------------------------------------------------------------- #
@@ -150,7 +151,7 @@ def analyze(query: str, use_mock: bool = True, hours: int = 48, model: str = "cr
         ext = basinextent.ef5_extent(g)
     except basinextent.BasinExtentError as e:
         yield ("status", f"⚠️ {e} — not simulated; CREST-AI never falls back to a box")
-        yield ("done", {"returncode": -2, "no_basin": True, "reason": e.reason})
+        yield ("done", GaugeRunResult(Outcome.NO_BASIN, g["id"], reason=e.reason))
         return
     bbox = ext["bounds"]
     sn = ext["snap"]
@@ -186,8 +187,23 @@ def analyze(query: str, use_mock: bool = True, hours: int = 48, model: str = "cr
     else:
         handle = run_ef5(spec.control_path, out_dir, g["id"], model=model)
 
+    rows = []
     for ev in stream_run(handle, poll=0.2):
-        yield (ev["kind"], ev)          # 'hydro' | 'q2d' | 'done'
+        if ev["kind"] != "done":
+            if ev["kind"] == "hydro":
+                rows += ev["rows"]
+            yield (ev["kind"], ev)      # 'hydro' | 'q2d'
+            continue
+        rc = ev.get("returncode")
+        if ev.get("cancelled"):
+            res = GaugeRunResult(Outcome.CANCELLED, g["id"], rows)
+        elif rc in (0, None):
+            res = GaugeRunResult(Outcome.OK, g["id"], rows, cache_model=model)
+        else:
+            res = GaugeRunResult(Outcome.FAILED, g["id"], rows,
+                                 ev.get("error") or f"EF5 exited rc={rc}")
+        yield ("done", res)
+        return
 
 
 WEST_LON = -105.0          # west of the Rocky Mountain front -> CREST (task #8)
@@ -343,16 +359,19 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
     """Per-gauge streaming run (map flow: gauge already chosen). Yields events.
     `cancel` (threading.Event) stops the run: the EF5 process is killed and the
     (gauge, model) lock released, so a superseding run can start immediately.
+    The stream ends with exactly one ("done", GaugeRunResult) — its outcome,
+    rows, record/state locations, keys and provenance (hf_data.runresult).
     The EF5 raster extent and outlet cell come from basinextent (the basin's
-    outline, never a box); an outlet without one is not simulated (done event
-    with returncode -2, no_basin=True).
+    outline, never a box); an outlet without one is not simulated
+    (Outcome.NO_BASIN).
     cut_ids: a speed-scheme cut set decided once for a multi-chunk run
     (plan_cut_set) — replaces the per-window obs-coverage gate, so every chunk
     of a fleet gauge simulates the same domain under the same keys."""
     g = gauge_info(gauge_id)
     if g is None:
         yield ("status", f"⚠️ gauge {gauge_id} not found")
-        yield ("done", {"returncode": -1})
+        yield ("done", GaugeRunResult(Outcome.FAILED, str(gauge_id),
+                                      reason="gauge not found"))
         return
     from hf_data import basinextent
     try:
@@ -360,7 +379,7 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
     except basinextent.BasinExtentError as e:
         yield ("meta", {**g, "model": model})
         yield ("status", f"⚠️ {e} — not simulated; CREST-AI never falls back to a box")
-        yield ("done", {"returncode": -2, "no_basin": True, "reason": e.reason})
+        yield ("done", GaugeRunResult(Outcome.NO_BASIN, g["id"], reason=e.reason))
         return
     if model == "auto":                          # western-CONUS switch (task #8)
         model = "crest" if g["lon"] < WEST_LON else "crestphys"
@@ -408,20 +427,21 @@ def run_gauge(gauge_id: str, t_start: datetime, t_end: datetime, model: str = "a
         while not lock.acquire(timeout=2):       # keep the queue cancellable
             if cancel is not None and cancel.is_set():
                 yield ("status", "⏹ stopped while queued")
-                yield ("done", {"returncode": -9, "cancelled": True})
+                yield ("done", GaugeRunResult(Outcome.CANCELLED, g["id"]))
                 return
     work = workdir or tempfile.mkdtemp(prefix=f"crest_{g['id']}_")
     try:
-        yield from _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end,
-                                   use_mock, overrides, snow, timestep,
-                                   warmup_days, grids, no_cache, work, cancel,
-                                   scheme, nowcast_t0, ext, cut_ids)
+        result = yield from _run_gauge_body(
+            g, model, ef5_model, wb_model, t_start, t_end, use_mock, overrides, snow,
+            timestep, warmup_days, grids, no_cache, work, cancel, scheme, nowcast_t0,
+            ext, cut_ids)
     finally:
         if lock is not None:
             lock.release()
         # the run-private state folder (M4) is scratch: its staged hard links
         # would otherwise pin states the shared folder has pruned or uploaded
         shutil.rmtree(os.path.join(work, "states"), ignore_errors=True)
+    yield ("done", result)
 
 
 def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
@@ -433,8 +453,14 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     t0 + horizon; each upstream cut gauge is injected with observed flow up to
     t0 and its DI-LSTM prediction beyond t0, and forcing stops at t0 (EF5 reads
     a missing precip grid as zero, so the future is driven by routed upstream
-    inflow, not new rain)."""
+    inflow, not new rain).
+
+    Streams progress events and RETURNS the run's GaugeRunResult."""
     from hf_data import basinextent, runstates
+    known = {}                      # keys/locations/provenance, once decided
+
+    def _end(outcome, reason=None, rows=()):
+        return GaugeRunResult(outcome, g["id"], list(rows), reason, **known)
     work = workdir or tempfile.mkdtemp(prefix=f"crest_{g['id']}_")
     out_dir = os.path.join(work, "CREST_output")
     # the basin's own extent (outline ∪ carved catchment + ~5 km, on the
@@ -453,8 +479,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
 
     if _stopped():                                       # stopped while queued
         yield ("status", "⏹ stopped")
-        yield ("done", {"returncode": -9, "cancelled": True})
-        return
+        return _end(Outcome.CANCELLED)
 
     # --- terrain first: the upstream-gauge scan below needs the clipped grids ---
     outline = {"gages2": "GAGES-II polygon", "hybas": "HydroBASINS sub-basins",
@@ -482,13 +507,11 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         cv = basinextent.carve(basic_dir, ext, g["id"])
     except basinextent.BasinExtentError as e:
         yield ("status", f"⚠️ {e} — not simulated; CREST-AI never falls back to a box")
-        yield ("done", {"returncode": -2, "no_basin": True, "reason": e.reason})
-        return
+        return _end(Outcome.NO_BASIN, e.reason)
 
     if _stopped():
         yield ("status", "⏹ stopped")
-        yield ("done", {"returncode": -9, "cancelled": True})
-        return
+        return _end(Outcome.CANCELLED)
 
     # --- upstream/interior gauges -> boundary conditions (data assimilation) ---
     bc_gauges = []
@@ -589,8 +612,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
         yield ("status", f"⚠️ the run's fixed cut set [{', '.join(cut_ids)}] could not "
                          "be rebuilt in this window (upstream scan or domain build "
                          "failed) — not simulated rather than switching domain")
-        yield ("done", {"returncode": -4, "cut_failed": True})
-        return
+        return _end(Outcome.CUT_FAILED,
+                    f"fixed cut set [{', '.join(cut_ids)}] could not be rebuilt")
     # the cells EF5 simulates on its raster: the carved catchment, or the kept
     # part of a speed domain. Snow is decided over them (M2) and a saved state
     # is used only if it holds values on them (M4)
@@ -619,11 +642,15 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     cache_model = state_model + (f"-{tag}" if tag else "")
     variant = (("cut:" + ",".join(sorted(c["id"] for c in speed["cut"]))) if speed
                else "bc:" + (",".join(sorted(b_["id"] for b_ in bc_gauges)) or "none"))
+    # what the result (and the row record) report: keys, locations, provenance
+    known.update(cache_model=cache_model, state_model=state_model,
+                 state_dir=statecache.state_dir(g["id"], state_model),
+                 provenance={"extent": basinextent.provenance(ext), "cut_ids": cut_now,
+                             "lakes": lakes.provenance(lake_set, lake_mult)})
 
     if cancel is not None and cancel.is_set():
         yield ("status", "⏹ stopped")
-        yield ("done", {"returncode": -9, "cancelled": True})
-        return
+        return _end(Outcome.CANCELLED)
 
     # every real hourly run fetches the fleet's data. no_cache runs (nowcast /
     # event runs, calibration candidates) never read or write the row cache,
@@ -676,6 +703,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
     # --- result cache: reuse overlap, simulate only the missing window (task #6) ---
     # the row cache is hourly; a sub-hourly run neither reuses nor writes it
     hourly = timestep == "1h" and not no_cache
+    if hourly:
+        known["record_path"] = statecache.results_path(g["id"], cache_model)
     pl = statecache.plan(g["id"], cache_model, t_start, t_end, variant=variant,
                          state_model=state_model, far_days=warmup_days) \
         if timestep == "1h" else {
@@ -720,10 +749,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                           "state_model": state_model,
                           "n_upstream": len(bc_gauges), "cut_ids": cut_now})
         yield ("status", "✓ served entirely from cache")
-        yield ("done", {"returncode": 0, "cached": True,
-                        "window": [t_start.strftime(statecache.TS_FMT),
-                                   t_end.strftime(statecache.TS_FMT)]})
-        return
+        return _end(Outcome.CACHED, rows=pl["cached_rows"])
     run_start, run_end = pl["run_start"], pl["run_end"]
     run_hours = max(1, int(round((run_end - run_start).total_seconds() / 3600)))
     yield ("status", f"🕐 simulation window {run_start:%Y-%m-%d %H:%M} → "
@@ -742,8 +768,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                                  f"{near[0]} ({near[1]:.0f} km away)")
     if wbkw is None:
         yield ("status", "⚠️ no calibrated params for this gauge")
-        yield ("done", {"returncode": -1})
-        return
+        return _end(Outcome.FAILED, "no calibrated params for this gauge")
     wb, kw = wbkw
     if model == "hp":
         # HP water balance has its own 2 params (fractions in [0,1]);
@@ -831,8 +856,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                 # never a stand-in warm-up without its upstream inflow
                 yield ("status", f"⚠️ saved model state @ {load_t:%Y-%m-%d %H:%M} covers "
                                  f"{cov:.0%} of this basin's EF5 cells — no forecast this hour")
-                yield ("done", {"returncode": -3, "no_state": True})
-                return
+                return _end(Outcome.NO_STATE, f"saved model state @ "
+                                              f"{load_t:%Y-%m-%d %H:%M} covers {cov:.0%}")
             yield ("status", f"saved model state @ {load_t:%Y-%m-%d %H:%M} holds values "
                              f"on only {cov:.0%} of this basin's EF5 cells "
                              f"(< {need:.0%}) — not used; warming up instead")
@@ -986,8 +1011,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
 
     if cancel is not None and cancel.is_set():
         yield ("status", "⏹ stopped")
-        yield ("done", {"returncode": -9, "cancelled": True})
-        return
+        return _end(Outcome.CANCELLED)
 
     if not use_mock:                                  # real run: forcing over the full span
         f0 = warmup_start or run_start
@@ -1019,8 +1043,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                              f"(first: {fr.missing[0]})")
         if _stopped():
             yield ("status", "⏹ stopped")
-            yield ("done", {"returncode": -9, "cancelled": True})
-            return
+            return _end(Outcome.CANCELLED)
         yield ("status", "🌡 preparing PET forcing…")
         forcing.prepare_forcing("pet", bbox, f0, force_end, pet_dir, cancel=cancel)
         if snow_on and not _stopped():
@@ -1040,8 +1063,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                                  f"them (first: {tr.missing[0]})")
         if _stopped():
             yield ("status", "⏹ stopped")
-            yield ("done", {"returncode": -9, "cancelled": True})
-            return
+            return _end(Outcome.CANCELLED)
 
     # warm-up: separate blocking ef5 process (own control); its state files at
     # run_start feed the Simu run below (two tasks in one process segfault)
@@ -1056,8 +1078,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             if cancel is not None and cancel.is_set():
                 wu.kill()
                 yield ("status", "⏹ stopped during warm-up")
-                yield ("done", {"returncode": -9, "cancelled": True})
-                return
+                return _end(Outcome.CANCELLED)
             if time.time() > wu_deadline:            # stuck-run watchdog
                 wu.kill()
                 yield ("status", f"⚠️ warm-up killed after {RUN_TIMEOUT_S / 3600:.1f} h "
@@ -1087,6 +1108,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
 
     new_rows = []
     final_rc = None
+    end = None                                   # stream_run's own done event
     for ev in stream_run(handle, poll=0.2, cancel=cancel):
         if ev["kind"] == "hydro":
             new_rows += ev["rows"]
@@ -1112,7 +1134,7 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             except Exception:
                 pass
         if ev["kind"] == "done":
-            final_rc = ev.get("returncode")
+            final_rc, end = ev.get("returncode"), ev
         if (ev["kind"] == "done" and not use_mock and not custom
                 and ev.get("returncode") in (0, None)):
             # M4: share the states EF5 wrote (warm-up + end state) - before the
@@ -1125,7 +1147,8 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
             except Exception as e:
                 from hf_data import crashlog
                 crashlog.capture("runstates:commit", e, gauge=g["id"], model=state_model)
-        yield (ev["kind"], ev)
+        if ev["kind"] != "done":
+            yield (ev["kind"], ev)
 
     # persist result + state-save times for future overlap reuse (hourly runs only)
     if hourly:
@@ -1137,10 +1160,18 @@ def _run_gauge_body(g, model, ef5_model, wb_model, t_start, t_end, use_mock,
                 st.append(run_start.strftime(statecache.TS_FMT))
         try:
             statecache.save_record(g["id"], cache_model, pl["cached_rows"] + new_rows, st,
-                                   variant=variant)
+                                   variant=variant, provenance=known["provenance"])
         except Exception as e:                    # caching silently stops working
             from hf_data import crashlog
             crashlog.capture("statecache:save", e, gauge=g["id"], model=cache_model)
+            known["record_path"] = None
+    rows = pl["cached_rows"] + new_rows
+    if end is not None and end.get("cancelled"):
+        return _end(Outcome.CANCELLED, rows=rows)
+    if final_rc in (0, None):
+        return _end(Outcome.OK, rows=rows)
+    return _end(Outcome.FAILED, (end or {}).get("error") or f"EF5 exited rc={final_rc}",
+                rows=rows)
 
 
 if __name__ == "__main__":
@@ -1155,4 +1186,6 @@ if __name__ == "__main__":
         elif kind == "q2d":
             nq += 1
         elif kind == "done":
-            print(f"DONE rc={payload.get('returncode')} | {nrows} hydro rows, {nq} q-grids")
+            print(f"DONE {payload.outcome.value}"
+                  f"{' (' + payload.reason + ')' if payload.reason else ''}"
+                  f" | {nrows} hydro rows, {nq} q-grids")

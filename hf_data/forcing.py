@@ -11,150 +11,20 @@ parquet key/value metadata (matches scripts/crest_preprocess/tif2pqf.py).
 """
 from __future__ import annotations
 
-import io
 import os
-import tarfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import numpy as np
-import pyarrow.parquet as pq
 import truststore
 truststore.inject_into_ssl()  # local corporate-MITM fix; harmless on HF runners
-from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import EntryNotFoundError
 
-from hf_data.atomicfile import atomic_path
-
-HF_REPO = "vincewin/CREST_data"
-
-# per-variable source layout + EF5 wiring
-@dataclass(frozen=True)
-class VarCfg:
-    month_fmt: str        # HF path of the MONTH tar (strftime on the timestep)
-    year_fmt: str         # HF path of the YEAR tar (fallback; strftime on the year)
-    member_fmt: str       # member name inside the tar (strftime on the timestep)
-    out_fmt: str          # output filename we write (strftime on the timestep)
-    freq: str             # 'h' | 'd'
-    section: str          # EF5 control section header
-    ef5_name: str         # EF5 NAME= pattern (DatedName tokens)
-    unit: str             # EF5 UNIT=
-    ef5_freq: str         # EF5 FREQ=
-
-VARS = {
-    "mrms": VarCfg("mrms/%Y/mrms_%Y_%m.tar", "mrms/mrms_%Y.tar",
-                   "mrms_corr_%Y%m%d%H.pqf", "mrms_%Y%m%d%H.pqf",
-                   "h", "PrecipForcing MRMS", "mrms_YYYYMMDDHH.pqf", "mm/h", "1h"),
-    "pet":  VarCfg("pet/%Y/pet_%Y_%m.tar", "pet/pet_%Y.tar",
-                   "et%Y%m%d.bil.pqf", "et%Y%m%d.pqf",
-                   "d", "PETForcing PET", "etYYYYMMDD.pqf", "mm/100d", "d"),
-    "temp": VarCfg("temp/%Y/temp_%Y_%m.tar", "temp/temp_%Y.tar",
-                   "NLDAS_FORA0125_H.A%Y%m%d.%H00.002.grb.SUB_T.pqf", "temp_%Y%m%d%H.pqf",
-                   "h", "TEMPForcing TEMP", "temp_YYYYMMDDHH.pqf", "C", "1h"),
-}
-
-# Canonical temperature grid: the geometry of every full-domain temp PQF in the
-# store (NLDAS-heritage 0.125-deg CONUS). NARR-derived members (scripts/
-# update_temp_narr.py) are resampled onto this same grid so ALL temp timesteps
-# — and the temperature-extrapolation DEM built against them — share one
-# geometry. (xll, yll, cellsize, nrows, ncols, nodata)
-TEMP_GRID = (-124.9375, 25.0625, 0.12473060344827586, 224, 464, -9999.0)
-
-# Temperature members must be °C (EF5 UNIT=C). Every upstream source ships
-# Kelvin (NLDAS/NARR/RTMA/HRRR 2-m TMP), and 76 NLDAS gap-fill hours of
-# 2023-07..2024-02 reached the store unconverted: SNOW17 read ~270 °C and
-# melted all SWE in one hour. A field whose valid-cell median is above
-# TEMP_K_MEDIAN is Kelvin; anything else outside plausible °C is garbage.
-TEMP_K_MEDIAN = 100.0
-K_OFFSET = 273.15
-
-
-class TempUnitsError(ValueError):
-    pass
-
-
-def check_temp_units(a: np.ndarray, nodata: float, name: str,
-                     convert: bool) -> tuple[np.ndarray, bool]:
-    """(°C grid, was_kelvin). A Kelvin grid is converted on valid cells only
-    (nodata stays nodata) when `convert`, else raises; a grid that is neither
-    plausible °C nor plausible K always raises — never run on it silently.
-    Writers call this with convert=False, readers with convert=True."""
-    valid = np.isfinite(a) & (a != nodata) & (a > -9000)
-    if not valid.any():
-        return a, False
-    v = a[valid]
-    med = float(np.median(v))
-    if med <= TEMP_K_MEDIAN:
-        if v.min() < -90 or v.max() > 70:
-            raise TempUnitsError(f"temperature {name}: values {v.min():.1f}..{v.max():.1f} "
-                                 f"are not plausible °C")
-        return a, False
-    if not convert or not (200 <= med <= 340 and v.min() > 150):
-        raise TempUnitsError(f"temperature {name}: median {med:.1f} — stored in "
-                             f"Kelvin (or corrupt), expected °C")
-    out = a.copy()
-    out[valid] = (v.astype("float64") - K_OFFSET).astype(a.dtype)
-    return out, True
-
-
-def clip_window(bbox, xll, yll, cell, nr, nc):
-    """Row/col window of bbox on a grid — the SAME arithmetic as _clip, so a
-    grid built from this geometry is cell-identical to the clipped forcing."""
-    W, S, E, N = bbox
-    top = yll + nr * cell
-    c0 = max(0, int(np.floor((W - xll) / cell)));  c1 = min(nc, int(np.ceil((E - xll) / cell)))
-    r0 = max(0, int(np.floor((top - N) / cell)));  r1 = min(nr, int(np.ceil((top - S) / cell)))
-    if c1 <= c0 or r1 <= r0:
-        return None
-    return r0, r1, c0, c1
-
-
-def temp_clip_geometry(bbox):
-    """Geometry of the basin-clipped temp grid: (xll, yll_top?, ...) ->
-    (nxll, nyll, cell, nrows, ncols) or None if bbox is outside the grid."""
-    xll, yll, cell, nr, nc = TEMP_GRID[:5]
-    win = clip_window(bbox, xll, yll, cell, nr, nc)
-    if win is None:
-        return None
-    r0, r1, c0, c1 = win
-    top = yll + nr * cell
-    return xll + c0 * cell, top - r1 * cell, cell, r1 - r0, c1 - c0
-
-
-def _read_pqf(data: bytes):
-    """bytes -> (array[nr,nc] float32, xll, yll, cell, nodata)."""
-    pf = pq.ParquetFile(io.BytesIO(data))
-    m = {k.decode(): v.decode() for k, v in pf.schema_arrow.metadata.items()
-         if not k.startswith(b"ARROW")}
-    nc, nr = int(m["ncols"]), int(m["nrows"])
-    a = pf.read().column("v").to_numpy().reshape(nr, nc)
-    return a, float(m["xllcorner"]), float(m["yllcorner"]), float(m["cellsize"]), float(m["nodata"])
-
-
-def _write_pqf(path: str, a: np.ndarray, xll: float, yll: float, cell: float, nodata: float):
-    import pyarrow as pa
-    nr, nc = a.shape
-    meta = {b"ncols": str(nc).encode(), b"nrows": str(nr).encode(),
-            b"xllcorner": repr(float(xll)).encode(), b"yllcorner": repr(float(yll)).encode(),
-            b"cellsize": repr(float(cell)).encode(), b"nodata": repr(float(nodata)).encode()}
-    schema = pa.schema([pa.field("v", pa.float32())]).with_metadata(meta)
-    # atomic, temp name unique per call: the shared store may have concurrent
-    # readers (EF5), and two writers - fleet workers or dashboard threads - may
-    # clip the same hour (nested basins share a store)
-    with atomic_path(path) as tmp:
-        pq.write_table(pa.table({"v": a.reshape(-1).astype("float32")}, schema=schema),
-                       tmp, compression="zstd")
-
-
-def _clip(a, xll, yll, cell, nodata, bbox):
-    """Clip full-domain grid to bbox (W,S,E,N). Returns (sub, nxll, nyll) or None."""
-    nr, nc = a.shape
-    win = clip_window(bbox, xll, yll, cell, nr, nc)
-    if win is None:
-        return None
-    r0, r1, c0, c1 = win
-    top = yll + nr * cell
-    return a[r0:r1, c0:c1], xll + c0 * cell, top - r1 * cell
+# Layout (tars and the near-real-time store), PQF encoding/decoding, clipping
+# and the per-variable value rules live in the forcing archive module.
+from hf_data.forcing_archive import (  # noqa: E402
+    RECENT_STORES, TEMP_K_MEDIAN, VARS, ArchiveGap, ForcingArchive, read_pqf,
+    store_file, store_key,
+)
 
 
 def _timesteps(t0: datetime, t1: datetime, freq: str):
@@ -180,23 +50,12 @@ class ForcingResult:
     control_block: str = ""
 
 
-# Near-real-time fallback stores: the month tars archive FINAL products on a
-# slow cadence (MRMS Pass2 is batched every few days — seen live: the freshest
-# ~2 days absent), which is exactly the window every nowcast/event run needs.
-# Loose per-hour members uploaded hourly by scripts/update_mrms_recent.py fill
-# tar-missing hours. var -> (HF path strftime fmt, retention days).
-RECENT_STORES = {
-    "mrms": ("mrms_recent/mrms1h_pass1_%Y%m%d%H.pqf", 21),
-}
-
-
 def store_dir(var: str, bbox) -> str:
     """Shared per-(variable, basin-bbox) forcing store. Runs over the same basin
     reuse each other's clipped timesteps — overlapping windows are MERGED here
     instead of re-downloaded and re-clipped into per-run temp dirs."""
     from hf_data.statecache import CACHE_DIR
-    key = "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p")
-    d = os.path.join(CACHE_DIR, "forcing", var, key)
+    d = os.path.join(CACHE_DIR, "forcing", var, store_key(bbox))
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -218,7 +77,7 @@ def _purge_kelvin_clips(out_dir: str) -> int:
             continue
         p = os.path.join(out_dir, f)
         with open(p, "rb") as fh:
-            a, _, _, _, nod = _read_pqf(fh.read())
+            a, _, _, _, nod = read_pqf(fh.read())
         v = a[np.isfinite(a) & (a != nod) & (a > -9000)]
         if v.size and float(np.median(v)) > TEMP_K_MEDIAN:
             os.remove(p)
@@ -228,10 +87,12 @@ def _purge_kelvin_clips(out_dir: str) -> int:
 
 
 def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir: str,
-                    repo: str = HF_REPO, cache_dir: str | None = None,
-                    cancel=None) -> ForcingResult:
+                    repo: str | None = None, cache_dir: str | None = None,
+                    cancel=None, archive: ForcingArchive | None = None) -> ForcingResult:
     """`cancel` (threading.Event) aborts between tar downloads / member clips —
-    a Stop must not sit behind a year of forcing downloads."""
+    a Stop must not sit behind a year of forcing downloads. Archive grids (and
+    near-real-time hours) are read through `archive` (default: a
+    ForcingArchive on `repo`/`cache_dir`; repo None = the data repo)."""
     cfg = VARS[var]
     os.makedirs(out_dir, exist_ok=True)
     res = ForcingResult(var=var, out_dir=out_dir)
@@ -251,89 +112,72 @@ def prepare_forcing(var: str, bbox, t_start: datetime, t_end: datetime, out_dir:
     recent = RECENT_STORES.get(var)
     now = datetime.utcnow()
 
-    for (year, month), steps in sorted(by_month.items()):
-        if cancel is not None and cancel.is_set():
-            return res                           # partial store stays valid (merge)
-        ref = steps[0]
-        try:                                    # prefer the small month-tar
-            local_tar = hf_hub_download(repo, ref.strftime(cfg.month_fmt),
-                                        repo_type="dataset", cache_dir=cache_dir)
-        except Exception:                        # fallback to year-tar (pre-reshard)
-            try:
-                local_tar = hf_hub_download(repo, ref.strftime(cfg.year_fmt),
-                                            repo_type="dataset", cache_dir=cache_dir)
-            except EntryNotFoundError:           # genuine data gap (permanent 404):
-                if recent and (now - max(steps)) <= timedelta(days=recent[1]):
-                    # a brand-new month may have no tar yet; the near-real-time
-                    # store below covers this window
-                    missing_ts.extend(steps)
-                    continue
-                # fail loudly but readably — never silently run with no forcing.
-                # (transient network errors raise other types and still propagate.)
-                raise RuntimeError(
-                    f"{var.upper()} forcing is not available for {year}-{month:02d} — "
-                    f"the archive does not cover this period. Try a more recent "
-                    f"date range."
-                ) from None
-        with tarfile.open(local_tar) as tf:
-            names = set(tf.getnames())
-            for t in steps:
+    arc = archive if archive is not None else ForcingArchive(repo, cache_dir)
+    try:
+        for (year, month), steps in sorted(by_month.items()):
+            if cancel is not None and cancel.is_set():
+                return res                       # partial store stays valid (merge)
+            for i, t in enumerate(steps):
                 if cancel is not None and cancel.is_set():
                     return res
-                member = t.strftime(cfg.member_fmt)
-                if member not in names:                # NARR-derived members use
-                    member = t.strftime(cfg.out_fmt)   # the generic name
-                if member not in names:
+                try:
+                    g = arc.read(var, t, bbox)   # validated, degC for temp
+                except ArchiveGap:               # genuine data gap (permanent 404):
+                    if recent and (now - max(steps)) <= timedelta(days=recent[1]):
+                        # a brand-new month may have no tar yet; the near-real-time
+                        # store below covers this window
+                        missing_ts.extend(steps[i:])
+                        break
+                    # fail loudly but readably — never silently run with no forcing.
+                    # (transient network errors raise other types and still propagate.)
+                    raise RuntimeError(
+                        f"{var.upper()} forcing is not available for {year}-{month:02d} — "
+                        f"the archive does not cover this period. Try a more recent "
+                        f"date range."
+                    ) from None
+                if g is None:                    # member absent / box off-grid
                     missing_ts.append(t)
                     continue
-                a, xll, yll, cell, nod = _read_pqf(tf.extractfile(member).read())
                 out_name = t.strftime(cfg.out_fmt)
-                if var == "temp":              # judged on the full grid, before clipping
-                    a, was_k = check_temp_units(a, nod, member, convert=True)
-                    if was_k:
-                        res.converted.append(out_name)
-                clip = _clip(a, xll, yll, cell, nod, bbox)
-                if clip is None:
-                    missing_ts.append(t)
-                    continue
-                sub, nxll, nyll = clip
-                _write_pqf(os.path.join(out_dir, out_name), sub, nxll, nyll, cell, nod)
+                if g.was_kelvin:
+                    res.converted.append(out_name)
+                store_file(os.path.join(out_dir, out_name), var, g.values, g.xll, g.yll,
+                           g.cell, g.nodata)
                 res.written.append(out_name)
 
-    # ---- near-real-time fill (tar-missing hours) --------------------------- #
-    # The archive tar batches the final product days behind real time; every
-    # hour it lacks is fetched from the loose hourly store instead. A filled
-    # hour lands in the shared per-basin store and is reused by later runs
-    # even after the tar catches up — acceptable: both are gauge-corrected
-    # MRMS (Pass1 vs Pass2), and the store is ephemeral on Space restarts.
-    if recent and missing_ts:
-        fmt, keep_days = recent
-        unfilled = []
-        for i, t in enumerate(sorted(missing_ts)):
-            if cancel is not None and cancel.is_set():
-                unfilled.extend(sorted(missing_ts)[i:])
-                break
-            if t > now or (now - t) > timedelta(days=keep_days):
-                unfilled.append(t)
-                continue
-            try:
-                p = hf_hub_download(repo, t.strftime(fmt), repo_type="dataset",
-                                    cache_dir=cache_dir)
-                with open(p, "rb") as fh:
-                    a, xll, yll, cell, nod = _read_pqf(fh.read())
-                clip = _clip(a, xll, yll, cell, nod, bbox)
-                if clip is None:
+        # ---- near-real-time fill (tar-missing hours) ----------------------- #
+        # The archive tar batches the final product days behind real time;
+        # every hour it lacks is read from the loose hourly store instead. A
+        # filled hour lands in the shared per-basin store and is reused by
+        # later runs even after the tar catches up — acceptable: both are
+        # gauge-corrected MRMS (Pass1 vs Pass2), and the store is ephemeral on
+        # Space restarts.
+        if recent and missing_ts:
+            keep_days = recent[1]
+            unfilled = []
+            for i, t in enumerate(sorted(missing_ts)):
+                if cancel is not None and cancel.is_set():
+                    unfilled.extend(sorted(missing_ts)[i:])
+                    break
+                if t > now or (now - t) > timedelta(days=keep_days):
                     unfilled.append(t)
                     continue
-                sub, nxll, nyll = clip
+                try:
+                    g = arc.read_recent(var, t, bbox)
+                except Exception:                # hiccup / implausible grid
+                    g = None
+                if g is None:                    # not posted / aged out / off-grid
+                    unfilled.append(t)
+                    continue
                 out_name = t.strftime(cfg.out_fmt)
-                _write_pqf(os.path.join(out_dir, out_name), sub, nxll, nyll,
-                           cell, nod)
+                store_file(os.path.join(out_dir, out_name), var, g.values, g.xll,
+                           g.yll, g.cell, g.nodata)
                 res.written.append(out_name)
                 res.recent += 1
-            except Exception:                    # not posted / aged out / hiccup
-                unfilled.append(t)
-        missing_ts = unfilled
+            missing_ts = unfilled
+    finally:
+        if archive is None:
+            arc.close()
     res.missing = [t.strftime(cfg.member_fmt) for t in sorted(missing_ts)]
 
     res.control_block = (
@@ -354,7 +198,7 @@ if __name__ == "__main__":
         print(f"[{var}] wrote {len(r.written)} files, {len(r.missing)} missing in {time.time()-t:.1f}s")
         for f in r.written:
             with open(os.path.join(r.out_dir, f), "rb") as fh:
-                a, xll, yll, cell, nod = _read_pqf(fh.read())
+                a, xll, yll, cell, nod = read_pqf(fh.read())
             print(f"    {f}: {a.shape} cell={cell} range[{np.nanmin(a):.2f},{np.nanmax(a):.2f}]")
         print("  --- control block ---")
         print("  " + r.control_block.replace("\n", "\n  ").rstrip())

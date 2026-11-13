@@ -1,6 +1,7 @@
 from datetime import datetime
 
 import numpy as np
+import pytest
 
 from conftest import RES, write_grid
 
@@ -68,24 +69,32 @@ def test_select_outlets_size_split(table):
 
 
 def test_done_keys_prefixes(monkeypatch):
-    import huggingface_hub
     import fleet_run
+    from hf_data import fleetstore
+    from hf_data.hubdata import Dataset, MemoryHub
     files = ["results/05467000_crestphys.json", "states/05467000_crestphys.pqf",
              # the ungauged nowcast's rolling checkpoint: NOT a finished hindcast
              "results/V70520944_crestphys-spd.json", "states/V70520944_crestphys-spd.pqf",
              "vp/results/V1_crestphys-spd.json", "vp/states/V1_crestphys-spd.pqf",
              "results/08263500_crestphys.json"]                 # no states: not done
-
-    class FakeApi:
-        def __init__(self, *a, **k):
-            pass
-
-        def list_repo_files(self, *a, **k):
-            return files
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    hub = MemoryHub({f: b"x" for f in files})
+    monkeypatch.setattr(fleetstore, "DATASET", Dataset("me/fleet", adapter=hub))
     monkeypatch.setenv("HF_TOKEN", "x")
     assert fleet_run._done_keys() == {"05467000_", "V1_"}
+
+
+def test_done_keys_outage_is_fatal_never_nothing_done(monkeypatch):
+    """Treating an unreachable Hub as "nothing done" would re-run and
+    re-upload every finished outlet of the shard."""
+    import fleet_run
+    from hf_data import fleetstore
+    from hf_data.hubdata import Dataset, MemoryHub
+    hub = MemoryHub()
+    hub.outage = True
+    monkeypatch.setattr(fleetstore, "DATASET", Dataset("me/fleet", adapter=hub))
+    monkeypatch.setattr(fleet_run.time, "sleep", lambda s: None)
+    with pytest.raises(SystemExit):
+        fleet_run._done_keys()
 
 
 def test_store_keys():

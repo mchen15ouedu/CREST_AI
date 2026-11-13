@@ -44,7 +44,8 @@ try:
 except Exception:
     pass
 
-FLEET_REPO = os.environ.get("CREST_FLEET_REPO", "vincewin/CREST_fleet")
+from hf_data.runresult import Outcome  # noqa: E402  (stdlib only)
+
 DEF_START, DEF_END = "2021-07-01", "2026-06-30"      # last 5 y of MRMS coverage
 PROGRESS = "fleet_progress.jsonl"
 # size split (PI 2026-10-23): basins at/above this drainage area run on the
@@ -52,10 +53,8 @@ PROGRESS = "fleet_progress.jsonl"
 # "small") - a 20,000 km2 basin needs ~15 h on a cpu-basic runner, which a
 # Space restart throws away
 BIG_KM2 = float(os.environ.get("FLEET_BIG_KM2", "5000"))
-# pour points (HydroBASINS level-07 virtual points) upload under their own
-# prefix: CREST_fleet's states/V*, results/V* are the ungauged nowcast's
-# rolling checkpoints, which a 5-year hindcast must never overwrite
-VP_PREFIX = "vp/"
+# where outputs land in CREST_fleet (key rule, the vp/ prefix of pour-point
+# hindcasts) is hf_data.fleetstore's business, not this file's
 
 
 def _token():
@@ -65,46 +64,29 @@ def _token():
     return tok
 
 
-def _prefix(gid: str) -> str:
-    return VP_PREFIX if str(gid).upper().startswith("V") else ""
-
-
 def _done_keys() -> set[str]:
-    """Outlet ids already fully uploaded (results + states present). By id,
-    not by key: rows are keyed by model+scheme+parameter tag, state grids by
-    model+scheme only, so the two names differ for a calibrated gauge.
-    A listing failure is retried, then fatal: treating it as "nothing done"
-    would re-run and re-upload every finished outlet of the shard."""
-    from huggingface_hub import HfApi
+    """"<id>_" of every outlet whose hindcast is already fully uploaded
+    (fleetstore.done_ids). A listing failure is retried, then fatal: treating
+    it as "nothing done" would re-run and re-upload every finished outlet of
+    the shard."""
+    from hf_data import fleetstore
     for attempt in range(4):
-        try:
-            files = set(HfApi(token=_token()).list_repo_files(FLEET_REPO, repo_type="dataset"))
-            break
-        except Exception as e:
-            if attempt == 3:
-                sys.exit(f"cannot list {FLEET_REPO}: {type(e).__name__}: {e}")
-            time.sleep(30 * (attempt + 1))
-    done = set()
-    for pre in ("", VP_PREFIX):
-        res = {f[len(pre + "results/"):].split("_", 1)[0] for f in files
-               if f.startswith(pre + "results/")}
-        st = {f[len(pre + "states/"):].split("_", 1)[0] for f in files
-              if f.startswith(pre + "states/")}
-        ids = res & st
-        # gauges under the bare prefix; pour points only under vp/
-        done |= {g for g in ids if g.upper().startswith("V") == (pre == VP_PREFIX)}
-    return {g + "_" for g in done}
+        r = fleetstore.done_ids()
+        if r.ok:
+            return {g + "_" for g in r.value}
+        if attempt == 3:
+            sys.exit(f"cannot list {fleetstore.DATASET.repo}: {r.error}")
+        time.sleep(30 * (attempt + 1))
 
 
 _SHARED_KEYS = None            # per worker process
 
 
 def _keys(bbox) -> tuple[str, str]:
-    """(terrain clip key, forcing store key) of an extent: basic.store_key and
-    the formula forcing.store_dir uses (without their mkdir)."""
-    from hf_data import basic
-    return (basic.store_key(bbox),
-            "_".join(f"{v:.3f}" for v in bbox).replace("-", "m").replace(".", "p"))
+    """(terrain clip key, forcing store key) of an extent: the keys
+    basic.store_dir and forcing.store_dir use (without their mkdir)."""
+    from hf_data import basic, forcing_archive
+    return basic.store_key(bbox), forcing_archive.store_key(bbox)
 
 
 def _shared_store_keys() -> set:
@@ -206,91 +188,53 @@ def run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict
 
 
 def _run_one_gauge(gid: str, t0: datetime, t1: datetime, chunk_days: int) -> dict:
-    import tempfile
-    from hf_data import pipeline, statecache, statebundle
-    from huggingface_hub import HfApi, CommitOperationAdd
+    from hf_data import fleetstore, pipeline, statecache
 
     from hf_data import basinextent
     t_start = time.time()
     last_status = ""
-    rows_model = state_model = None
-    lakes_prov = None
     try:
-        ext = basinextent.ef5_extent(gid)
         # M3: one cut set for the whole period, so no chunk re-keys the record
         cuts = pipeline.plan_cut_set(gid, t0, t1)
     except basinextent.BasinExtentError as e:
-        return {"gauge": gid, "ok": False, "rc": -2, "no_basin": True,
+        return {"gauge": gid, "ok": False, "outcome": Outcome.NO_BASIN.value,
                 "last": str(e)[-300:]}
+    res = None
     cur = t0
     while cur < t1:
         ce = min(cur + timedelta(days=chunk_days), t1)
-        rc = None
+        res = None
         for kind, payload in pipeline.run_gauge(gid, cur, ce, use_mock=False,
                                                 grids=False, scheme="speed",
                                                 cut_ids=cuts):
             if kind == "status":
                 last_status = payload
-            elif kind == "params":
-                rows_model = payload.get("cache_model") or rows_model
-                state_model = payload.get("state_model") or state_model
-                lakes_prov = payload.get("lakes") or lakes_prov
             elif kind == "done":
-                rc = payload.get("returncode")
-        if rc != 0:
+                res = payload
+        if res is None or not res.ok:
             return {"gauge": gid, "ok": False, "at": cur.strftime("%Y-%m-%d"),
-                    "rc": rc, "last": last_status[-300:]}
+                    "outcome": (res.outcome if res else Outcome.FAILED).value,
+                    "last": ((res and res.reason) or last_status)[-300:]}
         cur = ce
 
-    # the run resolved model/scheme itself and reported its keys: rows under
-    # model+scheme(+parameter tag), state grids under model+scheme
-    if rows_model:
-        rec_path = statecache.results_path(gid, rows_model)
-        recs = [rec_path] if os.path.exists(rec_path) else []
-    else:
-        recs = sorted(glob.glob(os.path.join(statecache.CACHE_DIR, "results",
-                                             f"{str(gid).zfill(8)}_*.json")),
-                      key=os.path.getmtime)
-    if not recs:
-        return {"gauge": gid, "ok": False, "rc": -1, "last": "no result record"}
-    rec_path = recs[-1]
-    key = os.path.splitext(os.path.basename(rec_path))[0]
-    skey = f"{str(gid).zfill(8)}_{state_model}" if state_model else key
-
-    sdir = statecache.state_dir(gid, skey.split("_", 1)[1])
-    # provenance: which basin outline (and table version) these rows were
-    # simulated on - box-era records lack it
-    try:
-        rec = json.load(open(rec_path))
-        rec["extent"] = basinextent.provenance(ext)
-        rec["cut_ids"] = cuts
-        rec["lakes"] = lakes_prov                      # lake set (None: lake module off)
-        with open(rec_path, "w") as fh:
-            json.dump(rec, fh)
-    except (OSError, ValueError):
-        pass
-    pre = _prefix(gid)
-    # bundle to a temp FILE: streamed pack, and the compressed bundle of a big
-    # basin is never held in RAM (statebundle.pack_dir)
-    fd, bpath = tempfile.mkstemp(prefix=f"fleet_{skey}_", suffix=".pqf")
-    os.close(fd)
-    try:
-        if statebundle.pack_dir(sdir, out_path=bpath) is None:
-            return {"gauge": gid, "ok": False, "rc": -1, "last": "no state grids"}
-        mb = os.path.getsize(bpath) / 1e6
-        api = HfApi(token=os.environ["HF_TOKEN"])
-        api.create_commit(repo_id=FLEET_REPO, repo_type="dataset",
-                          operations=[
-                              CommitOperationAdd(f"{pre}states/{skey}.pqf", bpath),
-                              CommitOperationAdd(f"{pre}results/{key}.json", rec_path)],
-                          commit_message=f"fleet {pre}{key}")
-    finally:
-        try:
-            os.remove(bpath)
-        except OSError:
-            pass
-    n_states = len(json.load(open(rec_path)).get("state_times", []))
-    n_rows = len(json.load(open(rec_path)).get("rows", []))
+    # the run reports its own record and state folder: rows under
+    # model+scheme(+parameter tag), state grids under model+scheme; the
+    # pipeline already stamped the record's provenance (extent, cut_ids, lakes)
+    rec_path = res.record_path if res else None
+    if not rec_path or not os.path.exists(rec_path):
+        return {"gauge": gid, "ok": False, "outcome": Outcome.FAILED.value,
+                "last": "no result record"}
+    with open(rec_path) as fh:
+        rec = json.load(fh)
+    n_states = len(rec.get("state_times", []))
+    n_rows = len(rec.get("rows", []))
+    # bundle + record in one commit, laid out by the fleet store (a pour
+    # point's hindcast under vp/); the bundle is streamed to a temp file
+    pub = fleetstore.publish_run(res, kind=fleetstore.HINDCAST)
+    if not pub:
+        return {"gauge": gid, "ok": False, "outcome": Outcome.FAILED.value,
+                "last": (pub.error or "upload failed")[-300:]}
+    key, mb = pub.key, pub.bytes / 1e6
 
     # bound local disk: everything just uploaded is re-fetchable
     shutil.rmtree(os.path.join(statecache.CACHE_DIR, "states", str(gid).zfill(8)),
@@ -338,9 +282,10 @@ def main():
     _token()
     os.environ.setdefault("CREST_DEMO_MOCK", "0")
 
-    from huggingface_hub import HfApi
-    HfApi(token=_token()).create_repo(FLEET_REPO, repo_type="dataset",
-                                      private=True, exist_ok=True)
+    from hf_data import fleetstore
+    made = fleetstore.DATASET.create(private=True)
+    if not made:
+        sys.exit(f"cannot create {fleetstore.DATASET.repo}: {made.error}")
 
     # thousands of gauges doing anonymous /vsicurl range-reads is exactly what
     # HF rate-limits (fleet-wide "RasterioIOError: Read failed" storm) — fetch
@@ -409,7 +354,7 @@ def main():
             try:
                 r = fu.result()
             except Exception as e:
-                r = {"gauge": futs[fu], "ok": False, "rc": -1,
+                r = {"gauge": futs[fu], "ok": False, "outcome": Outcome.FAILED.value,
                      "last": f"{type(e).__name__}: {e}"}
             r["when"] = datetime.now().strftime("%Y-%m-%d %H:%M")
             prog.write(json.dumps(r) + "\n")

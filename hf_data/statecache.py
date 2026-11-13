@@ -18,6 +18,8 @@ import json
 import os
 from datetime import datetime
 
+from hf_data.atomicfile import atomic_path
+
 TS_FMT = "%Y-%m-%d %H:%M"
 STATE_TOL_DAYS = float(os.environ.get("CREST_STATE_TOL_DAYS", "10"))  # reuse a state within +/- this
 CACHE_DIR = os.environ.get(
@@ -56,7 +58,9 @@ def load_record(gauge, model) -> dict | None:
 
 
 def save_record(gauge, model, rows: list[dict], state_times: list[str],
-                variant: str | None = None):
+                variant: str | None = None, provenance: dict | None = None):
+    """Merge rows into the record; `provenance` ({extent, cut_ids, lakes}: what
+    the rows were simulated on) is stamped onto it."""
     rec = load_record(gauge, model) or {"gauge": str(gauge).zfill(8), "model": model,
                                         "rows": [], "window": None, "state_times": []}
     if variant is not None and rec.get("variant") != variant:
@@ -73,7 +77,9 @@ def save_record(gauge, model, rows: list[dict], state_times: list[str],
         ts = [_rt(r["time"]) for r in merged]
         rec["window"] = [min(ts).strftime(TS_FMT), max(ts).strftime(TS_FMT)]
     rec["state_times"] = sorted(set(rec["state_times"]) | set(state_times))
-    with open(results_path(gauge, model), "w") as f:
+    if provenance:
+        rec.update(provenance)
+    with atomic_path(results_path(gauge, model)) as tmp, open(tmp, "w") as f:
         json.dump(rec, f)
     return rec
 

@@ -12,12 +12,13 @@ import json
 import os
 from datetime import datetime, timezone
 
-from hf_data import statecache
+from hf_data import hubdata, statecache
+from hf_data.hubdata import Put
 from hf_data.statecache import CACHE_DIR
 
 # the private state dataset persist.py mirrors params/ to; winners written on
 # another Space (CREST_autocal) land there and are picked up here on read
-STATE_REPO = os.environ.get("CREST_STATE_REPO", "vincewin/CREST_state")
+DATASET = hubdata.state()
 REMOTE_TTL_S = float(os.environ.get("CREST_PARAMS_REMOTE_TTL_S", "600"))
 _remote_seen: dict[str, float] = {}
 
@@ -40,19 +41,12 @@ def _local(gauge: str, model: str) -> dict | None:
         return None
 
 
-def _remote(gauge: str, model: str) -> dict | None:
-    """The record in CREST_state (None without a token / file / network)."""
-    tok = os.environ.get("HF_TOKEN")
-    if not tok:
-        return None
-    try:
-        from huggingface_hub import hf_hub_download
-        p = hf_hub_download(STATE_REPO, f"params/{_name(gauge, model)}",
-                            repo_type="dataset", token=tok)
-        with open(p, encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return None
+def _remote(gauge: str, model: str) -> hubdata.Read:
+    """The record in the state dataset (a private repo: without a token
+    there is no answer, UNREACHABLE)."""
+    if not hubdata.token():
+        return hubdata.Read(hubdata.UNREACHABLE, error="no HF token")
+    return DATASET.read_json(f"params/{_name(gauge, model)}", kind=dict)
 
 
 def get(gauge: str, model: str) -> dict | None:
@@ -62,13 +56,16 @@ def get(gauge: str, model: str) -> dict | None:
     also the CREST_state copy: the NEWER `when` wins (a calibration finished
     on the autocal Space must reach the runner/demo/fleet without a restart;
     `when` is '%Y-%m-%d %H:%M UTC', so it compares as a string). A newer
-    remote record is written locally so persist mirrors it like any other."""
+    remote record is written locally so persist mirrors it like any other.
+    An unreachable remote is not remembered: the next call looks again."""
     loc = _local(gauge, model)
     key = _name(gauge, model)
     now = datetime.now(timezone.utc).timestamp()
     if now - _remote_seen.get(key, 0.0) >= REMOTE_TTL_S:
-        _remote_seen[key] = now
-        rem = _remote(gauge, model)
+        r = _remote(gauge, model)
+        if not r.unreachable:
+            _remote_seen[key] = now
+        rem = r.value if r.ok else None
         if rem and (loc is None or str(rem.get("when", "")) > str(loc.get("when", ""))):
             try:
                 with open(_path(gauge, model), "w", encoding="utf-8") as fh:
@@ -80,21 +77,13 @@ def get(gauge: str, model: str) -> dict | None:
 
 
 def push_remote(gauge: str, model: str) -> bool:
-    """Upload the local record to CREST_state params/ (for Spaces that run no
-    persist thread, e.g. CREST_autocal). True on success."""
-    tok = os.environ.get("HF_TOKEN")
+    """Upload the local record to the state dataset's params/ (for Spaces that
+    run no persist thread, e.g. CREST_autocal). True on success."""
     p = _path(gauge, model)
-    if not tok or not os.path.exists(p):
+    if not os.path.exists(p):
         return False
-    try:
-        from huggingface_hub import HfApi
-        HfApi(token=tok).upload_file(
-            path_or_fileobj=p, path_in_repo=f"params/{_name(gauge, model)}",
-            repo_id=STATE_REPO, repo_type="dataset",
-            commit_message=f"params {gauge} {model}: calibration winner")
-        return True
-    except Exception:
-        return False
+    return bool(DATASET.commit([Put(f"params/{_name(gauge, model)}", p)],
+                               f"params {gauge} {model}: calibration winner"))
 
 
 def maybe_save(gauge: str, model: str, wb: dict, kw: dict, nse: float | None,

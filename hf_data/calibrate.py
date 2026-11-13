@@ -204,7 +204,9 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
     Two-stage budget: rounds*k candidates, then — only if the best NSE is
     still below ext_nse — one extended stage of ext_rounds*ext_k more.
     Yields ("status", str) | ("round", dict) | ("hydro", {rows}) |
-    ("done", {best_nse, baseline_nse, best_params, saved, improved, extended}).
+    ("done", {best_nse, baseline_nse, best_params, saved, improved, extended}),
+    or ("done", {error, ...}) when nothing was calibrated — for an outlet
+    without a basin outline also {outcome: "no_basin", reason}.
     """
     from hf_data import multipliers
     from hf_data.pipeline import gauge_info, run_gauge
@@ -219,7 +221,9 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
         basinextent.ef5_extent(g)
     except basinextent.BasinExtentError as e:
         yield ("status", f"⚠️ {e} — not calibrated")
-        yield ("done", {"error": f"no basin boundary: {e.reason}", "no_basin": True})
+        from hf_data.runresult import Outcome
+        yield ("done", {"error": f"no basin boundary: {e.reason}",
+                        "outcome": Outcome.NO_BASIN.value, "reason": e.reason})
         return
     wb_model = "crest" if (model == "crest" or (model == "auto" and g["lon"] < -105)) else "crestphys"
     ef5_model = wb_model if model in ("auto", "crest", "crestphys") else model
@@ -246,6 +250,7 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
         calibration leaves no intermediary data behind (the 1-D rows and the
         winning parameter set are all that survive)."""
         rows = []
+        res = None
         work = tempfile.mkdtemp(prefix=f"crest_cal_{g['id']}_")
         try:
             for kind, payload in run_gauge(
@@ -254,14 +259,25 @@ def _run_calibration(gauge_id: str, t_start: datetime, t_end: datetime,
                     grids=False, no_cache=True, workdir=work):
                 if kind == "hydro":
                     rows += payload["rows"]
+                elif kind == "done":
+                    res = payload
         finally:
             shutil.rmtree(work, ignore_errors=True)
+        if res is None or not res.ok:     # partial rows never score a candidate
+            why = res.outcome.value if res else "no result"
+            raise RuntimeError(f"run {why}"
+                               + (f": {res.reason}" if res and res.reason else ""))
         m = analysis.compute_metrics(rows)
         nse = _mock_nse(params) if use_mock else m.get("nsce")
         return nse, m, rows
 
     yield ("status", f"baseline run — current parameters ({'stored best' if stored else 'a-priori'})")
-    base_nse, base_metrics, base_rows = run_candidate(base)
+    try:
+        base_nse, base_metrics, base_rows = run_candidate(base)
+    except RuntimeError as e:          # nothing to calibrate against
+        yield ("status", f"⚠️ baseline run did not simulate ({e}) — not calibrated")
+        yield ("done", {"error": f"baseline {e}"})
+        return
     if rec is not None:
         rec.baseline(base, base_nse, _summarize(base_metrics))
     yield ("round", {"round": 0, "tried": [{"id": "baseline", "goal": "current parameters",

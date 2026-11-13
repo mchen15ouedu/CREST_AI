@@ -37,9 +37,15 @@ def chat_run(message, history):
             elif kind == "q2d":
                 last_q = payload["path"]
                 q2d = q2d_fig(last_q)
-            elif kind == "done":
-                peak = max((r["sim_q"] for r in rows if r["sim_q"] is not None), default=0.0)
-                log.append(f"✅ **Complete** — {len(rows)} timesteps · peak Q **{peak:.1f} m³/s**")
+            elif kind == "done":                    # payload: a GaugeRunResult
+                if payload.ok:
+                    peak = max((r["sim_q"] for r in rows if r["sim_q"] is not None),
+                               default=0.0)
+                    log.append(f"✅ **Complete** — {len(rows)} timesteps · "
+                               f"peak Q **{peak:.1f} m³/s**")
+                else:
+                    log.append(f"⚠️ **{payload.outcome.value}**"
+                               f"{' — ' + payload.reason if payload.reason else ''}")
                 if last_q:
                     q2d = q2d_fig(last_q)
                 hydro = hydrograph_fig(rows, "Hydrograph — complete") if rows else hydro
