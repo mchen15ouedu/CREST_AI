@@ -25,6 +25,7 @@ import threading
 
 import numpy as np
 
+from hf_data.atomicfile import atomic_path
 from hf_data.hucdomain import DomainError
 
 TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
@@ -262,10 +263,9 @@ def carve(basic_dir: str, ext: dict, gid: str = "?") -> dict:
                 mask = None
         if mask is None:
             mask = upstream_mask(ds.read(1), r, c)
-            tmp = cache + f".{os.getpid()}.tmp.npy"
             try:
-                np.save(tmp, mask)
-                os.replace(tmp, cache)
+                with atomic_path(cache) as tmp, open(tmp, "wb") as fh:
+                    np.save(fh, mask)       # a file object: no ".npy" appended
             except OSError:
                 pass
     if mask[0].any() or mask[-1].any() or mask[:, 0].any() or mask[:, -1].any():

@@ -40,6 +40,7 @@ from datetime import datetime, timedelta
 import numpy as np
 
 from hf_data import fleetstore
+from hf_data.atomicfile import atomic_path
 
 REPO = fleetstore.REPO
 INDEX_FILE = "mosaic/index.json"
@@ -470,16 +471,13 @@ def write_states(res: dict, dst: dict, state_dir: str, overwrite: bool = False) 
         p = os.path.join(state_dir, f"{var}_{ts}.tif")
         if os.path.exists(p) and not overwrite:
             continue
-        tmp = p + ".tmp"
-        with rasterio.open(tmp, "w", driver="GTiff", height=dst["nrows"],
-                           width=dst["ncols"], count=1, dtype="float32",
-                           crs="EPSG:4326",
-                           transform=from_origin(dst["xll"],
-                                                 dst["yll"] + dst["nrows"] * CELL,
-                                                 CELL, CELL),
-                           nodata=NODATA, tiled=False, blockysize=1) as ds:
+        with atomic_path(p) as tmp, rasterio.open(
+                tmp, "w", driver="GTiff", height=dst["nrows"],
+                width=dst["ncols"], count=1, dtype="float32", crs="EPSG:4326",
+                transform=from_origin(dst["xll"], dst["yll"] + dst["nrows"] * CELL,
+                                      CELL, CELL),
+                nodata=NODATA, tiled=False, blockysize=1) as ds:
             ds.write(a, 1)
-        os.replace(tmp, p)
         n += 1
     return n
 

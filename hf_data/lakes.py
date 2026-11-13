@@ -34,6 +34,8 @@ import threading
 
 import numpy as np
 
+from hf_data.atomicfile import atomic_path
+
 TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
                           "lakes.parquet")
 WEST_LON = -105.0                 # = pipeline.WEST_LON (no import cycle)
@@ -133,10 +135,9 @@ def _write_sig(path: str, sig: dict) -> None:
     """lake_set sidecar via a temp file + os.replace: the run folder's copy
     may be a staged hard link of the shared one, which must never be written
     through."""
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as fh:
-        json.dump(sig, fh)
-    os.replace(tmp, path)
+    with atomic_path(path) as tmp:
+        with open(tmp, "w") as fh:
+            json.dump(sig, fh)
 
 
 def _sig(lakes, mult) -> dict:
@@ -193,10 +194,9 @@ def prepare_states(state_dir: str, t, lakes, dem_path: str,
             "nodata": -9999.0, "compress": "deflate"}
     os.makedirs(state_dir, exist_ok=True)
     for path, arr in ((sp, st), (op, of)):
-        tmp = path + ".tmp"
-        with rasterio.open(tmp, "w", **prof) as dst:
-            dst.write(arr, 1)
-        os.replace(tmp, path)        # a staged hard link is replaced, not written into
+        with atomic_path(path) as tmp:   # a staged hard link is replaced, not written into
+            with rasterio.open(tmp, "w", **prof) as dst:
+                dst.write(arr, 1)
     _write_sig(os.path.join(state_dir, f"lake_set_{stamp}.json"), _sig(lakes, mult))
     return {"kept": kept, "initial": len(lakes) - kept}
 
